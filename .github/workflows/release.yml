@@ -1,0 +1,176 @@
+name: Release
+
+# Runs after CI passes on main, so nothing is released from a commit whose checks, packed install
+# or e2e failed.
+# - Changesets waiting: opens or updates the "Version Packages" pull request (versions, changelogs,
+#   the CMS plugin's version).
+# - That pull request merged: builds and packs the packages whose version isn't on npm yet, and
+#   publishes them through npm trusted publishing, with provenance and no npm token. Only the
+#   publish job can mint the OIDC token npm accepts.
+#
+# Like CI, each job checks out the CMS beside this repo (../nextjs-cms): the CMS plugin's test site
+# links its packages, and pnpm installs the whole workspace.
+#
+# Repository settings: Actions › General › "Allow GitHub Actions to create and approve pull
+# requests" must be on for the version job. Each package on npmjs.com names this repository and
+# this workflow file (release.yml) as its trusted publisher.
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+
+permissions: {}
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  select-mode:
+    if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      mode: ${{ steps.mode.outputs.mode }}
+      publish-plan-artifact-id: ${{ steps.mode.outputs.publish-plan-artifact-id }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          path: otw-db
+      - uses: actions/checkout@v5
+        with:
+          repository: OTWSRL/otw-cms
+          path: nextjs-cms
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: otw-db/package.json
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: '*/pnpm-lock.yaml'
+      - run: pnpm install --frozen-lockfile
+        working-directory: nextjs-cms
+      - run: pnpm install --frozen-lockfile
+        working-directory: otw-db
+      - id: mode
+        uses: changesets/action/select-mode@v2
+        with:
+          cwd: otw-db
+
+  version:
+    needs: select-mode
+    if: needs.select-mode.outputs.mode == 'version'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          path: otw-db
+      - uses: actions/checkout@v5
+        with:
+          repository: OTWSRL/otw-cms
+          path: nextjs-cms
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: otw-db/package.json
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: '*/pnpm-lock.yaml'
+      - run: pnpm install --frozen-lockfile
+        working-directory: nextjs-cms
+      - run: pnpm install --frozen-lockfile
+        working-directory: otw-db
+      - uses: changesets/action/version@v2
+        with:
+          cwd: otw-db
+          # changeset version, then the CMS plugin's version follows its package.json.
+          script: pnpm version-packages
+
+  pack:
+    needs: select-mode
+    if: needs.select-mode.outputs.mode == 'publish'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      pack-dir-artifact-id: ${{ steps.pack.outputs.pack-dir-artifact-id }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          path: otw-db
+      - uses: actions/checkout@v5
+        with:
+          repository: OTWSRL/otw-cms
+          path: nextjs-cms
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: otw-db/package.json
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: '*/pnpm-lock.yaml'
+      - run: pnpm install --frozen-lockfile
+        working-directory: nextjs-cms
+      - run: pnpm install --frozen-lockfile
+        working-directory: otw-db
+      # These packages ship compiled code: build before packing.
+      - run: pnpm build
+        working-directory: otw-db
+      # pnpm packs each package, turning workspace:* into the released versions.
+      - id: pack
+        uses: changesets/action/pack@v2
+        with:
+          cwd: otw-db
+          publish-plan-artifact-id: ${{ needs.select-mode.outputs.publish-plan-artifact-id }}
+
+  publish:
+    needs: pack
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # git tags and GitHub releases
+      id-token: write # npm trusted publishing
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          path: otw-db
+      - uses: actions/checkout@v5
+        with:
+          repository: OTWSRL/otw-cms
+          path: nextjs-cms
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: otw-db/package.json
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          # As npm's trusted publishing example has it.
+          registry-url: https://registry.npmjs.org
+          cache: pnpm
+          cache-dependency-path: '*/pnpm-lock.yaml'
+      # Trusted publishing needs npm 11.5.1 or later; pnpm hands the upload to npm.
+      - run: npm install --global npm@11
+      - run: pnpm install --frozen-lockfile
+        working-directory: nextjs-cms
+      - run: pnpm install --frozen-lockfile
+        working-directory: otw-db
+      - uses: changesets/action/publish@v2
+        env:
+          # npm explains a refused trusted publish only in its detailed log.
+          NPM_CONFIG_LOGLEVEL: verbose
+        with:
+          cwd: otw-db
+          pack-dir-artifact-id: ${{ needs.pack.outputs.pack-dir-artifact-id }}
+          create-github-releases: true

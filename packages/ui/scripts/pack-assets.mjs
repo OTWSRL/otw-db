@@ -22,9 +22,16 @@ for (const name of readdirSync(join(app, 'assets'))) {
   }
 }
 const index = readFileSync(join(app, 'index.html'), 'utf8').replace(placeholder, '%OTW_DB_BASE%')
+// The script and stylesheet the page loads, for hosts that embed the app in their own pages.
+const entry = {
+  script: /src="%OTW_DB_BASE%\/assets\/([^"]+\.js)"/.exec(index)?.[1],
+  style: /href="%OTW_DB_BASE%\/assets\/([^"]+\.css)"/.exec(index)?.[1],
+}
+if (!entry.script || !entry.style)
+  throw new Error('pack-assets: the page has no script or stylesheet.')
 writeFileSync(
   new URL('../dist/assets.js', import.meta.url),
-  `export const assets = ${JSON.stringify({ index, files })}\n`,
+  `export const assets = ${JSON.stringify({ index, files, entry })}\n`,
 )
 const size = Object.values(files).reduce((sum, f) => sum + f.body.length, 0)
 console.log(`pack-assets: ${Object.keys(files).length} files, ${Math.round(size / 1024)} KB`)

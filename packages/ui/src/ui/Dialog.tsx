@@ -27,7 +27,9 @@ export function ConfirmDialog({
   const confirm = useRef<HTMLButtonElement>(null)
   useEffect(() => {
     // Back to what had the focus (the editor, say) when the dialog goes, as native dialogs do.
-    const before = document.activeElement as HTMLElement | null
+    // In a shadow root, the document's active element is the host: ask the root itself.
+    const scope = (confirm.current?.getRootNode() ?? document) as Document | ShadowRoot
+    const before = scope.activeElement as HTMLElement | null
     confirm.current?.focus()
     return () => before?.focus()
   }, [])

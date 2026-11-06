@@ -249,8 +249,9 @@ export function TableTab({ schema, table, summary, active }: Props) {
     function onKey(event: KeyboardEvent) {
       const mod = event.metaKey || event.ctrlKey
       if (!mod || event.defaultPrevented) return
-      const target = event.target as HTMLElement
-      const typing = target.closest('input, textarea, select, [contenteditable="true"]')
+      // The element itself, even inside a shadow root, where event.target is the host.
+      const target = (event.composedPath()[0] ?? event.target) as HTMLElement
+      const typing = target.closest?.('input, textarea, select, [contenteditable="true"]')
       if (event.key === 's') {
         event.preventDefault()
         void startReview()

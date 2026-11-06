@@ -4,4 +4,6 @@ export declare const assets: {
   index: string
   /** Files under `assets/`, by name; their names change with their content. */
   files: Readonly<Record<string, { type: string; body: string }>>
+  /** The script and stylesheet the page loads, by name under `assets/`, for hosts that embed it. */
+  entry: { script: string; style: string }
 }

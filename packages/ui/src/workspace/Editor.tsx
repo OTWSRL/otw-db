@@ -103,6 +103,8 @@ export function Editor({ value, onChange, onRun, schema, defaultSchema, kind, la
     }
     const editor = new EditorView({
       parent: host.current!,
+      // A shadow root, inside a host's page: the editor's styles go there, not to the document.
+      root: host.current!.getRootNode() as Document | ShadowRoot,
       state: EditorState.create({
         doc: value,
         extensions: [

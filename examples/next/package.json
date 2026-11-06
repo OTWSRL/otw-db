@@ -1,0 +1,22 @@
+{
+  "name": "@otwdesign/db-example-next",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "next dev -p 3470",
+    "build": "next build",
+    "start": "next start -p 3470",
+    "test:e2e": "next build && playwright test"
+  },
+  "dependencies": {
+    "@otwdesign/db-core": "workspace:*",
+    "next": "^16.4.5",
+    "pg": "^8.23.1",
+    "pg-cursor": "^2.22.1",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1"
+  },
+  "devDependencies": {
+    "@types/react": "^19.3.0"
+  }
+}

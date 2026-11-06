@@ -104,3 +104,69 @@ export async function send(res: ServerResponse, response: Response): Promise<voi
   }
   await pipeline(Readable.fromWeb(response.body as NodeReadableStream), res)
 }
+
+/** What the Fastify plugin uses of Fastify: shapes only, so this package needs no fastify. */
+interface FastifyLike {
+  removeAllContentTypeParsers(): void
+  addContentTypeParser(
+    type: string,
+    parser: (
+      request: unknown,
+      payload: unknown,
+      done: (error: Error | null, body?: unknown) => void,
+    ) => void,
+  ): void
+  all(
+    path: string,
+    handler: (
+      request: { raw: IncomingMessage },
+      reply: { raw: ServerResponse; hijack(): void },
+    ) => Promise<void>,
+  ): void
+}
+
+/**
+ * A Fastify plugin: `app.register(fastifyPlugin(dbAdmin))`. Its routes leave the body unread,
+ * as Fastify's own parsers would read it first, and answer through Node's response. Register it
+ * as it is, not through fastify-plugin, so its parser settings stay inside it.
+ */
+export function fastifyPlugin(admin: Pick<DbAdmin, 'fetch' | 'basePath'>) {
+  const handle = toNodeHandler(admin)
+  return async function otwDb(fastify: FastifyLike): Promise<void> {
+    fastify.removeAllContentTypeParsers()
+    fastify.addContentTypeParser('*', (_request, _payload, done) => done(null))
+    const route = async (
+      request: { raw: IncomingMessage },
+      reply: { raw: ServerResponse; hijack(): void },
+    ) => {
+      reply.hijack()
+      await handle(request.raw, reply.raw)
+    }
+    fastify.all(admin.basePath || '/', route)
+    fastify.all(`${admin.basePath}/*`, route)
+  }
+}
+
+/** What the Koa middleware uses of Koa's context. */
+interface KoaContext {
+  path: string
+  req: IncomingMessage
+  res: ServerResponse
+  respond?: boolean
+  request: { body?: unknown }
+}
+
+/**
+ * Koa middleware: `app.use(koaMiddleware(dbAdmin))`. Paths outside the base path go on to the
+ * next middleware. A body a parser before it read (koa-bodyparser) is handed over.
+ */
+export function koaMiddleware(admin: Pick<DbAdmin, 'fetch' | 'basePath'>) {
+  const handle = toNodeHandler(admin)
+  return async (ctx: KoaContext, next: () => Promise<unknown>): Promise<unknown> => {
+    if (!within(ctx.path, admin.basePath)) return next()
+    const req = ctx.req as IncomingMessage & { body?: unknown }
+    if (req.readableEnded && req.body === undefined) req.body = ctx.request.body
+    ctx.respond = false
+    await handle(ctx.req, ctx.res)
+  }
+}

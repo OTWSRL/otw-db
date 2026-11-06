@@ -7,3 +7,5 @@ coverage/
 .DS_Store
 test-results/
 playwright-report/
+.next/
+next-env.d.ts

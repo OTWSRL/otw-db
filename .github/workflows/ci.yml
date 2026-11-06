@@ -75,9 +75,12 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm exec playwright install --with-deps chromium
+      # The standalone server's suite, then the Next.js example's.
       - run: pnpm test:e2e
       - uses: actions/upload-artifact@v4
         if: failure()
         with:
           name: playwright-traces
-          path: test-results/
+          path: |
+            test-results/
+            examples/next/test-results/

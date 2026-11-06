@@ -65,30 +65,33 @@ export const dbAdmin = createDbAdmin({
 ```
 
 **Next.js** (`app/db/[[...path]]/route.ts`): a route handler takes the Fetch handler as it is.
+[examples/next](examples/next) is a whole app, with its tests.
 
 ```ts
 import { dbAdmin } from '@/db-admin'
 
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
-export const GET = dbAdmin.fetch
-export const POST = dbAdmin.fetch
+export const GET = (request: Request) => dbAdmin.fetch(request)
+export const POST = (request: Request) => dbAdmin.fetch(request)
 ```
 
-**Hono, Bun, Deno:** `app.all('/db/*', (c) => dbAdmin.fetch(c.req.raw))`, or `Bun.serve({ fetch: dbAdmin.fetch })`.
+**Hono, Bun, Deno:** `app.all('/db/*', (c) => dbAdmin.fetch(c.req.raw))`, or
+`Bun.serve({ fetch: dbAdmin.fetch })`.
 
-**node:http, Express, Connect:**
+**node:http, Express, Connect, Fastify, Koa** (`@otwdesign/db-node`):
 
 ```ts
-import { toNodeHandler } from '@otwdesign/db-node'
+import { fastifyPlugin, koaMiddleware, toNodeHandler } from '@otwdesign/db-node'
 
-app.use('/db', toNodeHandler(dbAdmin)) // Express or Connect
+app.use('/db', toNodeHandler(dbAdmin)) // Express or Connect, after express.json() too
 http.createServer(toNodeHandler(dbAdmin)) // node:http
+await fastify.register(fastifyPlugin(dbAdmin)) // Fastify; its other routes keep their parsers
+koa.use(koaMiddleware(dbAdmin)) // Koa, after koa-bodyparser too
 ```
 
-It works after `express.json()` too. CommonJS apps `require()` it as well (Node 22.12+).
-
-Koa and Fastify come with milestone 5, with tests of their own.
+Each is tested with a real server. CommonJS apps `require()` it too (Node 22.12+). Bundlers leave
+the drivers to the host: a Next.js site builds without the ones it doesn't install.
 
 **Routers that register paths one by one** (the OTW CMS's): `dbAdmin.routes` lists every endpoint
 with a fixed path.

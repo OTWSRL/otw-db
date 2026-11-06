@@ -83,7 +83,12 @@ let modules: Promise<Modules> | undefined
 
 /** pg and pg-cursor, imported on the first PostgreSQL connection, so other hosts never load them. */
 function loadModules(): Promise<Modules> {
-  modules ??= Promise.all([import('pg'), import('pg-cursor')]).then(
+  // Imported where the host runs, not bundled: a site installs only the drivers it uses, and a
+  // bundler (Next.js) mustn't fail on one it doesn't have.
+  modules ??= Promise.all([
+    import(/* webpackIgnore: true */ /* turbopackIgnore: true */ 'pg'),
+    import(/* webpackIgnore: true */ /* turbopackIgnore: true */ 'pg-cursor'),
+  ]).then(
     ([pg, cursor]) => ({ Pool: pg.Pool, Cursor: cursor.default }),
     (error: unknown) => {
       modules = undefined

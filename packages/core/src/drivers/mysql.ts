@@ -25,7 +25,8 @@ let module: Promise<MySql> | undefined
 
 /** mysql2, imported on the first MySQL connection, so other hosts never load it. */
 function loadMySql(): Promise<MySql> {
-  module ??= import('mysql2/promise').then(
+  // Imported where the host runs, not bundled (see postgres.ts).
+  module ??= import(/* webpackIgnore: true */ /* turbopackIgnore: true */ 'mysql2/promise').then(
     // CommonJS: its exports arrive as the default.
     (m) => (m as unknown as { default?: MySql }).default ?? (m as unknown as MySql),
     (error: unknown) => {

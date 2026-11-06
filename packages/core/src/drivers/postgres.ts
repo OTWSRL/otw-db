@@ -3,7 +3,9 @@ import { connect } from 'node:net'
 import type { FieldDef, Pool, PoolClient, PoolConfig } from 'pg'
 import { ConnectionError, DbAdminError, QueryError } from '../errors.ts'
 import type {
+  ApplyResult,
   Capabilities,
+  Change,
   Filter,
   Column,
   Definition,
@@ -75,6 +77,7 @@ export function postgresDriver(url: string): Driver {
 class PostgresDriver implements Driver {
   readonly kind = 'postgres'
   readonly capabilities: Capabilities = { schemas: true, transactionalDdl: true, cancel: true }
+  readonly sql = { identifier: quote, literal }
   readonly #config: PoolConfig
   #pool: Promise<{ pool: Pool; modules: Modules }> | undefined
   /** Type names by OID, filled as results bring new ones. */
@@ -222,6 +225,78 @@ class PostgresDriver implements Driver {
     return this.#run(sql, undefined, options)
   }
 
+  async apply(
+    { schema, table }: { schema: string; table: string },
+    changes: readonly Change[],
+    { timeoutMs, dryRun = false }: { timeoutMs: number; dryRun?: boolean },
+  ): Promise<ApplyResult> {
+    const statements = changes.map((change) =>
+      statementFor(`${quote(schema)}.${quote(table)}`, change),
+    )
+    const shown = statements.map((s) => s.shown)
+    if (dryRun) return { statements: shown, applied: false }
+    const { client } = await this.#connect()
+    try {
+      await client.query(`BEGIN; SET LOCAL statement_timeout = ${whole(timeoutMs)}`)
+      for (const statement of statements) {
+        const { rowCount } = await client.query(statement.text, statement.values)
+        if (statement.oneRow && rowCount !== 1) {
+          const why =
+            rowCount === 0
+              ? 'its row is gone or its key changed'
+              : `its key matched ${rowCount} rows`
+          throw new DbAdminError(`Nothing was saved: ${why}.\n${statement.shown}`, 409, 'conflict')
+        }
+      }
+      await client.query('COMMIT')
+      return { statements: shown, applied: true }
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => {})
+      throw toError(error)
+    } finally {
+      // A write, closed after like every other.
+      client.release(true)
+    }
+  }
+
+  async *export(
+    {
+      schema,
+      table,
+      filters = [],
+      order = [],
+    }: Pick<RowsRequest, 'schema' | 'table' | 'filters' | 'order'>,
+    { timeoutMs }: { timeoutMs: number },
+  ): AsyncGenerator<{ columns: { name: string }[]; rows: (string | null)[][] }> {
+    const values: unknown[] = []
+    const orderBy = order.length
+      ? ` ORDER BY ${order.map((o) => `${quote(o.column)}${o.descending ? ' DESC' : ''}`).join(', ')}`
+      : ''
+    const sql = `SELECT * FROM ${quote(schema)}.${quote(table)}${where(filters, values)}${orderBy}`
+    const { client, modules } = await this.#connect()
+    // Until the last batch is read, the connection is mid-transaction: a stop on the way closes it.
+    let finished = false
+    try {
+      await client.query(`BEGIN READ ONLY; SET LOCAL statement_timeout = ${whole(timeoutMs)}`)
+      const cursor = client.query(
+        new modules.Cursor(sql, values, { rowMode: 'array', types: AS_TEXT } as never),
+      )
+      // The first batch always, even empty, so a file of no rows still has its column names.
+      for (let first = true; ; first = false) {
+        const { rows, fields } = await readBatch(cursor, EXPORT_BATCH)
+        if (rows.length || first) yield { columns: fields.map((f) => ({ name: f.name })), rows }
+        if (rows.length < EXPORT_BATCH) break
+      }
+      await new Promise<void>((resolve, reject) => cursor.close((e) => (e ? reject(e) : resolve())))
+      await client.query(READ_CLEANUP)
+      finished = true
+    } catch (error) {
+      throw toError(error)
+    } finally {
+      client.release(!finished)
+    }
+  }
+
   /**
    * One statement, in a transaction with its own statement timeout. Through pg-cursor, so the
    * extended protocol runs it, which takes one statement only: `COMMIT; DROP …` can't step out of
@@ -340,6 +415,59 @@ function sendCancel(client: PoolClient): void {
   socket.setTimeout(5_000, () => socket.destroy())
   socket.once('connect', () => socket.end(message))
   socket.once('error', (error) => console.error('otw-db: could not send the cancel request', error))
+}
+
+const EXPORT_BATCH = 1_000
+
+function readBatch(
+  cursor: CursorClass,
+  count: number,
+): Promise<{ rows: (string | null)[][]; fields: FieldDef[] }> {
+  return new Promise((resolve, reject) =>
+    cursor.read(count, (error, rows, result) =>
+      error ? reject(error) : resolve({ rows: rows as (string | null)[][], fields: result.fields }),
+    ),
+  )
+}
+
+/** A change as SQL: the text with parameters to run, and with its values written in to show. */
+function statementFor(
+  target: string,
+  change: Change,
+): { text: string; values: (string | null)[]; shown: string; oneRow: boolean } {
+  const values: (string | null)[] = []
+  const shownValues: string[] = []
+  const parameter = (value: string | null) => {
+    values.push(value)
+    shownValues.push(literal(value))
+    return `$${values.length}`
+  }
+  const assignments = (record: Readonly<Record<string, string | null>>) =>
+    Object.entries(record).map(([column, value]) => `${quote(column)} = ${parameter(value)}`)
+  let text: string
+  if (change.type === 'insert') {
+    const columns = Object.keys(change.values)
+    text = columns.length
+      ? `INSERT INTO ${target} (${columns.map(quote).join(', ')}) VALUES (${columns.map((c) => parameter(change.values[c]!)).join(', ')})`
+      : `INSERT INTO ${target} DEFAULT VALUES`
+  } else {
+    const set = change.type === 'update' ? assignments(change.values).join(', ') : ''
+    const key = assignments(change.key).join(' AND ')
+    text =
+      change.type === 'update'
+        ? `UPDATE ${target} SET ${set} WHERE ${key}`
+        : `DELETE FROM ${target} WHERE ${key}`
+  }
+  // $10 before $1, so one parameter's number is never read as the start of another's.
+  const shown = text.replace(/\$(\d+)/g, (_, n: string) => shownValues[Number(n) - 1]!)
+  return { text, values, shown, oneRow: change.type !== 'insert' }
+}
+
+/** A value as a PostgreSQL literal, for statements shown to people and SQL exports. */
+export function literal(value: string | null): string {
+  if (value === null) return 'NULL'
+  // standard_conforming_strings, on since PostgreSQL 9.1, keeps backslashes literal in '…'.
+  return `'${value.replaceAll("'", "''")}'`
 }
 
 interface CursorResult {

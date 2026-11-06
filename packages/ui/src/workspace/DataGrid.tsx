@@ -27,6 +27,19 @@ interface Props {
   selected: Cell | null
   onSelect(cell: Cell): void
   label: string
+  /**
+   * Makes the grid editable: Enter, F2, a double-click or typing edits a cell; Enter or Tab keeps
+   * the edit, Escape drops it; ⌘⌫ sets NULL.
+   */
+  onEdit?(cell: Cell, value: string | null): void
+  /** Delete or Backspace on a selected row. */
+  onDeleteRow?(row: number): void
+  /** Columns no one may edit, as an identity's GENERATED ALWAYS. */
+  lockedColumns?: ReadonlySet<number>
+  /** A row added or to be deleted, for its color. */
+  rowState?(row: number): 'inserted' | 'deleted' | null
+  /** A cell changed from the database's value, or a new row's that takes its default. */
+  cellState?(row: number, col: number): 'changed' | 'default' | null
 }
 
 const ROW = 24
@@ -50,8 +63,20 @@ export function DataGrid({
   selected,
   onSelect,
   label,
+  onEdit,
+  onDeleteRow,
+  lockedColumns,
+  rowState,
+  cellState,
 }: Props) {
   const scroller = useRef<HTMLDivElement>(null)
+  const [editing, setEditingState] = useState<{ cell: Cell; draft: string } | null>(null)
+  // What's being edited now, for the blur that follows Enter: the edit is kept once, not twice.
+  const editingNow = useRef<{ cell: Cell; draft: string } | null>(null)
+  const setEditing = (next: { cell: Cell; draft: string } | null) => {
+    editingNow.current = next
+    setEditingState(next)
+  }
   const [widths, setWidths] = useState(() => fit(columns, rows))
   // New columns (another table, another result) get widths of their own, fitted again once the
   // first rows arrive: a table's columns show before its rows do.
@@ -90,9 +115,72 @@ export function DataGrid({
     columnVirtualizer.scrollToIndex(next.col)
   }
 
+  const editable = (cell: Cell) =>
+    !!onEdit && !lockedColumns?.has(cell.col) && rowState?.(cell.row) !== 'deleted'
+
+  function startEditing(cell: Cell, draft?: string) {
+    if (!editable(cell)) return
+    setEditing({ cell, draft: draft ?? rows[cell.row]?.[cell.col] ?? '' })
+  }
+
+  /** Keeps the edit (or NULL), then moves on as the key says. */
+  function finishEditing(value: string | null | undefined, then?: Cell) {
+    const current = editingNow.current
+    if (!current) return
+    const { cell } = current
+    setEditing(null)
+    if (value !== undefined && value !== (rows[cell.row]?.[cell.col] ?? null)) onEdit?.(cell, value)
+    if (then) move(then)
+    scroller.current?.focus()
+  }
+
+  function editorKeys(event: KeyboardEvent<HTMLInputElement>) {
+    if (!editing) return
+    event.stopPropagation()
+    const { row, col } = editing.cell
+    const draft = event.currentTarget.value
+    if (event.key === 'Enter') {
+      event.preventDefault()
+      finishEditing(draft, { row: row + 1, col })
+    } else if (event.key === 'Tab') {
+      event.preventDefault()
+      finishEditing(draft, { row, col: col + (event.shiftKey ? -1 : 1) })
+    } else if (event.key === 'Escape') {
+      event.preventDefault()
+      finishEditing(undefined)
+    } else if (event.key === 'Backspace' && (event.metaKey || event.ctrlKey)) {
+      event.preventDefault()
+      finishEditing(null)
+    }
+  }
+
   function keys(event: KeyboardEvent) {
     if (!rows.length || !columns.length) return
     const at = selected ?? { row: 0, col: 0 }
+    const mod = event.metaKey || event.ctrlKey
+    if (onEdit && selected) {
+      if (event.key === 'Enter' || event.key === 'F2') {
+        event.preventDefault()
+        startEditing(selected)
+        return
+      }
+      if (event.key === 'Backspace' && mod) {
+        event.preventDefault()
+        if (editable(selected)) onEdit(selected, null)
+        return
+      }
+      if ((event.key === 'Delete' || event.key === 'Backspace') && onDeleteRow) {
+        event.preventDefault()
+        onDeleteRow(selected.row)
+        return
+      }
+      // Typing starts an edit with what was typed, as in a spreadsheet.
+      if (event.key.length === 1 && !mod && !event.altKey) {
+        event.preventDefault()
+        startEditing(selected, event.key)
+        return
+      }
+    }
     const page = Math.max(1, Math.floor((scroller.current?.clientHeight ?? 240) / ROW) - 1)
     const moves: Record<string, Cell> = {
       ArrowUp: { row: at.row - 1, col: at.col },
@@ -174,10 +262,11 @@ export function DataGrid({
         {rowVirtualizer.getVirtualItems().map((rowItem) => {
           const row = rows[rowItem.index]!
           const isSelected = selected?.row === rowItem.index
+          const state = rowState?.(rowItem.index)
           return (
             <div
               key={rowItem.key}
-              className={`grid-row${isSelected ? ' selected' : ''}`}
+              className={`grid-row${isSelected ? ' selected' : ''}${state ? ` ${state}` : ''}`}
               role="row"
               aria-rowindex={rowItem.index + 2}
               aria-selected={isSelected}
@@ -186,20 +275,41 @@ export function DataGrid({
               <div className="cell number-cell" style={{ width: NUMBER }}>
                 {firstRow + rowItem.index}
               </div>
-              {visibleColumns.map((item) => (
-                <CellView
-                  key={item.key}
-                  value={row[item.index] ?? null}
-                  left={NUMBER + item.start}
-                  width={item.size}
-                  column={item.index}
-                  selected={isSelected && selected?.col === item.index}
-                  onClick={() => {
-                    onSelect({ row: rowItem.index, col: item.index })
-                    scroller.current?.focus()
-                  }}
-                />
-              ))}
+              {visibleColumns.map((item) =>
+                editing?.cell.row === rowItem.index && editing.cell.col === item.index ? (
+                  <input
+                    key={item.key}
+                    className="cell-editor"
+                    aria-label={`Edit ${columns[item.index]!.name}`}
+                    style={{ left: NUMBER + item.start, width: item.size }}
+                    defaultValue={editing.draft}
+                    autoFocus
+                    onFocus={(e) =>
+                      e.currentTarget.setSelectionRange(
+                        e.currentTarget.value.length,
+                        e.currentTarget.value.length,
+                      )
+                    }
+                    onKeyDown={editorKeys}
+                    onBlur={(e) => finishEditing(e.currentTarget.value)}
+                  />
+                ) : (
+                  <CellView
+                    key={item.key}
+                    value={row[item.index] ?? null}
+                    state={cellState?.(rowItem.index, item.index) ?? null}
+                    left={NUMBER + item.start}
+                    width={item.size}
+                    column={item.index}
+                    selected={isSelected && selected?.col === item.index}
+                    onClick={() => {
+                      onSelect({ row: rowItem.index, col: item.index })
+                      scroller.current?.focus()
+                    }}
+                    onDoubleClick={() => startEditing({ row: rowItem.index, col: item.index })}
+                  />
+                ),
+              )}
             </div>
           )
         })}
@@ -210,29 +320,40 @@ export function DataGrid({
 
 function CellView({
   value,
+  state,
   left,
   width,
   column,
   selected,
   onClick,
+  onDoubleClick,
 }: {
   value: string | null
+  state: 'changed' | 'default' | null
   left: number
   width: number
   column: number
   selected: boolean
   onClick(): void
+  onDoubleClick(): void
 }) {
   return (
     <div
-      className={`cell${selected ? ' selected' : ''}`}
+      className={`cell${selected ? ' selected' : ''}${state ? ` ${state}` : ''}`}
       role="gridcell"
       aria-colindex={column + 1}
       aria-selected={selected}
       style={{ left, width }}
       onClick={onClick}
+      onDoubleClick={onDoubleClick}
     >
-      {value === null ? <span className="null">NULL</span> : shown(value)}
+      {state === 'default' ? (
+        <span className="null">DEFAULT</span>
+      ) : value === null ? (
+        <span className="null">NULL</span>
+      ) : (
+        shown(value)
+      )}
     </div>
   )
 }

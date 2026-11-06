@@ -50,6 +50,14 @@ function fakeDriver(overrides: Partial<Driver> = {}) {
       durationMs: 1,
     }),
     count: async () => 42,
+    sql: { identifier: (n) => `"${n}"`, literal: (v) => (v === null ? 'NULL' : `'${v}'`) },
+    apply: async (_target, changes, options) => ({
+      statements: changes.map((c) => c.type),
+      applied: !options.dryRun,
+    }),
+    export: async function* () {
+      yield { columns: [{ name: 'id' }], rows: [['1'], ['2']] }
+    },
     info: async () => ({ product: 'PostgreSQL', version: '17.11', database: 'shop', user: 'ana' }),
     query: async (sql, options) => {
       calls.push({ sql, options })
@@ -338,6 +346,8 @@ describe('createDbAdmin', () => {
       'POST /api/count',
       'POST /api/rows',
       'POST /api/query',
+      'POST /api/apply',
+      'POST /api/export',
       'POST /api/cancel',
     ])
     for (const route of admin.routes) expect(route.path).not.toMatch(/[*[]|:.*:/)
@@ -361,6 +371,139 @@ describe('createDbAdmin', () => {
     expect(audit).toHaveBeenCalledWith(
       expect.objectContaining({ action: 'count', statement: 'count public.posts', rows: 42 }),
     )
+  })
+
+  describe('applying changes', () => {
+    const changes = [
+      { type: 'insert', values: { title: 'New', body: null } },
+      { type: 'update', key: { id: '1' }, values: { title: 'Changed' } },
+      { type: 'delete', key: { id: '2' } },
+    ]
+    const body = (extra: object = {}) => ({
+      connection: 'main',
+      schema: 'public',
+      table: 'posts',
+      changes,
+      ...extra,
+    })
+
+    it('applies them on a write connection, and audits it', async () => {
+      const { admin, audit } = setup()
+      const { status, body: answer } = await json(
+        await admin.fetch(call('/db/api/apply', { body: body() })),
+      )
+      expect(status).toBe(200)
+      expect(answer).toEqual({ statements: ['insert', 'update', 'delete'], applied: true })
+      expect(audit).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: 'apply',
+          statement: 'insert;\nupdate;\ndelete',
+          rows: 3,
+        }),
+      )
+    })
+
+    it('shows the statements of a dry run without applying them or auditing', async () => {
+      const { admin, audit } = setup()
+      const { body: answer } = await json(
+        await admin.fetch(call('/db/api/apply', { body: body({ dryRun: true }) })),
+      )
+      expect(answer.applied).toBe(false)
+      expect(audit).not.toHaveBeenCalled()
+    })
+
+    it('refuses a read-only connection', async () => {
+      const { admin } = setup()
+      const { status, body: answer } = await json(
+        await admin.fetch(call('/db/api/apply', { body: body({ connection: 'reports' }) })),
+      )
+      expect(status).toBe(403)
+      expect(answer.error.code).toBe('read-only')
+    })
+
+    it.each([
+      [[], '"changes" is a list of 1 to 1000 changes.'],
+      [[{ type: 'upsert' }], '"changes[0].type" is insert, update or delete.'],
+      [
+        [{ type: 'update', key: {}, values: { a: 'b' } }],
+        '"changes[0].key" names 1 to 1000 columns.',
+      ],
+      [
+        [{ type: 'update', key: { id: '1' }, values: {} }],
+        '"changes[0].values" names 1 to 1000 columns.',
+      ],
+      [[{ type: 'delete', key: { id: null } }], '"changes[0].key.id" is text.'],
+      [[{ type: 'delete', key: { id: 1 } }], '"changes[0].key.id" is text.'],
+      [[{ type: 'insert', values: { n: 5 } }], '"changes[0].values.n" is text or null.'],
+      [[{ type: 'insert', values: ['x'] }], '"changes[0].values" maps column names to values.'],
+    ])('refuses %j', async (bad, message) => {
+      const { admin } = setup()
+      const { status, body: answer } = await json(
+        await admin.fetch(
+          call('/db/api/apply', {
+            body: { connection: 'main', schema: 'public', table: 'posts', changes: bad },
+          }),
+        ),
+      )
+      expect(status).toBe(400)
+      expect(answer.error.message).toBe(message)
+    })
+  })
+
+  describe('exporting', () => {
+    it('streams the file to download, and audits how many rows went', async () => {
+      const { admin, audit } = setup()
+      const response = await admin.fetch(
+        call('/db/api/export', {
+          body: { connection: 'reports', schema: 'public', table: 'my posts', format: 'csv' },
+        }),
+      )
+      expect(response.headers.get('content-type')).toBe('text/csv; charset=utf-8')
+      expect(response.headers.get('content-disposition')).toBe(
+        'attachment; filename="my_posts.csv"',
+      )
+      expect(await response.text()).toBe('id\r\n1\r\n2\r\n')
+      await vi.waitFor(() =>
+        expect(audit).toHaveBeenCalledWith(
+          expect.objectContaining({
+            action: 'export',
+            statement: 'public.my posts as csv',
+            rows: 2,
+          }),
+        ),
+      )
+    })
+
+    it('answers a table that fails at once with the error, not half a file', async () => {
+      const failing = fakeDriver({
+        // eslint-disable-next-line require-yield -- it fails before its first batch, as a missing table does
+        export: async function* () {
+          throw new QueryError('relation "nope" does not exist', '42P01')
+        },
+      })
+      const { admin } = setup({}, failing)
+      const { status, body } = await json(
+        await admin.fetch(
+          call('/db/api/export', {
+            body: { connection: 'main', schema: 'public', table: 'nope', format: 'json' },
+          }),
+        ),
+      )
+      expect(status).toBe(400)
+      expect(body.error.sqlState).toBe('42P01')
+    })
+
+    it('refuses a format it doesn’t write', async () => {
+      const { admin } = setup()
+      const { body } = await json(
+        await admin.fetch(
+          call('/db/api/export', {
+            body: { connection: 'main', schema: 'public', table: 'posts', format: 'xlsx' },
+          }),
+        ),
+      )
+      expect(body.error.message).toBe('"format" is csv, json or sql.')
+    })
   })
 
   describe('filters', () => {

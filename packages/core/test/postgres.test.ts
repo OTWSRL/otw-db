@@ -244,6 +244,166 @@ describe('the PostgreSQL driver', () => {
     })
   })
 
+  describe('applying changes', () => {
+    const products = { schema: 'shop', table: 'products' }
+    const names = async () =>
+      (await db.query('SELECT name, price FROM shop.products ORDER BY id', read)).rows
+
+    it('shows the statements with their values written in, and changes nothing on a dry run', async () => {
+      const before = await names()
+      const { statements, applied } = await db.apply(
+        products,
+        [
+          { type: 'insert', values: { name: "Kid's pen", price: '2.00' } },
+          { type: 'update', key: { id: '1' }, values: { name: 'Pen', details: null } },
+          { type: 'delete', key: { id: '3' } },
+          { type: 'insert', values: {} },
+        ],
+        { timeoutMs: 5_000, dryRun: true },
+      )
+      expect(applied).toBe(false)
+      expect(statements).toEqual([
+        `INSERT INTO "shop"."products" ("name", "price") VALUES ('Kid''s pen', '2.00')`,
+        `UPDATE "shop"."products" SET "name" = 'Pen', "details" = NULL WHERE "id" = '1'`,
+        `DELETE FROM "shop"."products" WHERE "id" = '3'`,
+        'INSERT INTO "shop"."products" DEFAULT VALUES',
+      ])
+      expect(await names()).toEqual(before)
+    })
+
+    it('applies inserts, updates and deletes together, reading each value as its column’s type', async () => {
+      await db.apply(
+        products,
+        [
+          { type: 'insert', values: { name: 'Mug', price: '7.5', details: '{"color": "blue"}' } },
+          { type: 'update', key: { id: '2' }, values: { price: '13' } },
+        ],
+        { timeoutMs: 5_000 },
+      )
+      const rows = (
+        await db.query(
+          "SELECT price, details->>'color' FROM shop.products WHERE name IN ('Mug', 'book') ORDER BY price",
+          read,
+        )
+      ).rows
+      expect(rows).toEqual([
+        ['7.50', 'blue'],
+        ['13.00', null],
+      ])
+      const mug = (await db.query("SELECT id FROM shop.products WHERE name = 'Mug'", read))
+        .rows[0]![0]!
+      await db.apply(products, [{ type: 'delete', key: { id: mug } }], { timeoutMs: 5_000 })
+      expect(
+        (await db.query("SELECT count(*) FROM shop.products WHERE name = 'Mug'", read)).rows,
+      ).toEqual([['0']])
+      await db.apply(products, [{ type: 'update', key: { id: '2' }, values: { price: '12.00' } }], {
+        timeoutMs: 5_000,
+      })
+    })
+
+    it('saves nothing when a row it changes is gone, not even the changes before it', async () => {
+      const before = await names()
+      const error = await db
+        .apply(
+          products,
+          [
+            { type: 'update', key: { id: '1' }, values: { name: 'Changed' } },
+            { type: 'delete', key: { id: '999' } },
+          ],
+          { timeoutMs: 5_000 },
+        )
+        .catch((e: unknown) => e)
+      expect(error).toMatchObject({ status: 409, code: 'conflict' })
+      expect((error as Error).message).toContain(`DELETE FROM "shop"."products" WHERE "id" = '999'`)
+      expect(await names()).toEqual(before)
+    })
+
+    it('saves nothing when a key matches more than one row, not even the changes before it', async () => {
+      await db.query("INSERT INTO shop.products (name, price) VALUES ('pen', 1.50)", write)
+      const before = await names()
+      const error = await db
+        .apply(
+          products,
+          [
+            { type: 'update', key: { id: '2' }, values: { name: 'changed' } },
+            { type: 'delete', key: { price: '1.50' } },
+          ],
+          { timeoutMs: 5_000 },
+        )
+        .catch((e: unknown) => e)
+      expect(error).toMatchObject({
+        code: 'conflict',
+        message: expect.stringContaining('its key matched 2 rows'),
+      })
+      expect(await names()).toEqual(before)
+      await db.query(
+        'DELETE FROM shop.products WHERE id = (SELECT max(id) FROM shop.products)',
+        write,
+      )
+    })
+
+    it('reports a value the column refuses as the database does, and saves nothing', async () => {
+      await expect(
+        db.apply(products, [{ type: 'update', key: { id: '1' }, values: { price: '-5' } }], {
+          timeoutMs: 5_000,
+        }),
+      ).rejects.toMatchObject({ sqlState: '23514' })
+      await expect(
+        db.apply(products, [{ type: 'insert', values: { id: '50', name: 'x', price: '1' } }], {
+          timeoutMs: 5_000,
+        }),
+      ).rejects.toMatchObject({ sqlState: '428C9' })
+    })
+  })
+
+  describe('exporting', () => {
+    it('reads every row in batches, filtered and in order, in a read-only transaction', async () => {
+      await db.query(
+        'CREATE TABLE shop.big AS SELECT n AS id, md5(n::text) AS hash FROM generate_series(1, 2500) n',
+        write,
+      )
+      const batches: number[] = []
+      let last = ''
+      for await (const batch of db.export(
+        {
+          schema: 'shop',
+          table: 'big',
+          filters: [{ column: 'id', operator: '>', value: '100' }],
+          order: [{ column: 'id', descending: true }],
+        },
+        { timeoutMs: 5_000 },
+      )) {
+        expect(batch.columns).toEqual([{ name: 'id' }, { name: 'hash' }])
+        batches.push(batch.rows.length)
+        last = batch.rows.at(-1)![0]!
+      }
+      expect(batches).toEqual([1000, 1000, 400])
+      expect(last).toBe('101')
+    })
+
+    it('gives an empty table its columns', async () => {
+      const batches = []
+      for await (const batch of db.export(
+        { schema: 'shop', table: 'big', filters: [{ column: 'id', operator: '<', value: '0' }] },
+        { timeoutMs: 5_000 },
+      )) {
+        batches.push(batch)
+      }
+      expect(batches).toEqual([{ columns: [{ name: 'id' }, { name: 'hash' }], rows: [] }])
+    })
+
+    it('closes its connection when the reader stops early, and the pool goes on', async () => {
+      for await (const batch of db.export({ schema: 'shop', table: 'big' }, { timeoutMs: 5_000 })) {
+        expect(batch.rows).toHaveLength(1000)
+        break
+      }
+      // Three queries at once: every connection in the pool of three is usable.
+      const answers = await Promise.all([1, 2, 3].map((n) => db.query(`SELECT ${n}`, read)))
+      expect(answers.map((a) => a.rows[0]![0])).toEqual(['1', '2', '3'])
+      await db.query('DROP TABLE shop.big', write)
+    })
+  })
+
   it('reports the server, its database and who it connects as', async () => {
     expect(await db.info()).toEqual({
       product: 'PostgreSQL',

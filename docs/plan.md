@@ -145,7 +145,7 @@ zone, numerics and int8 their digits, json its spelling), rows as arrays beside 
 2. **UI** (`db-ui`), done 2026-11-07, without saved queries (history only) and `mount()` untried in
    a host: connections, schema tree, table browser (virtualized grid), SQL editor
    (CodeMirror 6, schema-aware), results; served by the handler; `mount()`.
-3. **Editing and export:** row edits as previewed SQL in one transaction, destructive-statement
+3. **Editing and export**, done 2026-11-07: row edits as previewed SQL in one transaction, destructive-statement
    confirmation, CSV/JSON/SQL export streamed.
 4. **MySQL/MariaDB and SQLite**, and one conformance suite all drivers pass.
 5. **Hosts:** Next.js and Express/Fastify/Koa/Hono examples with e2e; the CMS plugin with its site.

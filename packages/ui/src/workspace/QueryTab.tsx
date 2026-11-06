@@ -3,7 +3,9 @@ import { useEffect, useRef, useState, type MouseEvent as ReactMouseEvent } from 
 import { ApiError, type QueryResult } from '../api.ts'
 import { remember } from '../history.ts'
 import { looksLikeWrite, splitStatements, statementAt, type Statement } from '../sql.ts'
+import { toCsv, toJson } from '@otwdesign/db-core/format'
 import { ConfirmDialog } from '../ui/Dialog.tsx'
+import { download, ExportMenu } from '../ui/ExportMenu.tsx'
 import { Icon } from '../ui/icons.tsx'
 import { useWorkspace } from './context.ts'
 import { DataGrid, type Cell } from './DataGrid.tsx'
@@ -198,6 +200,17 @@ export function QueryTab({ id, sql, onChange, schema, defaultSchema, active, onH
           <span>{connection.access === 'read' ? 'Read-only connection' : ''}</span>
         )}
         <span className="spacer" />
+        {result && result.columns.length > 0 && (
+          <ExportMenu
+            formats={['csv', 'json']}
+            onExport={(format) => {
+              const names = result.columns.map((c) => c.name)
+              const text = format === 'csv' ? toCsv(names, result.rows) : toJson(names, result.rows)
+              const type = format === 'csv' ? 'text/csv' : 'application/json'
+              download(new Blob([text], { type: `${type};charset=utf-8` }), `result.${format}`)
+            }}
+          />
+        )}
         <span aria-live="polite">
           {running
             ? 'Running…'

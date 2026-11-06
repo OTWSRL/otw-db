@@ -237,3 +237,161 @@ test('keeps the history of statements run, and its tabs across a reload', async 
     'SELECT 42 AS answer',
   )
 })
+
+test.describe('editing', () => {
+  async function openTable(page: Page, schema: string, table: string) {
+    if (schema !== 'public') await page.getByLabel('Schema').selectOption(schema)
+    await page.getByRole('button', { name: new RegExp(`^${table}`) }).click()
+    await expect(cell(page, `${schema}.${table}`, 1, 1)).not.toBeEmpty()
+  }
+
+  async function editCell(
+    page: Page,
+    gridName: string,
+    row: number,
+    col: number,
+    column: string,
+    value: string,
+  ) {
+    await cell(page, gridName, row, col).dblclick()
+    await page.getByLabel(`Edit ${column}`).fill(value)
+    await page.getByLabel(`Edit ${column}`).press('Enter')
+  }
+
+  test('edits a cell, shows the SQL with ⌘S, and commits it', async ({ page }) => {
+    await open(page, 'Blog')
+    await openTable(page, 'public', 'users')
+    await editCell(page, 'public.users', 1, 3, 'name', 'Ada')
+    await expect(cell(page, 'public.users', 1, 3)).toHaveText('Ada')
+    await expect(cell(page, 'public.users', 1, 3)).toHaveClass(/changed/)
+    await expect(page.getByText('1 change', { exact: true })).toBeVisible()
+    await page.keyboard.press(`${MOD}+s`)
+    const dialog = page.getByRole('alertdialog', { name: 'Commit changes?' })
+    await expect(dialog.locator('pre')).toHaveText(
+      `UPDATE "public"."users" SET "name" = 'Ada' WHERE "id" = '1';`,
+    )
+    await dialog.getByRole('button', { name: 'Commit' }).click()
+    await expect(dialog).toBeHidden()
+    await expect(page.getByText('1 change', { exact: true })).toBeHidden()
+    await expect(cell(page, 'public.users', 1, 3)).not.toHaveClass(/changed/)
+    await page.reload()
+    await expect(cell(page, 'public.users', 1, 3)).toHaveText('Ada')
+    // Back as it was, for the other tests.
+    await editCell(page, 'public.users', 1, 3, 'name', 'User 1')
+    await page.getByRole('button', { name: 'Commit', exact: true }).click()
+    await page.getByRole('alertdialog').getByRole('button', { name: 'Commit' }).click()
+    await expect(cell(page, 'public.users', 1, 3)).toHaveText('User 1')
+  })
+
+  test('adds and deletes rows, ⌘Z steps back, and Discard drops what’s left', async ({ page }) => {
+    await open(page, 'Blog')
+    await openTable(page, 'shop', 'products')
+    await page.getByRole('button', { name: 'Row', exact: true }).click()
+    await expect(grid(page, 'shop.products').locator('[aria-rowindex="5"]')).toHaveClass(/inserted/)
+    await expect(cell(page, 'shop.products', 4, 2)).toHaveText('DEFAULT')
+    await editCell(page, 'shop.products', 4, 2, 'name', 'Lamp shade')
+    await editCell(page, 'shop.products', 4, 3, 'price', '9.99')
+    await cell(page, 'shop.products', 3, 2).click()
+    await page.keyboard.press('Delete')
+    await expect(grid(page, 'shop.products').locator('[aria-rowindex="4"]')).toHaveClass(/deleted/)
+    await expect(page.getByText('2 changes')).toBeVisible()
+    await page.keyboard.press(`${MOD}+z`)
+    await expect(grid(page, 'shop.products').locator('[aria-rowindex="4"]')).not.toHaveClass(
+      /deleted/,
+    )
+    await expect(page.getByText('1 change', { exact: true })).toBeVisible()
+    await page.keyboard.press('Delete')
+    await page.keyboard.press(`${MOD}+s`)
+    const dialog = page.getByRole('alertdialog')
+    await expect(dialog.locator('pre')).toHaveText(
+      `DELETE FROM "shop"."products" WHERE "id" = '3';\nINSERT INTO "shop"."products" ("name", "price") VALUES ('Lamp shade', '9.99');`,
+    )
+    await dialog.getByRole('button', { name: 'Commit' }).click()
+    await expect(cell(page, 'shop.products', 3, 2)).toHaveText('Lamp shade')
+    await expect(cell(page, 'shop.products', 3, 1)).toHaveText('4')
+    // Put the lamp back: a staged edit, then Discard, then the real change.
+    await editCell(page, 'shop.products', 3, 2, 'name', 'Never saved')
+    await page.getByRole('button', { name: 'Discard' }).click()
+    await expect(cell(page, 'shop.products', 3, 2)).toHaveText('Lamp shade')
+    await sql(page, "UPDATE shop.products SET id = 3, name = 'Lamp', price = 30.25 WHERE id = 4")
+    await page.keyboard.press(`${MOD}+Enter`)
+    await expect(page.getByRole('status')).toContainText('UPDATE · 1 rows affected')
+  })
+
+  test('saves nothing when a row changed in the meantime', async ({ page }) => {
+    await open(page, 'Blog')
+    await openTable(page, 'shop', 'products')
+    await editCell(page, 'shop.products', 2, 3, 'price', '99')
+    await sql(page, 'UPDATE shop.products SET id = 200 WHERE id = 2')
+    await page.keyboard.press(`${MOD}+Enter`)
+    await expect(page.getByRole('status')).toContainText('UPDATE · 1 rows affected')
+    await page.getByRole('tab', { name: /products/ }).click()
+    await page.getByRole('button', { name: 'Commit', exact: true }).click()
+    const dialog = page.getByRole('alertdialog')
+    await dialog.getByRole('button', { name: 'Commit' }).click()
+    await expect(dialog.getByRole('alert')).toContainText(
+      'Nothing was saved: its row is gone or its key changed.',
+    )
+    await dialog.getByRole('button', { name: 'Cancel' }).click()
+    await expect(page.getByText('1 change', { exact: true })).toBeVisible()
+    await page.getByRole('button', { name: 'Discard' }).click()
+    await page.getByRole('tab', { name: /Query/ }).click()
+    await page
+      .locator('.tab-body:not([hidden]) .cm-content')
+      .fill('UPDATE shop.products SET id = 2 WHERE id = 200')
+    await page.keyboard.press(`${MOD}+Enter`)
+    await expect(page.getByRole('status')).toContainText('UPDATE · 1 rows affected')
+  })
+
+  test('offers no editing on a read-only connection or a view', async ({ page }) => {
+    await open(page, 'Blog (read-only)')
+    await openTable(page, 'public', 'users')
+    await expect(page.getByRole('button', { name: 'Row', exact: true })).toBeHidden()
+    await cell(page, 'public.users', 1, 3).dblclick()
+    await expect(page.getByLabel('Edit name')).toBeHidden()
+    await page.getByRole('button', { name: 'Connections' }).click()
+    await page.getByRole('button', { name: 'Blog', exact: true }).click()
+    await page.getByRole('button', { name: /^admins/ }).click()
+    await expect(page.getByText('Read-only: no primary key')).toBeVisible()
+  })
+})
+
+test.describe('exporting', () => {
+  test('downloads a table, filtered and in order, as CSV', async ({ page }) => {
+    await open(page, 'Blog')
+    await page.getByRole('button', { name: /^users/ }).click()
+    await page.keyboard.press(`${MOD}+f`)
+    const bar = page.getByRole('form', { name: 'Filters' })
+    await bar.getByLabel('Column').selectOption('id')
+    await bar.getByLabel('Operator').selectOption('<=')
+    await bar.getByLabel('Value').fill('2')
+    await bar.getByLabel('Value').press('Enter')
+    await expect(page.getByText('Rows 1–2')).toBeVisible()
+    await page.getByRole('button', { name: 'Export' }).click()
+    const saved = page.waitForEvent('download')
+    await page.getByRole('menuitem', { name: 'CSV' }).click()
+    const file = await saved
+    expect(file.suggestedFilename()).toBe('users.csv')
+    const text = await new Response(
+      (await file.createReadStream()) as unknown as ReadableStream,
+    ).text()
+    expect(text).toBe(
+      'id,email,name,joined,admin\r\n1,user1@example.com,User 1,2026-01-01 09:00:00+00,t\r\n2,user2@example.com,User 2,2026-01-01 09:00:00+00,f\r\n',
+    )
+  })
+
+  test('downloads a query’s result as JSON', async ({ page }) => {
+    await open(page, 'Blog')
+    await sql(page, "SELECT 1 AS n, NULL AS nothing, 'x' AS t")
+    await page.keyboard.press(`${MOD}+Enter`)
+    await expect(cell(page, 'Result', 1, 3)).toHaveText('x')
+    await page.getByRole('button', { name: 'Export' }).click()
+    const saved = page.waitForEvent('download')
+    await page.getByRole('menuitem', { name: 'JSON' }).click()
+    const file = await saved
+    const text = await new Response(
+      (await file.createReadStream()) as unknown as ReadableStream,
+    ).text()
+    expect(JSON.parse(text)).toEqual([{ n: '1', nothing: null, t: 'x' }])
+  })
+})

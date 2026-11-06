@@ -21,6 +21,9 @@
   --danger-bg: #fdecea;
   --warning-bg: #fff6e0;
   --null: #a1a1a6;
+  --changed: #fff1b8;
+  --inserted: #dcf5e3;
+  --deleted: #fde0e0;
   --shadow: 0 8px 30px rgba(0, 0, 0, 0.18);
   --tag-local: #2ea44f;
   --tag-development: #2f80ed;
@@ -50,6 +53,9 @@
     --danger-bg: #3b1f1d;
     --warning-bg: #3a3020;
     --null: #6b6b74;
+    --changed: #4b4115;
+    --inserted: #183a24;
+    --deleted: #4a2020;
     --shadow: 0 8px 30px rgba(0, 0, 0, 0.5);
     color-scheme: dark;
   }
@@ -663,6 +669,60 @@ kbd {
 }
 .grid-row.selected .cell {
   background: var(--selection);
+}
+/* Staged edits: changed cells, new rows and rows to delete, until ⌘S. */
+.cell.changed {
+  background: var(--changed);
+}
+.grid-row.inserted .cell:not(.number-cell) {
+  background: var(--inserted);
+}
+.grid-row.deleted .cell:not(.number-cell) {
+  background: var(--deleted);
+  color: var(--text-dim);
+  text-decoration: line-through;
+}
+.cell-editor {
+  position: absolute;
+  top: 0;
+  z-index: 3;
+  height: 100%;
+  padding: 0 7px;
+  border: 2px solid var(--selection-strong);
+  outline: none;
+  background: var(--bg-input);
+  font: inherit;
+}
+.menu {
+  position: absolute;
+  bottom: 34px;
+  z-index: 5;
+  display: flex;
+  flex-direction: column;
+  min-width: 140px;
+  padding: 4px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--bg);
+  box-shadow: var(--shadow);
+}
+.menu button {
+  padding: 5px 10px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+.menu button:hover,
+.menu button:focus-visible {
+  background: var(--accent);
+  color: var(--accent-text);
+  outline: none;
+}
+.changes {
+  color: var(--text);
+  font-weight: 600;
 }
 .cell .null {
   color: var(--null);

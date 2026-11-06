@@ -1,11 +1,14 @@
 import { driverKind } from './connections.ts'
 import { openDriver } from './drivers/index.ts'
 import { DbAdminError, QueryError } from './errors.ts'
+import { EXPORT_TYPES, exportStream } from './export.ts'
 import type {
   Access,
   AuditEvent,
+  Change,
   ConnectionConfig,
   Driver,
+  ExportFormat,
   Filter,
   FilterOperator,
   Limits,
@@ -70,6 +73,7 @@ const MAX_BODY = 1_048_576
 const NAME = /^[a-z0-9]+(?:-[a-z0-9]+)*$/
 const QUERY_ID = /^[A-Za-z0-9_-]{1,64}$/
 const MAX_FILTERS = 20
+const MAX_CHANGES = 1_000
 const MAX_LIST = 1_000
 const OPERATORS: ReadonlySet<string> = new Set<FilterOperator>([
   '=',
@@ -339,6 +343,100 @@ export function createDbAdmin(options: DbAdminOptions): DbAdmin {
     },
     {
       method: 'POST',
+      path: '/api/apply',
+      async run(request, viewer) {
+        const body = await json(request)
+        const { connection, access } = reach(viewer, body.connection)
+        const target = { schema: text(body.schema, 'schema'), table: text(body.table, 'table') }
+        const changes = changesOf(body.changes)
+        const dryRun = body.dryRun === true
+        if (access !== 'write') {
+          throw new DbAdminError(`Connection "${connection.name}" is read-only.`, 403, 'read-only')
+        }
+        const started = performance.now()
+        try {
+          const result = await driver(connection).apply(target, changes, {
+            timeoutMs: limits.timeoutMs,
+            dryRun,
+          })
+          if (!dryRun) {
+            await record({
+              viewer: viewer.id,
+              connection: connection.name,
+              action: 'apply',
+              statement: result.statements.join(';\n'),
+              durationMs: Math.round(performance.now() - started),
+              rows: changes.length,
+            })
+          }
+          return result
+        } catch (error) {
+          if (!dryRun) {
+            await record({
+              viewer: viewer.id,
+              connection: connection.name,
+              action: 'apply',
+              statement: `${changes.length} changes to ${target.schema}.${target.table}`,
+              durationMs: Math.round(performance.now() - started),
+              error: (error as Error).message,
+            })
+          }
+          throw error
+        }
+      },
+    },
+    {
+      method: 'POST',
+      path: '/api/export',
+      async run(request, viewer) {
+        const body = await json(request)
+        const { connection } = reach(viewer, body.connection)
+        const format = formatOf(body.format)
+        const page = rowsRequest({ ...body, limit: undefined, offset: undefined })
+        const opened = driver(connection)
+        const started = performance.now()
+        const batches = opened.export(page, { timeoutMs: limits.timeoutMs })
+        // Read the first batch before answering, so a bad table or filter is a proper error.
+        const first = await batches.next()
+        let replayed = false
+        const replay: AsyncIterator<{ columns: { name: string }[]; rows: (string | null)[][] }> = {
+          next: async () => {
+            if (replayed) return batches.next()
+            replayed = true
+            return first
+          },
+          return: async () => batches.return(undefined),
+        }
+        const stream = exportStream(
+          format,
+          replay,
+          page,
+          opened.sql,
+          (rows, error) =>
+            void record({
+              viewer: viewer.id,
+              connection: connection.name,
+              action: 'export',
+              statement: `${page.schema}.${page.table} as ${format}`,
+              durationMs: Math.round(performance.now() - started),
+              rows,
+              ...(error ? { error: error.message } : {}),
+            }),
+        )
+        const { type, extension } = EXPORT_TYPES[format]
+        const file = `${page.table}.${extension}`.replace(/[^\w.-]+/g, '_')
+        return new Response(stream, {
+          headers: {
+            'content-type': type,
+            'content-disposition': `attachment; filename="${file}"`,
+            'cache-control': 'no-store',
+            'x-content-type-options': 'nosniff',
+          },
+        })
+      },
+    },
+    {
+      method: 'POST',
       path: '/api/cancel',
       async run(request, viewer) {
         const queryId = id((await json(request)).queryId)
@@ -398,7 +496,9 @@ export function createDbAdmin(options: DbAdminOptions): DbAdmin {
       }
       const viewer = await options.authorize(request)
       if (!viewer) throw new DbAdminError('Sign in first.', 401, 'unauthorized')
-      return reply(200, await run(viewer))
+      const answer = await run(viewer)
+      // A download answers with its own response; everything else with JSON.
+      return answer instanceof Response ? answer : reply(200, answer)
     } catch (error) {
       return failure(error)
     }
@@ -577,6 +677,65 @@ function rowsRequest(body: Record<string, unknown>): RowsRequest {
     }),
     filters: filtersOf(body.filters),
   }
+}
+
+const FORMATS: ReadonlySet<string> = new Set<ExportFormat>(['csv', 'json', 'sql'])
+
+function formatOf(value: unknown): ExportFormat {
+  if (typeof value !== 'string' || !FORMATS.has(value)) {
+    throw bad('"format" is csv, json or sql.')
+  }
+  return value as ExportFormat
+}
+
+/** Column names to values: text, and null where `nulls` allows it. */
+function values(
+  value: unknown,
+  field: string,
+  nulls: boolean,
+  atLeastOne: boolean,
+): Record<string, string | null> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw bad(`"${field}" maps column names to values.`)
+  }
+  const entries = Object.entries(value as Record<string, unknown>)
+  if ((atLeastOne && !entries.length) || entries.length > 1_000) {
+    throw bad(`"${field}" names 1 to 1000 columns.`)
+  }
+  for (const [column, v] of entries) {
+    if (!column) throw bad(`"${field}" has a column without a name.`)
+    if (typeof v !== 'string' && !(nulls && v === null)) {
+      throw bad(`"${field}.${column}" is text${nulls ? ' or null' : ''}.`)
+    }
+  }
+  return Object.fromEntries(entries) as Record<string, string | null>
+}
+
+/** The grid's staged edits, each checked for the fields its type needs. */
+function changesOf(value: unknown): Change[] {
+  if (!Array.isArray(value) || !value.length || value.length > MAX_CHANGES) {
+    throw bad(`"changes" is a list of 1 to ${MAX_CHANGES} changes.`)
+  }
+  return value.map((entry: unknown, i): Change => {
+    const change = (entry ?? {}) as Record<string, unknown>
+    const at = `changes[${i}]`
+    if (change.type === 'insert')
+      return { type: 'insert', values: values(change.values ?? {}, `${at}.values`, true, false) }
+    if (change.type === 'update') {
+      return {
+        type: 'update',
+        key: values(change.key, `${at}.key`, false, true) as Record<string, string>,
+        values: values(change.values, `${at}.values`, true, true),
+      }
+    }
+    if (change.type === 'delete') {
+      return {
+        type: 'delete',
+        key: values(change.key, `${at}.key`, false, true) as Record<string, string>,
+      }
+    }
+    throw bad(`"${at}.type" is insert, update or delete.`)
+  })
 }
 
 function bad(message: string): DbAdminError {

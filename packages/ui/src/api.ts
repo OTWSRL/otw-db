@@ -1,8 +1,11 @@
 import type {
   Access,
+  ApplyResult,
   Capabilities,
+  Change,
   ConnectionTag,
   DriverKind,
+  ExportFormat,
   Filter,
   QueryResult,
   ResultSet,
@@ -12,7 +15,17 @@ import type {
   UiConfig,
 } from '@otwdesign/db-core'
 
-export type { Filter, QueryResult, ResultSet, ServerInfo, TableDetail, TableSummary }
+export type {
+  ApplyResult,
+  Change,
+  ExportFormat,
+  Filter,
+  QueryResult,
+  ResultSet,
+  ServerInfo,
+  TableDetail,
+  TableSummary,
+}
 
 /** A connection as the API lists it: never its URL. */
 export interface Connection {
@@ -63,8 +76,8 @@ export interface RowsQuery {
 
 /** The API, with the header every call needs and its errors as ApiError. */
 export function createApi(config: UiConfig, onUnauthorized: () => void) {
-  async function call<T>(path: string, body?: unknown, signal?: AbortSignal): Promise<T> {
-    const response = await fetch(`${config.api}${path}`, {
+  function send(path: string, body?: unknown, signal?: AbortSignal): Promise<Response> {
+    return fetch(`${config.api}${path}`, {
       method: body === undefined ? 'GET' : 'POST',
       headers: {
         'x-db-admin': '1',
@@ -74,6 +87,15 @@ export function createApi(config: UiConfig, onUnauthorized: () => void) {
       credentials: 'same-origin',
       signal,
     })
+  }
+
+  async function call<T>(path: string, body?: unknown, signal?: AbortSignal): Promise<T> {
+    const response = await send(path, body, signal)
+    if (!response.ok) throw await failure(response)
+    return (await response.json()) as T
+  }
+
+  async function failure(response: Response): Promise<ApiError> {
     const answer = (await response.json().catch(() => ({}))) as {
       error?: {
         code: string
@@ -84,20 +106,17 @@ export function createApi(config: UiConfig, onUnauthorized: () => void) {
         hint?: string
       }
     }
-    if (!response.ok) {
-      if (response.status === 401) onUnauthorized()
-      const e = answer.error
-      throw new ApiError(
-        response.status,
-        e?.code ?? 'failed',
-        e?.message ?? `The server answered ${response.status}.`,
-        e?.sqlState,
-        e?.position,
-        e?.detail,
-        e?.hint,
-      )
-    }
-    return answer as T
+    if (response.status === 401) onUnauthorized()
+    const e = answer.error
+    return new ApiError(
+      response.status,
+      e?.code ?? 'failed',
+      e?.message ?? `The server answered ${response.status}.`,
+      e?.sqlState,
+      e?.position,
+      e?.detail,
+      e?.hint,
+    )
   }
   const q = (params: Record<string, string>) => new URLSearchParams(params).toString()
 
@@ -117,6 +136,24 @@ export function createApi(config: UiConfig, onUnauthorized: () => void) {
       call<{ count: number }>('/count', request, signal).then((r) => r.count),
     query: (connection: string, sql: string, queryId: string, signal?: AbortSignal) =>
       call<QueryResult>('/query', { connection, sql, queryId }, signal),
+    apply: (request: {
+      connection: string
+      schema: string
+      table: string
+      changes: Change[]
+      dryRun?: boolean
+    }) => call<ApplyResult>('/apply', request),
+    /** A table (filtered and in order) as a file, with the name the server gave it. */
+    exportTable: async (
+      request: Omit<RowsQuery, 'limit' | 'offset'> & { format: ExportFormat },
+    ): Promise<{ blob: Blob; filename: string }> => {
+      const response = await send('/export', request)
+      if (!response.ok) throw await failure(response)
+      const disposition = response.headers.get('content-disposition') ?? ''
+      const filename =
+        /filename="([^"]+)"/.exec(disposition)?.[1] ?? `${request.table}.${request.format}`
+      return { blob: await response.blob(), filename }
+    },
     cancel: (queryId: string) =>
       call<{ canceled: boolean }>('/cancel', { queryId }).then((r) => r.canceled),
   }

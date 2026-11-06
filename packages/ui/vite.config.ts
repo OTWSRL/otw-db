@@ -1,3 +1,4 @@
+import { fileURLToPath } from 'node:url'
 import react from '@vitejs/plugin-react'
 import { defineConfig } from 'vite'
 
@@ -8,6 +9,12 @@ import { defineConfig } from 'vite'
  */
 export default defineConfig({
   plugins: [react()],
+  resolve: {
+    alias: {
+      // The core's file formats, shared with the server; a plain module with nothing from Node.
+      '@otwdesign/db-core/format': fileURLToPath(new URL('../core/src/format.ts', import.meta.url)),
+    },
+  },
   base: '/__OTW_DB_BASE__/',
   build: {
     outDir: 'dist/app',

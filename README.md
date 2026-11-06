@@ -3,8 +3,8 @@
 A database manager in your app: browse, query and inspect PostgreSQL (MySQL/MariaDB and SQLite
 are next) from an OTW CMS site, any Next.js app, any Node server, or on its own. Apache-2.0.
 
-> Work in progress: the engine, its API and the browser app are here; editing rows and export
-> are next. See [docs/plan.md](docs/plan.md).
+> Work in progress: the engine, its API and the browser app, with editing and export, are here;
+> MySQL/MariaDB and SQLite are next. See [docs/plan.md](docs/plan.md).
 
 | Package              | For                                                          |
 | -------------------- | ------------------------------------------------------------ |
@@ -20,6 +20,12 @@ a window with the schema's tables in a sidebar, tabs for tables and SQL editors,
 - **Tables:** pages of rows in a fast grid (sort by a header, resize, arrow keys, ⌘C), a filter bar
   with TablePlus's operators, exact counts on demand, the Structure view, and the selected row whole
   in the right-hand panel.
+- **Editing**, on a write connection, in tables with a primary key: double-click, Enter or type to
+  edit a cell (⌘⌫ sets NULL), "+ Row" to add, Delete to remove. Edits are staged in color until ⌘S
+  shows their SQL and commits them in one transaction: all or nothing, and nothing when a row
+  changed meanwhile. ⌘Z steps back; Discard drops them.
+- **Export:** a table (with its filters and order) as CSV, JSON or SQL INSERTs, streamed from the
+  server; a query's result as CSV or JSON.
 - **SQL editor:** completion of tables; ⌘↵ runs the statement at the cursor, ⇧⌘↵ them all, each
   with its own result; errors point at their line and column; Cancel stops the query on the server.
   Writes on a `production` connection ask first.

@@ -12,6 +12,11 @@
       "@otwdesign/source": "./src/index.ts",
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
+    },
+    "./format": {
+      "@otwdesign/source": "./src/format.ts",
+      "types": "./dist/format.d.ts",
+      "default": "./dist/format.js"
     }
   },
   "files": [

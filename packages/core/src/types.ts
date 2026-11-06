@@ -145,6 +145,34 @@ export interface RowsRequest {
   filters?: readonly Filter[]
 }
 
+/**
+ * One edit staged in the grid. Values are text, as the grid shows them; the database reads each
+ * as its column's type. An update or delete names its row by `key`, the primary key's values.
+ */
+export type Change =
+  | { type: 'insert'; values: Readonly<Record<string, string | null>> }
+  | {
+      type: 'update'
+      key: Readonly<Record<string, string>>
+      values: Readonly<Record<string, string | null>>
+    }
+  | { type: 'delete'; key: Readonly<Record<string, string>> }
+
+export interface ApplyResult {
+  /** Each change's statement, its values written in, for the review before ⌘S commits. */
+  statements: string[]
+  /** False for a dry run. */
+  applied: boolean
+}
+
+export type ExportFormat = 'csv' | 'json' | 'sql'
+
+/** How a database's SQL quotes names and values, for statements shown to people and exports. */
+export interface SqlDialect {
+  identifier(name: string): string
+  literal(value: string | null): string
+}
+
 /** The server a connection reaches, for the toolbar. */
 export interface ServerInfo {
   /** Such as `PostgreSQL`. */
@@ -182,6 +210,22 @@ export interface Driver {
     options: Omit<QueryOptions, 'access' | 'maxRows'>,
   ): Promise<number>
   info(): Promise<ServerInfo>
+  /**
+   * The changes in one transaction: all of them or none. Each update and delete must change
+   * exactly one row, or nothing is saved (someone else changed it, or its key isn't unique).
+   * `dryRun` only returns the statements.
+   */
+  apply(
+    target: { schema: string; table: string },
+    changes: readonly Change[],
+    options: { timeoutMs: number; dryRun?: boolean },
+  ): Promise<ApplyResult>
+  /** Every row that matches, a batch at a time, in a read-only transaction. */
+  export(
+    request: Pick<RowsRequest, 'schema' | 'table' | 'filters' | 'order'>,
+    options: { timeoutMs: number },
+  ): AsyncGenerator<{ columns: { name: string }[]; rows: (string | null)[][] }>
+  readonly sql: SqlDialect
   /** One statement. */
   query(sql: string, options: QueryOptions): Promise<QueryResult>
   close(): Promise<void>
@@ -203,7 +247,7 @@ export interface AuditEvent {
   at: string
   viewer: string
   connection: string
-  action: 'query' | 'rows' | 'count' | 'cancel'
+  action: 'query' | 'rows' | 'count' | 'apply' | 'export' | 'cancel'
   /** The SQL run, or for `rows`, the table read. */
   statement: string
   durationMs: number

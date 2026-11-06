@@ -5,6 +5,8 @@ interface Props {
   children: ReactNode
   confirmLabel: string
   danger?: boolean
+  /** While true, the confirm button waits (a request is on its way). */
+  busy?: boolean
   onConfirm(): void
   onCancel(): void
 }
@@ -18,6 +20,7 @@ export function ConfirmDialog({
   children,
   confirmLabel,
   danger,
+  busy,
   onConfirm,
   onCancel,
 }: Props) {
@@ -51,6 +54,7 @@ export function ConfirmDialog({
             ref={confirm}
             type="button"
             className={`button ${danger ? 'danger' : 'primary'}`}
+            disabled={busy}
             onClick={onConfirm}
           >
             {confirmLabel}

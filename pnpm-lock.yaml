@@ -48,6 +48,21 @@ importers:
         specifier: ^2.22.1
         version: 2.22.1(pg@8.23.1)
 
+  packages/db:
+    dependencies:
+      '@otwdesign/db-core':
+        specifier: workspace:*
+        version: link:../core
+      '@otwdesign/db-node':
+        specifier: workspace:*
+        version: link:../node
+      pg:
+        specifier: ^8.23.1
+        version: 8.23.1
+      pg-cursor:
+        specifier: ^2.22.1
+        version: 2.22.1(pg@8.23.1)
+
   packages/node:
     dependencies:
       '@otwdesign/db-core':

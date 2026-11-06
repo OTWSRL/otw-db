@@ -1,0 +1,22 @@
+{
+  "name": "@otwdesign/db",
+  "version": "0.0.0",
+  "description": "OTW DB on its own: npx @otwdesign/db opens a database manager in your browser, with every driver included.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "engines": {
+    "node": ">=22.18"
+  },
+  "bin": {
+    "otw-db": "./bin/otw-db.js"
+  },
+  "files": [
+    "bin"
+  ],
+  "dependencies": {
+    "@otwdesign/db-core": "workspace:*",
+    "@otwdesign/db-node": "workspace:*",
+    "pg": "^8.23.1",
+    "pg-cursor": "^2.22.1"
+  }
+}

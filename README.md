@@ -6,10 +6,11 @@ are next) from an OTW CMS site, any Next.js app, any Node server, or on its own.
 > Work in progress. The engine and its HTTP API are here; the browser UI is milestone 2. See
 > [docs/plan.md](docs/plan.md).
 
-| Package              | For                                                      |
-| -------------------- | -------------------------------------------------------- |
-| `@otwdesign/db-core` | The engine and its API, as one standard Fetch handler    |
-| `@otwdesign/db-node` | node:http, Express and Connect; and the `otw-db` command |
+| Package              | For                                                          |
+| -------------------- | ------------------------------------------------------------ |
+| `@otwdesign/db-core` | The engine and its API, as one standard Fetch handler        |
+| `@otwdesign/db-node` | node:http, Express and Connect                               |
+| `@otwdesign/db`      | The `otw-db` command, with every driver: `npx @otwdesign/db` |
 
 ## Connections
 
@@ -74,8 +75,7 @@ with a fixed path.
 ## On its own
 
 ```sh
-npm install @otwdesign/db-node pg pg-cursor
-DB_ADMIN_MAIN_URL=postgres://… npx otw-db
+DB_ADMIN_MAIN_URL=postgres://… npx @otwdesign/db
 ```
 
 It listens on 127.0.0.1:4010 and prints a link with a one-time token, which signs your browser in.

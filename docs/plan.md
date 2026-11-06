@@ -18,12 +18,13 @@ on its own from the command line. Apache-2.0.
 
 One engine, one HTTP surface, thin hosts.
 
-| Package                | Holds                                                                   | Depends on       |
-| ---------------------- | ----------------------------------------------------------------------- | ---------------- |
-| `@otwdesign/db-core`   | Drivers, introspection, queries, the Fetch handler (API and UI assets)  | Node 22.18+ only |
-| `@otwdesign/db-ui`     | The browser app, prebuilt (Vite), with its own React inside             | nothing at run   |
-| `@otwdesign/db-node`   | `toNodeHandler()` for node:http-style servers, and the `otw-db` command | `db-core`        |
-| `@otwdesign/plugin-db` | The OTW CMS plugin                                                      | `db-core`, SDK   |
+| Package                | Holds                                                                               | Depends on         |
+| ---------------------- | ----------------------------------------------------------------------------------- | ------------------ |
+| `@otwdesign/db-core`   | Drivers, introspection, queries, the Fetch handler (API and UI assets)              | Node 22.18+ only   |
+| `@otwdesign/db-ui`     | The browser app, prebuilt (Vite), with its own React inside                         | nothing at run     |
+| `@otwdesign/db-node`   | `toNodeHandler()` for node:http-style servers                                       | `db-core`          |
+| `@otwdesign/db`        | The `otw-db` command with every driver, for `npx @otwdesign/db` (Tahir, 2026-11-07) | `db-node`, drivers |
+| `@otwdesign/plugin-db` | The OTW CMS plugin                                                                  | `db-core`, SDK     |
 
 - **The Fetch handler is the contract.** `createDbAdmin(options)` returns `fetch(request)`, a
   standard `Request → Response` function, and `routes`, the same endpoints as a flat list.
@@ -152,9 +153,6 @@ zone, numerics and int8 their digits, json its spelling), rows as arrays beside 
 
 ## Open questions
 
-- `npx` for the standalone command: `db-node` keeps drivers as optional peers (hosts install only
-  theirs), so `npx @otwdesign/db-node` alone has no pg. A package that depends on db-node and every
-  driver, such as `@otwdesign/db`, would make `npx @otwdesign/db` work. Decide before release.
 - Cancel through a proxy that requires TLS with SNI (Neon) can't reach the server with pg's cancel
   request; the statement timeout still stops the query.
 

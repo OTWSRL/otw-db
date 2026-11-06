@@ -206,7 +206,8 @@ export function conformance(name: string, open: () => Promise<Fixture>) {
       expect(await f.driver.table(f.schema, 'conf_tmp')).not.toBeNull()
     })
 
-    it('stops a statement at the timeout', async () => {
+    it('stops a statement at the timeout', async (context) => {
+      if (!f.driver.capabilities.cancel) context.skip()
       const started = performance.now()
       await expect(f.driver.query(f.slow, { ...read, timeoutMs: 300 })).rejects.toBeInstanceOf(
         QueryError,
@@ -215,7 +216,9 @@ export function conformance(name: string, open: () => Promise<Fixture>) {
       expect((await f.driver.query('SELECT 1 AS one', read)).rows).toEqual([['1']])
     })
 
-    it('cancels a running statement when asked', async () => {
+    it('cancels a running statement when asked', async (context) => {
+      // PGlite runs on the host's thread: nothing can stop it mid-statement.
+      if (!f.driver.capabilities.cancel) context.skip()
       const controller = new AbortController()
       const started = performance.now()
       const query = f.driver.query(f.slow, { ...read, signal: controller.signal })

@@ -29,7 +29,10 @@ export interface Capabilities {
   schemas: boolean
   /** Schema changes roll back with their transaction. */
   transactionalDdl: boolean
-  /** A running query can be stopped. */
+  /**
+   * A running statement can be stopped: by Cancel, and at the time limit. Not in PGlite, which
+   * runs on the host's own thread.
+   */
   cancel: boolean
 }
 

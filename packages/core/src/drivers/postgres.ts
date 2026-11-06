@@ -3,20 +3,24 @@ import { connect } from 'node:net'
 import type { FieldDef, Pool, PoolClient, PoolConfig } from 'pg'
 import { ConnectionError, DbAdminError, QueryError } from '../errors.ts'
 import {
-  changeStatement,
-  doubleQuote,
-  orderBy,
-  Parameters,
-  where,
-  whole,
-  type Dialect,
-} from './sql.ts'
+  detail,
+  dialect,
+  INFO_SQL,
+  literal,
+  quote,
+  summary,
+  TABLE_SQL,
+  TABLES_SQL,
+  TYPE_NAMES_SQL,
+  versionOf,
+  type CatalogDetail,
+  type CatalogTable,
+} from './postgres-catalog.ts'
+import { changeStatement, orderBy, Parameters, where, whole } from './sql.ts'
 import type {
   ApplyResult,
   Capabilities,
   Change,
-  Column,
-  Definition,
   Driver,
   QueryOptions,
   QueryResult,
@@ -24,44 +28,11 @@ import type {
   RowsRequest,
   ServerInfo,
   TableDetail,
-  TableKind,
   TableSummary,
 } from '../types.ts'
 
 /** Every value as the server's text: nothing converted, so nothing lost. */
 const AS_TEXT = { getTypeParser: () => (value: string) => value }
-
-const KINDS: Record<string, TableKind> = {
-  r: 'table',
-  v: 'view',
-  m: 'materialized-view',
-  f: 'foreign-table',
-  p: 'partitioned-table',
-}
-const RELKINDS = `('r','v','m','f','p')`
-
-/** A name in double quotes, so any name is taken as a name and never as SQL. */
-export const quote = doubleQuote
-
-/** A value as a PostgreSQL literal, for statements shown to people and SQL exports. */
-export function literal(value: string | null): string {
-  if (value === null) return 'NULL'
-  // standard_conforming_strings, on since PostgreSQL 9.1, keeps backslashes literal in '…'.
-  return `'${value.replaceAll("'", "''")}'`
-}
-
-const dialect: Dialect = {
-  identifier: quote,
-  literal,
-  placeholder: (n) => `$${n}`,
-  text: (expression) => `${expression}::text`,
-  ilike: 'ILIKE',
-  likeEscapeChar: '\\',
-  likeEscape: '',
-  // One array parameter, read as the column's type's array.
-  inList: (expression, values, parameter) => `${expression} = ANY(${parameter(values)})`,
-  insertDefaults: 'DEFAULT VALUES',
-}
 
 /**
  * Ends a read: ROLLBACK undoes its settings (SET, SET ROLE) and anything it declared; session
@@ -160,64 +131,13 @@ class PostgresDriver implements Driver {
   }
 
   async tables(): Promise<TableSummary[]> {
-    const rows = await this.#catalog<CatalogTable>(
-      `SELECT n.nspname AS schema, c.relname AS name, c.relkind AS kind, c.reltuples AS estimate,
-              CASE WHEN c.relkind IN ('r','m') THEN pg_total_relation_size(c.oid) END AS bytes
-         FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-        WHERE c.relkind IN ${RELKINDS} AND NOT c.relispartition
-          AND n.nspname NOT IN ('pg_catalog', 'information_schema')
-          AND n.nspname NOT LIKE 'pg\\_toast%' AND n.nspname NOT LIKE 'pg\\_temp\\_%'
-        ORDER BY 1, 2`,
-    )
+    const rows = await this.#catalog<CatalogTable>(TABLES_SQL)
     return rows.map(summary)
   }
 
   async table(schema: string, name: string): Promise<TableDetail | null> {
-    const [row] = await this.#catalog<CatalogTable & CatalogDetail>(
-      `SELECT n.nspname AS schema, c.relname AS name, c.relkind AS kind, c.reltuples AS estimate,
-              CASE WHEN c.relkind IN ('r','m') THEN pg_total_relation_size(c.oid) END AS bytes,
-              obj_description(c.oid, 'pg_class') AS comment,
-              (SELECT coalesce(json_agg(json_build_object(
-                        'name', a.attname, 'type', format_type(a.atttypid, a.atttypmod),
-                        'nullable', NOT a.attnotnull, 'default', pg_get_expr(d.adbin, d.adrelid),
-                        'identity', a.attidentity, 'generated', a.attgenerated,
-                        'comment', col_description(a.attrelid, a.attnum)) ORDER BY a.attnum), '[]')
-                 FROM pg_attribute a
-                 LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
-                WHERE a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped) AS columns,
-              (SELECT coalesce(json_agg(a.attname ORDER BY k.ord), '[]')
-                 FROM pg_index i
-                 CROSS JOIN LATERAL unnest(i.indkey::int2[]) WITH ORDINALITY AS k(attnum, ord)
-                 JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum
-                WHERE i.indrelid = c.oid AND i.indisprimary) AS primary_key,
-              (SELECT coalesce(json_agg(json_build_object(
-                        'name', ic.relname, 'definition', pg_get_indexdef(i.indexrelid))
-                        ORDER BY ic.relname), '[]')
-                 FROM pg_index i JOIN pg_class ic ON ic.oid = i.indexrelid
-                WHERE i.indrelid = c.oid) AS indexes,
-              (SELECT coalesce(json_agg(json_build_object(
-                        'name', conname, 'definition', pg_get_constraintdef(oid), 'type', contype)
-                        ORDER BY conname), '[]')
-                 FROM pg_constraint WHERE conrelid = c.oid AND contype IN ('f', 'c')) AS constraints
-         FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-        WHERE n.nspname = $1 AND c.relname = $2 AND c.relkind IN ${RELKINDS}`,
-      [schema, name],
-    )
-    if (!row) return null
-    const constraints = JSON.parse(row.constraints) as (Definition & { type: 'f' | 'c' })[]
-    const pick = (type: 'f' | 'c') =>
-      constraints
-        .filter((c) => c.type === type)
-        .map(({ name, definition }) => ({ name, definition }))
-    return {
-      ...summary(row),
-      columns: (JSON.parse(row.columns) as CatalogColumn[]).map(column),
-      primaryKey: JSON.parse(row.primary_key) as string[],
-      indexes: JSON.parse(row.indexes) as Definition[],
-      foreignKeys: pick('f'),
-      checks: pick('c'),
-      comment: row.comment,
-    }
+    const [row] = await this.#catalog<CatalogTable & CatalogDetail>(TABLE_SQL, [schema, name])
+    return row ? detail(row) : null
   }
 
   async rows(
@@ -251,12 +171,8 @@ class PostgresDriver implements Driver {
   }
 
   async info(): Promise<ServerInfo> {
-    const [row] = await this.#catalog<Omit<ServerInfo, 'product'>>(
-      `SELECT current_setting('server_version') AS version, current_database() AS database,
-              current_user AS user`,
-    )
-    // Distributions add their own words after the number, as "17.2 (Debian 17.2-1)".
-    return { product: 'PostgreSQL', ...row!, version: row!.version.split(' ')[0]! }
+    const [row] = await this.#catalog<Omit<ServerInfo, 'product'>>(INFO_SQL)
+    return { product: 'PostgreSQL', ...row!, version: versionOf(row!.version) }
   }
 
   query(sql: string, options: QueryOptions): Promise<QueryResult> {
@@ -404,10 +320,7 @@ class PostgresDriver implements Driver {
       (oid) => !this.#typeNames.has(oid),
     )
     if (unknown.length) {
-      const rows = await this.#catalog<{ oid: string; name: string }>(
-        'SELECT oid::text AS oid, format_type(oid, NULL) AS name FROM pg_type WHERE oid = ANY($1::oid[])',
-        [unknown],
-      )
+      const rows = await this.#catalog<{ oid: string; name: string }>(TYPE_NAMES_SQL, [unknown])
       for (const row of rows) this.#typeNames.set(Number(row.oid), row.name)
     }
     return fields.map((f) => ({
@@ -501,65 +414,6 @@ function readCursor(
       cursor.close((closeError) => (closeError ? reject(closeError) : finish()))
     })
   })
-}
-
-interface CatalogTable {
-  schema: string
-  name: string
-  kind: string
-  estimate: string
-  bytes: string | null
-}
-
-interface CatalogDetail {
-  comment: string | null
-  columns: string
-  primary_key: string
-  indexes: string
-  constraints: string
-}
-
-interface CatalogColumn {
-  name: string
-  type: string
-  nullable: boolean
-  default: string | null
-  identity: string
-  generated: string
-  comment: string | null
-}
-
-function summary(row: CatalogTable): TableSummary {
-  const estimate = Number(row.estimate)
-  return {
-    schema: row.schema,
-    name: row.name,
-    kind: KINDS[row.kind] ?? 'table',
-    // -1 until the table is first vacuumed or analyzed.
-    estimatedRows: row.kind === 'v' || estimate < 0 ? null : Math.round(estimate),
-    bytes: row.bytes === null ? null : Number(row.bytes),
-  }
-}
-
-function column(c: CatalogColumn): Column {
-  const generated =
-    c.identity === 'a'
-      ? 'always'
-      : c.identity === 'd'
-        ? 'by default'
-        : c.generated === 's'
-          ? 'stored'
-          : c.generated === 'v'
-            ? 'virtual'
-            : null
-  return {
-    name: c.name,
-    type: c.type,
-    nullable: c.nullable,
-    default: c.default,
-    generated,
-    comment: c.comment,
-  }
 }
 
 function sqlState(error: unknown): string | undefined {

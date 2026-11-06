@@ -1,9 +1,20 @@
 name: CI
 
+# The CMS plugin's test site links the CMS's packages from a checkout next to this repo
+# (../nextjs-cms), as on a developer's machine, so each job checks out both.
+
 on:
   push:
     branches: [main]
   pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    working-directory: otw-db
 
 jobs:
   check:
@@ -43,17 +54,29 @@ jobs:
       TEST_MYSQL_URL: mysql://root:test@127.0.0.1:3306/conf
       TEST_MARIADB_URL: mariadb://root:test@127.0.0.1:3307/conf
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+        with:
+          path: otw-db
+      - uses: actions/checkout@v5
+        with:
+          repository: OTWSRL/otw-cms
+          path: nextjs-cms
       - uses: pnpm/action-setup@v4
-      - uses: actions/setup-node@v4
+        with:
+          package_json_file: otw-db/package.json
+      - uses: actions/setup-node@v5
         with:
           node-version: ${{ matrix.node }}
           cache: pnpm
+          cache-dependency-path: '*/pnpm-lock.yaml'
+      - run: pnpm install --frozen-lockfile
+        working-directory: nextjs-cms
       - run: pnpm install --frozen-lockfile
       - run: pnpm check
       - run: pnpm build
 
   e2e:
+    needs: check
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -67,20 +90,31 @@ jobs:
     env:
       E2E_POSTGRES_URL: postgres://postgres:e2e@127.0.0.1:5432/postgres
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+        with:
+          path: otw-db
+      - uses: actions/checkout@v5
+        with:
+          repository: OTWSRL/otw-cms
+          path: nextjs-cms
       - uses: pnpm/action-setup@v4
-      - uses: actions/setup-node@v4
+        with:
+          package_json_file: otw-db/package.json
+      - uses: actions/setup-node@v5
         with:
           node-version: '24'
           cache: pnpm
+          cache-dependency-path: '*/pnpm-lock.yaml'
+      - run: pnpm install --frozen-lockfile
+        working-directory: nextjs-cms
       - run: pnpm install --frozen-lockfile
       - run: pnpm exec playwright install --with-deps chromium
-      # The standalone server's suite, then the Next.js example's.
+      # The standalone server's suite, the Next.js example's, then the CMS plugin's.
       - run: pnpm test:e2e
       - uses: actions/upload-artifact@v4
         if: failure()
         with:
           name: playwright-traces
           path: |
-            test-results/
-            examples/next/test-results/
+            otw-db/test-results/
+            otw-db/examples/*/test-results/

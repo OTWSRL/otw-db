@@ -137,7 +137,11 @@ export function Workspace({ api, connection, onSwitch }: Props) {
               onClick={() => setRefreshKey((n) => n + 1)}
             />
           </div>
-          <div className={`status-pill ${tag}`} aria-label="Connection">
+          <div
+            className={`status-pill ${tag}`}
+            aria-label="Connection"
+            title={connection.warning ?? undefined}
+          >
             {connection.tag && <span className={`tag-dot ${tag}`} title={connection.tag} />}
             <strong>{info ? `${info.product} ${info.version}` : '…'}</strong>
             <span className="sep">:</span>

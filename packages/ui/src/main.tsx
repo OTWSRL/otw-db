@@ -5,7 +5,7 @@ import { readConfig } from './api.ts'
 import { App } from './App.tsx'
 import './styles.css'
 
-/** Where a host's page asks for the app, and with what: `<div data-otw-db='{"api":…,"style":…}'>`. */
+/** What a host's page gives the app: `<otw-db-app config='{"api":…,"style":…}'>`. */
 export interface EmbedConfig extends UiConfig {
   /** The app's stylesheet, loaded inside its shadow root. */
   style: string
@@ -23,23 +23,33 @@ export function mount(element: HTMLElement, config: UiConfig = readConfig()): ()
 }
 
 /**
- * Shows OTW DB inside a host's page, in a shadow root of `host`: the host's styles can't reach
- * the app, nor the app's the host.
+ * `<otw-db-app config='…'>`: OTW DB inside a host's page, in a shadow root, so the host's styles
+ * can't reach the app nor the app's the host. A custom element, so it shows wherever it's put,
+ * however it got there: on page load, or later by a client-side router (the CMS admin's).
  */
-export function embed(host: HTMLElement, config: EmbedConfig): () => void {
-  const shadow = host.shadowRoot ?? host.attachShadow({ mode: 'open' })
-  const style = document.createElement('link')
-  style.rel = 'stylesheet'
-  style.href = config.style
-  const container = document.createElement('div')
-  container.className = 'otw-db'
-  shadow.replaceChildren(style, container)
-  return mount(container, config)
+class OtwDbApp extends HTMLElement {
+  #unmount: (() => void) | null = null
+
+  connectedCallback() {
+    const config = JSON.parse(this.getAttribute('config') ?? '{}') as EmbedConfig
+    const shadow = this.shadowRoot ?? this.attachShadow({ mode: 'open' })
+    const style = document.createElement('link')
+    style.rel = 'stylesheet'
+    style.href = config.style
+    const container = document.createElement('div')
+    container.className = 'otw-db'
+    shadow.replaceChildren(style, container)
+    this.#unmount = mount(container, config)
+  }
+
+  disconnectedCallback() {
+    this.#unmount?.()
+    this.#unmount = null
+  }
 }
 
-// The standalone page has its root; a host's page marks where it wants the app.
+if (!customElements.get('otw-db-app')) customElements.define('otw-db-app', OtwDbApp)
+
+// The standalone page has its root.
 const page = document.getElementById('root')
 if (page) mount(page)
-for (const host of document.querySelectorAll<HTMLElement>('[data-otw-db]')) {
-  embed(host, JSON.parse(host.dataset.otwDb!) as EmbedConfig)
-}

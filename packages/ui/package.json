@@ -8,11 +8,17 @@
     ".": {
       "types": "./assets.d.ts",
       "default": "./dist/assets.js"
+    },
+    "./entry": {
+      "types": "./entry.d.ts",
+      "default": "./dist/entry.js"
     }
   },
   "files": [
     "assets.d.ts",
-    "dist/assets.js"
+    "entry.d.ts",
+    "dist/assets.js",
+    "dist/entry.js"
   ],
   "scripts": {
     "build": "vite build && node scripts/pack-assets.mjs",

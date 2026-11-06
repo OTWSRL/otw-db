@@ -18,6 +18,8 @@ export interface ConnectionConfig {
   label?: string
   /** Which environment it is, shown as the connection's color; `production` asks before writes. */
   tag?: ConnectionTag
+  /** Shown wherever people run SQL on it, such as what a heavy statement does to the host. */
+  warning?: string
 }
 
 /** A connection's environment, as a color: production red, staging orange, and so on. */

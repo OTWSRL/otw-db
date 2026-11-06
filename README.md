@@ -93,8 +93,15 @@ koa.use(koaMiddleware(dbAdmin)) // Koa, after koa-bodyparser too
 Each is tested with a real server. CommonJS apps `require()` it too (Node 22.12+). Bundlers leave
 the drivers to the host: a Next.js site builds without the ones it doesn't install.
 
-**Routers that register paths one by one** (the OTW CMS's): `dbAdmin.routes` lists every endpoint
-with a fixed path.
+**OTW CMS:** install `@otwdesign/plugin-db` like any plugin. Database appears in the admin for
+administrators (the `db.manage` capability), on the site's own database (read-only unless
+`DB_ADMIN_SITE_ACCESS=write`) and any `DB_ADMIN_<NAME>_URL` connections. On a site's embedded
+database (PGlite), a heavy statement holds the whole site until it finishes, and the tool says
+so. The plugin registers four routes at boot (about 0.2 ms) and loads the tool on the first
+request to it.
+
+**Routers that register paths one by one:** `dbAdmin.routes`, or `ROUTES` from
+`@otwdesign/db-core/routes` to register at boot without loading the tool: four patterns.
 
 ## On its own
 

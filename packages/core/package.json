@@ -17,6 +17,11 @@
       "@otwdesign/source": "./src/format.ts",
       "types": "./dist/format.d.ts",
       "default": "./dist/format.js"
+    },
+    "./routes": {
+      "@otwdesign/source": "./src/routes.ts",
+      "types": "./dist/routes.d.ts",
+      "default": "./dist/routes.js"
     }
   },
   "files": [

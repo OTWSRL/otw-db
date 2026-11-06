@@ -15,5 +15,6 @@ export {
   type DbAdminOptions,
   type DbAdminRoute,
 } from './handler.ts'
+export { ROUTES } from './routes.ts'
 export { renderAsset, renderIndex, type UiAssets, type UiConfig } from './ui.ts'
 export type * from './types.ts'

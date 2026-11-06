@@ -148,7 +148,7 @@ zone, numerics and int8 their digits, json its spelling), rows as arrays beside 
 3. **Editing and export**, done 2026-11-07: row edits as previewed SQL in one transaction, destructive-statement
    confirmation, CSV/JSON/SQL export streamed.
 4. **MySQL/MariaDB and SQLite**, and one conformance suite all drivers pass, done 2026-11-07.
-5. **Hosts:** Next.js and Express/Fastify/Koa/Hono examples with e2e; the CMS plugin with its site.
+5. **Hosts**, done 2026-11-07 (Fastify, Koa, Hono, Next.js example, CMS plugin with its site): Next.js and Express/Fastify/Koa/Hono examples with e2e; the CMS plugin with its site.
 6. **Release:** docs (the docs site), installs of the packed tarballs into fresh Next.js, Express and
    CMS sites in CI, Changesets, trusted publishing.
 

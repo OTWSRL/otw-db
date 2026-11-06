@@ -1,0 +1,33 @@
+{
+  "name": "@otwdesign/plugin-db",
+  "version": "0.0.0",
+  "description": "OTW DB in the OTW CMS admin: browse, query and edit the site's database, and any other, the way TablePlus does.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./admin": "./src/admin.tsx"
+  },
+  "files": [
+    "src"
+  ],
+  "engines": {
+    "node": ">=22.18"
+  },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@otwdesign/db-core": "workspace:*",
+    "@otwdesign/db-ui": "workspace:*"
+  },
+  "peerDependencies": {
+    "@otwdesign/sdk": "^1.1.0",
+    "react": "^19.0.0"
+  },
+  "devDependencies": {
+    "@otwdesign/sdk": "link:../../../nextjs-cms/packages/sdk",
+    "@types/react": "^19.3.0",
+    "react": "^19.3.1"
+  }
+}

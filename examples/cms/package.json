@@ -1,0 +1,30 @@
+{
+  "name": "@otwdesign/db-example-cms",
+  "private": true,
+  "description": "An OTW CMS site with the Database plugin, which its e2e tests run on.",
+  "type": "module",
+  "scripts": {
+    "dev": "cms generate && next dev -p 3471",
+    "build": "cms generate && next build",
+    "start": "next start -p 3471",
+    "typecheck": "cms generate && next typegen && tsc --noEmit",
+    "test:e2e": "playwright test"
+  },
+  "dependencies": {
+    "@electric-sql/pglite": "^0.5.13",
+    "@opentelemetry/api": "~1.9.0",
+    "@otwdesign/admin-ui": "link:../../../nextjs-cms/packages/admin-ui",
+    "@otwdesign/next": "link:../../../nextjs-cms/packages/next",
+    "@otwdesign/plugin-db": "workspace:*",
+    "@otwdesign/sdk": "link:../../../nextjs-cms/packages/sdk",
+    "drizzle-orm": "^0.45.4",
+    "next": "^16.4.5",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1"
+  },
+  "devDependencies": {
+    "@otwdesign/cli": "link:../../../nextjs-cms/packages/cli",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.2.0"
+  }
+}

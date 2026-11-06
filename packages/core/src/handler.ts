@@ -15,6 +15,7 @@ import type {
   RowsRequest,
   Viewer,
 } from './types.ts'
+import { ROUTES } from './routes.ts'
 import { renderAsset, renderIndex, type UiAssets } from './ui.ts'
 
 export interface DbAdminOptions {
@@ -61,7 +62,10 @@ export interface DbAdmin {
   readonly basePath: string
   /** A standard Fetch handler: Next.js route handlers, Hono, Bun and Deno take it as it is. */
   fetch(request: Request): Promise<Response>
-  /** The same endpoints, flat: no path has more than its fixed segments. */
+  /**
+   * The patterns to register the handler under, for routers that take routes one by one (see
+   * ROUTES): each answers through `fetch`, which tells the endpoints apart.
+   */
   readonly routes: readonly DbAdminRoute[]
   /** Closes every connection it opened. */
   close(): Promise<void>
@@ -175,7 +179,8 @@ export function createDbAdmin(options: DbAdminOptions): DbAdmin {
           }
           const label = connection.label ?? connection.name
           const tag = connection.tag ?? null
-          return [{ name: connection.name, label, tag, kind, access, capabilities }]
+          const warning = connection.warning ?? null
+          return [{ name: connection.name, label, tag, warning, kind, access, capabilities }]
         })
         return { connections: visible }
       },
@@ -484,7 +489,7 @@ export function createDbAdmin(options: DbAdminOptions): DbAdmin {
         },
       ]
     : []
-  const routes = [...pages, ...api]
+  const serves = [...pages, ...api]
 
   async function respond(request: Request, run: (viewer: Viewer) => Promise<unknown>) {
     try {
@@ -504,14 +509,18 @@ export function createDbAdmin(options: DbAdminOptions): DbAdmin {
     }
   }
 
-  return {
+  const admin: DbAdmin = {
     basePath,
-    routes,
+    routes: ROUTES.filter((route) => loadUi || route.path.startsWith('/api/')).map((route) => ({
+      method: route.method,
+      path: route.path,
+      handler: (request: Request) => admin.fetch(request),
+    })),
     async fetch(request) {
       const pathname = new URL(request.url).pathname
       const within = pathname === basePath || pathname.startsWith(`${basePath}/`)
       const path = within ? pathname.slice(basePath.length) || '/' : null
-      const matches = path === null ? [] : routes.filter((route) => pathMatches(route.path, path))
+      const matches = path === null ? [] : serves.filter((route) => pathMatches(route.path, path))
       const route = matches.find((r) => r.method === request.method)
       if (route) return route.handler(request)
       if (matches.length) {
@@ -534,6 +543,7 @@ export function createDbAdmin(options: DbAdminOptions): DbAdmin {
       await Promise.all(open.map((d) => d.close()))
     },
   }
+  return admin
 }
 
 /** A page's response, or a 500 when its files can't be loaded (a build that's missing). */

@@ -3,6 +3,7 @@ import {
   createDbAdmin,
   QueryError,
   renderIndex,
+  ROUTES,
   type AuditEvent,
   type ConnectionConfig,
   type DbAdminOptions,
@@ -154,6 +155,7 @@ describe('createDbAdmin', () => {
         name: 'main',
         label: 'main',
         tag: 'production',
+        warning: null,
         kind: 'postgres',
         access: 'write',
         capabilities: { schemas: true, transactionalDdl: true, cancel: true },
@@ -334,23 +336,17 @@ describe('createDbAdmin', () => {
     expect(response.headers.get('x-content-type-options')).toBe('nosniff')
   })
 
-  it('lists its routes flat, for routers that match fixed segments and one-segment parameters', () => {
+  it('lists four patterns for routers that register routes one by one, each answering in full', async () => {
     const { admin } = setup({ ui: async () => UI })
-    expect(admin.routes.map((r) => `${r.method} ${r.path}`)).toEqual([
-      'GET /',
-      'GET /assets/:file',
-      'GET /api/connections',
-      'GET /api/tables',
-      'GET /api/table',
-      'GET /api/info',
-      'POST /api/count',
-      'POST /api/rows',
-      'POST /api/query',
-      'POST /api/apply',
-      'POST /api/export',
-      'POST /api/cancel',
-    ])
+    expect(admin.routes.map(({ method, path }) => ({ method, path }))).toEqual(ROUTES)
     for (const route of admin.routes) expect(route.path).not.toMatch(/[*[]|:.*:/)
+    const api = admin.routes.find((r) => r.method === 'GET' && r.path === '/api/:endpoint')!
+    expect((await api.handler(call('/db/api/connections'))).status).toBe(200)
+    // Without the app, its two patterns go.
+    expect(setup({ ui: false }).admin.routes.map((r) => r.path)).toEqual([
+      '/api/:endpoint',
+      '/api/:endpoint',
+    ])
   })
 
   it('reports the server and counts rows', async () => {

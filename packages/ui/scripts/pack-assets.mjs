@@ -33,5 +33,10 @@ writeFileSync(
   new URL('../dist/assets.js', import.meta.url),
   `export const assets = ${JSON.stringify({ index, files, entry })}\n`,
 )
+// The two names alone, for a host's admin page that loads them: nothing else comes with them.
+writeFileSync(
+  new URL('../dist/entry.js', import.meta.url),
+  `export const entry = ${JSON.stringify(entry)}\n`,
+)
 const size = Object.values(files).reduce((sum, f) => sum + f.body.length, 0)
 console.log(`pack-assets: ${Object.keys(files).length} files, ${Math.round(size / 1024)} KB`)

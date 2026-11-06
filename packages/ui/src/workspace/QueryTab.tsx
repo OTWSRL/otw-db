@@ -142,6 +142,11 @@ export function QueryTab({
 
   return (
     <div className="tab-body" hidden={!active}>
+      {connection.warning && (
+        <div className="notice warning" role="note">
+          {connection.warning}
+        </div>
+      )}
       <div className="query" ref={body} style={{ ['--editor' as string]: `${editorShare}%` }}>
         <Editor
           value={sql}

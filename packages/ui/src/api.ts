@@ -32,6 +32,8 @@ export interface Connection {
   name: string
   label: string
   tag: ConnectionTag | null
+  /** Shown wherever people run SQL on it. */
+  warning: string | null
   kind: DriverKind
   access: Access
   /** Null when this server has no driver for its kind yet. */

@@ -1,19 +1,17 @@
 name: Release
 
 # Runs after CI passes on main, so nothing is released from a commit whose checks, packed install
-# or e2e failed.
-# - Changesets waiting: opens or updates the "Version Packages" pull request (versions, changelogs,
-#   the CMS plugin's version).
-# - That pull request merged: builds and packs the packages whose version isn't on npm yet, and
-#   publishes them through npm trusted publishing, with provenance and no npm token. Only the
-#   publish job can mint the OIDC token npm accepts.
+# or e2e failed. A release is a commit on main, with no pull request: run `pnpm version-packages`
+# (versions, changelogs, the CMS plugin's version), commit it and push. Once CI passes on it, this
+# builds and packs the packages whose version isn't on npm yet, and publishes them through npm
+# trusted publishing, with provenance and no npm token. Only the publish job can mint the OIDC
+# token npm accepts. While changesets are waiting to be versioned, it does nothing.
 #
 # Like CI, each job checks out the CMS beside this repo (../nextjs-cms): the CMS plugin's test site
 # links its packages, and pnpm installs the whole workspace.
 #
-# Repository settings: Actions › General › "Allow GitHub Actions to create and approve pull
-# requests" must be on for the version job. Each package on npmjs.com names this repository and
-# this workflow file (release.yml) as its trusted publisher.
+# Each package on npmjs.com names this repository and this workflow file (release.yml) as its
+# trusted publisher.
 
 on:
   workflow_run:
@@ -61,40 +59,6 @@ jobs:
         uses: changesets/action/select-mode@v2
         with:
           cwd: otw-db
-
-  version:
-    needs: select-mode
-    if: needs.select-mode.outputs.mode == 'version'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      pull-requests: write
-    steps:
-      - uses: actions/checkout@v5
-        with:
-          ref: ${{ github.event.workflow_run.head_sha }}
-          path: otw-db
-      - uses: actions/checkout@v5
-        with:
-          repository: OTWSRL/otw-cms
-          path: nextjs-cms
-      - uses: pnpm/action-setup@v4
-        with:
-          package_json_file: otw-db/package.json
-      - uses: actions/setup-node@v5
-        with:
-          node-version: 24
-          cache: pnpm
-          cache-dependency-path: '*/pnpm-lock.yaml'
-      - run: pnpm install --frozen-lockfile
-        working-directory: nextjs-cms
-      - run: pnpm install --frozen-lockfile
-        working-directory: otw-db
-      - uses: changesets/action/version@v2
-        with:
-          cwd: otw-db
-          # changeset version, then the CMS plugin's version follows its package.json.
-          script: pnpm version-packages
 
   pack:
     needs: select-mode

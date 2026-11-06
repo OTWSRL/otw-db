@@ -45,6 +45,7 @@ export interface PGliteQueryable {
   exec(sql: string): Promise<unknown>
 }
 
+/** A PGlite instance the host already has open, such as the CMS's embedded database. */
 export interface PGliteLike extends PGliteQueryable {
   /** Its parsers by type OID: the types it would turn into JavaScript values. */
   parsers: Record<number, unknown>

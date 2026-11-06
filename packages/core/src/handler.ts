@@ -18,6 +18,7 @@ import type {
 import { ROUTES } from './routes.ts'
 import { renderAsset, renderIndex, type UiAssets } from './ui.ts'
 
+/** What `createDbAdmin` needs: who may use the tool, the databases it may open, its limits. */
 export interface DbAdminOptions {
   /** Where the host mounts it, such as `/db`; empty for the root. */
   basePath?: string
@@ -58,6 +59,7 @@ export interface DbAdminRoute {
   handler(request: Request): Promise<Response>
 }
 
+/** The tool `createDbAdmin` returns: one Fetch handler, serving the app and its API. */
 export interface DbAdmin {
   readonly basePath: string
   /** A standard Fetch handler: Next.js route handlers, Hono, Bun and Deno take it as it is. */
@@ -71,6 +73,7 @@ export interface DbAdmin {
   close(): Promise<void>
 }
 
+/** The limits when the options set none: 1,000 rows and 30 seconds per statement. */
 export const DEFAULT_LIMITS: Limits = { maxRows: 1_000, timeoutMs: 30_000 }
 const MAX_PAGE = 1_000
 const MAX_BODY = 1_048_576

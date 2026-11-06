@@ -7,6 +7,7 @@ export interface ExportBatch {
   rows: readonly (readonly (string | null)[])[]
 }
 
+/** Each export format's media type and file extension, for the download's headers. */
 export const EXPORT_TYPES: Record<ExportFormat, { type: string; extension: string }> = {
   csv: { type: 'text/csv; charset=utf-8', extension: 'csv' },
   json: { type: 'application/json; charset=utf-8', extension: 'json' },

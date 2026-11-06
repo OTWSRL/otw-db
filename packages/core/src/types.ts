@@ -38,6 +38,7 @@ export interface Capabilities {
   cancel: boolean
 }
 
+/** What a schema-tree entry is: SQLite and MySQL have tables and views, PostgreSQL the rest too. */
 export type TableKind =
   'table' | 'view' | 'materialized-view' | 'foreign-table' | 'partitioned-table'
 
@@ -52,6 +53,7 @@ export interface TableSummary {
   bytes: number | null
 }
 
+/** One column of a table, as Structure shows it. */
 export interface Column {
   name: string
   /** As the database spells it, such as `numeric(10,2)` or `timestamp with time zone`. */
@@ -73,6 +75,7 @@ export interface Definition {
   definition: string
 }
 
+/** A table whole, as Structure shows it: its columns, keys, indexes and checks. */
 export interface TableDetail extends TableSummary {
   columns: Column[]
   /** The primary key's columns, in order; empty without one. */
@@ -83,6 +86,7 @@ export interface TableDetail extends TableSummary {
   comment: string | null
 }
 
+/** One column of a result: its name, and the type the database gave it. */
 export interface ResultColumn {
   name: string
   /** The column's type as the database names it, such as `bigint` or `jsonb`. */
@@ -101,6 +105,7 @@ export interface ResultSet {
   durationMs: number
 }
 
+/** What one statement returned: its rows, and what the database says it did. */
 export interface QueryResult extends ResultSet {
   /** The statement's command, the first word of its tag: `SELECT`, `UPDATE`, `CREATE`. */
   command: string
@@ -163,6 +168,7 @@ export type Change =
     }
   | { type: 'delete'; key: Readonly<Record<string, string>> }
 
+/** The staged changes as the SQL that commits them, and whether it ran. */
 export interface ApplyResult {
   /** Each change's statement, its values written in, for the review before ⌘S commits. */
   statements: string[]
@@ -170,6 +176,7 @@ export interface ApplyResult {
   applied: boolean
 }
 
+/** An export's file: CSV, a JSON array of objects, or SQL with an INSERT a row. */
 export type ExportFormat = 'csv' | 'json' | 'sql'
 
 /** How a database's SQL quotes names and values, for statements shown to people and exports. */
@@ -188,6 +195,7 @@ export interface ServerInfo {
   user: string
 }
 
+/** How many rows one statement may send back, and how long it may run. */
 export interface Limits {
   /** Rows sent back at most; the rest are cut, and the result says so. */
   maxRows: number
@@ -195,6 +203,7 @@ export interface Limits {
   timeoutMs: number
 }
 
+/** How a driver runs one statement: with the connection's access, inside the limits. */
 export interface QueryOptions extends Limits {
   access: Access
   /** Aborting it stops the query on the server. */

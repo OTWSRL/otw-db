@@ -1,17 +1,7 @@
 import { entry } from '@otwdesign/db-ui/entry'
 import { defineAdmin } from '@otwdesign/sdk'
+import { createElement, type CSSProperties } from 'react'
 import db from './index'
-
-// React's own types are in scope inside its module.
-declare module 'react' {
-  // eslint-disable-next-line @typescript-eslint/no-namespace
-  namespace JSX {
-    interface IntrinsicElements {
-      /** The app, defined by its own script: it mounts wherever it's put. */
-      'otw-db-app': DetailedHTMLProps<HTMLAttributes<HTMLElement>, HTMLElement> & { config: string }
-    }
-  }
-}
 
 /** The admin entry: Database, the tool inside the admin's own frame. */
 export default defineAdmin(db, (cms) => {
@@ -26,23 +16,24 @@ export default defineAdmin(db, (cms) => {
   })
 })
 
+const frame: CSSProperties = {
+  display: 'block',
+  height: 'calc(100vh - 150px)',
+  minHeight: 480,
+  border: '1px solid #dcdce0',
+  borderRadius: 6,
+  overflow: 'hidden',
+}
+
 /** The app's script and its element; the element mounts the app in a shadow root of its own. */
 export function DatabaseScreen({ base }: { base: string }) {
   const config = JSON.stringify({ api: `${base}/api`, style: `${base}/assets/${entry.style}` })
   return (
     <>
       <script type="module" async src={`${base}/assets/${entry.script}`} />
-      <otw-db-app
-        config={config}
-        style={{
-          display: 'block',
-          height: 'calc(100vh - 150px)',
-          minHeight: 480,
-          border: '1px solid #dcdce0',
-          borderRadius: 6,
-          overflow: 'hidden',
-        }}
-      />
+      {/* createElement, not JSX: a JSX tag would need the element added to React's global JSX
+          types, which a site with its own copy of React's types (a linked checkout) can't take. */}
+      {createElement('otw-db-app', { config, style: frame })}
     </>
   )
 }

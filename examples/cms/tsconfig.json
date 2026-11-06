@@ -20,7 +20,9 @@
     ],
     "paths": {
       "@/*": ["./src/*"]
-    }
+    },
+    "customConditions": ["@otwdesign/source"],
+    "allowImportingTsExtensions": true
   },
   "include": [
     "next-env.d.ts",

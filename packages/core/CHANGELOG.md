@@ -1,5 +1,12 @@
 # @otwdesign/db-core
 
+## 1.0.2
+
+### Patch Changes
+
+- Updated dependencies [69e22b8]
+  - @otwdesign/db-ui@1.0.2
+
 ## 1.0.1
 
 ### Patch Changes

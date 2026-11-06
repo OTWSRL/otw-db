@@ -1,5 +1,18 @@
 # @otwdesign/plugin-db
 
+## 1.0.2
+
+### Patch Changes
+
+- 69e22b8: Two fixes in the app:
+
+  - Opening the Console no longer crashes the app. In today's Chrome `scrollIntoView()` returns a promise, and the console's effect handed it to React as its cleanup.
+  - Export works where the app sits in a shadow root: the CMS's Database screen, and any page with `<otw-db-app>`. A click on a format was taken for a click outside the menu, which closed first.
+
+- Updated dependencies [69e22b8]
+  - @otwdesign/db-ui@1.0.2
+  - @otwdesign/db-core@1.0.2
+
 ## 1.0.1
 
 ### Patch Changes

@@ -1,6 +1,6 @@
 {
   "name": "@otwdesign/plugin-db",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "OTW DB in the OTW CMS admin: browse, query and edit the site's database, and any other, the way TablePlus does.",
   "license": "Apache-2.0",
   "author": "OTW SRL",

@@ -1,6 +1,6 @@
 {
   "name": "@otwdesign/db",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "OTW DB on its own: npx @otwdesign/db opens a database manager in your browser, with every driver included.",
   "license": "Apache-2.0",
   "author": "OTW SRL",

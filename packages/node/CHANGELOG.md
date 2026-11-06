@@ -1,5 +1,11 @@
 # @otwdesign/db-node
 
+## 1.0.2
+
+### Patch Changes
+
+- @otwdesign/db-core@1.0.2
+
 ## 1.0.1
 
 ### Patch Changes

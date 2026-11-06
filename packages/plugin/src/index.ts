@@ -79,7 +79,7 @@ export function setup(cms: PluginContext): void {
 
 export default definePlugin({
   id: 'db',
-  version: '1.0.1',
+  version: '1.0.2',
   name: 'Database',
   icon: ICON,
   description:

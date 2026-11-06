@@ -1,0 +1,39 @@
+{
+  "name": "@otwdesign/db-ui",
+  "version": "0.0.0",
+  "description": "OTW DB's browser app, prebuilt: the files db-core serves, as one module.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./assets.d.ts",
+      "default": "./dist/assets.js"
+    }
+  },
+  "files": [
+    "assets.d.ts",
+    "dist/assets.js"
+  ],
+  "scripts": {
+    "build": "vite build && node scripts/pack-assets.mjs",
+    "dev": "vite",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "devDependencies": {
+    "@codemirror/autocomplete": "^6.20.4",
+    "@codemirror/commands": "^6.11.1",
+    "@codemirror/lang-sql": "^6.10.0",
+    "@codemirror/language": "^6.13.1",
+    "@codemirror/search": "^6.7.2",
+    "@codemirror/state": "^6.7.6",
+    "@codemirror/view": "^6.43.15",
+    "@lezer/highlight": "^1.2.5",
+    "@tanstack/react-virtual": "^3.14.26",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^6.2.1",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
+    "vite": "^8.3.6"
+  }
+}

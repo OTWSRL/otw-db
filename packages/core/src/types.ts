@@ -103,13 +103,56 @@ export interface QueryResult extends ResultSet {
   affectedRows: number | null
 }
 
-/** One page of a table, in the order given. */
+/** How a filter compares a column with its value, as TablePlus's filter bar offers. */
+export type FilterOperator =
+  | '='
+  | '<>'
+  | '<'
+  | '>'
+  | '<='
+  | '>='
+  | 'in'
+  | 'not in'
+  | 'between'
+  | 'not between'
+  | 'is null'
+  | 'is not null'
+  | 'like'
+  | 'not like'
+  | 'contains'
+  | 'not contains'
+  | 'starts with'
+  | 'ends with'
+
+/**
+ * One condition of the filter bar; a page's filters must all hold. `in` and `not in` take a list,
+ * `between` two values, `is null` none, the rest one. Values go to the database as parameters,
+ * never into the SQL, and it reads them as the column's type.
+ */
+export interface Filter {
+  column: string
+  operator: FilterOperator
+  value?: string | readonly string[]
+}
+
+/** One page of a table, filtered and in the order given. */
 export interface RowsRequest {
   schema: string
   table: string
   limit: number
   offset: number
   order?: readonly { column: string; descending?: boolean }[]
+  filters?: readonly Filter[]
+}
+
+/** The server a connection reaches, for the toolbar. */
+export interface ServerInfo {
+  /** Such as `PostgreSQL`. */
+  product: string
+  /** Such as `17.11`. */
+  version: string
+  database: string
+  user: string
 }
 
 export interface Limits {
@@ -133,6 +176,12 @@ export interface Driver {
   /** Null when there's no such table. */
   table(schema: string, name: string): Promise<TableDetail | null>
   rows(request: RowsRequest, options: Omit<QueryOptions, 'access' | 'maxRows'>): Promise<ResultSet>
+  /** How many rows match the filters: an exact count, which can take a while on a big table. */
+  count(
+    request: Pick<RowsRequest, 'schema' | 'table' | 'filters'>,
+    options: Omit<QueryOptions, 'access' | 'maxRows'>,
+  ): Promise<number>
+  info(): Promise<ServerInfo>
   /** One statement. */
   query(sql: string, options: QueryOptions): Promise<QueryResult>
   close(): Promise<void>
@@ -154,7 +203,7 @@ export interface AuditEvent {
   at: string
   viewer: string
   connection: string
-  action: 'query' | 'rows' | 'cancel'
+  action: 'query' | 'rows' | 'count' | 'cancel'
   /** The SQL run, or for `rows`, the table read. */
   statement: string
   durationMs: number

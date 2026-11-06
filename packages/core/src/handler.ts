@@ -6,10 +6,13 @@ import type {
   AuditEvent,
   ConnectionConfig,
   Driver,
+  Filter,
+  FilterOperator,
   Limits,
   RowsRequest,
   Viewer,
 } from './types.ts'
+import { renderAsset, renderIndex, type UiAssets } from './ui.ts'
 
 export interface DbAdminOptions {
   /** Where the host mounts it, such as `/db`; empty for the root. */
@@ -32,9 +35,19 @@ export interface DbAdminOptions {
   origins?: readonly string[]
   /** Opens a connection's driver; a host replaces it to hand over a connection it already has. */
   driver?(connection: ConnectionConfig): Driver
+  /**
+   * The browser app's files, loaded on the first page view. Defaults to `@otwdesign/db-ui`'s;
+   * `false` serves the API alone.
+   */
+  ui?: (() => Promise<UiAssets>) | false
+  /** Where the app sends a browser the API turns away (401): the host's sign-in page. */
+  signInUrl?: string
 }
 
-/** One endpoint, relative to the base path, for hosts that register routes one by one. */
+/**
+ * One endpoint, relative to the base path, for hosts that register routes one by one. A segment
+ * starting with `:` is a parameter, as `/assets/:file`; the handler reads it from the URL.
+ */
 export interface DbAdminRoute {
   method: 'GET' | 'POST'
   path: string
@@ -56,6 +69,28 @@ const MAX_PAGE = 1_000
 const MAX_BODY = 1_048_576
 const NAME = /^[a-z0-9]+(?:-[a-z0-9]+)*$/
 const QUERY_ID = /^[A-Za-z0-9_-]{1,64}$/
+const MAX_FILTERS = 20
+const MAX_LIST = 1_000
+const OPERATORS: ReadonlySet<string> = new Set<FilterOperator>([
+  '=',
+  '<>',
+  '<',
+  '>',
+  '<=',
+  '>=',
+  'in',
+  'not in',
+  'between',
+  'not between',
+  'is null',
+  'is not null',
+  'like',
+  'not like',
+  'contains',
+  'not contains',
+  'starts with',
+  'ends with',
+])
 /** Sent by the browser app on every call; a form on another site can't send it. */
 export const CSRF_HEADER = 'x-db-admin'
 
@@ -83,6 +118,8 @@ export function createDbAdmin(options: DbAdminOptions): DbAdmin {
   const drivers = new Map<string, Driver>()
   const running = new Map<string, { viewer: string; controller: AbortController }>()
   const open = options.driver ?? openDriver
+  const loadUi = options.ui === false ? undefined : (options.ui ?? defaultUi)
+  let ui: Promise<UiAssets> | undefined
 
   function driver(connection: ConnectionConfig): Driver {
     let found = drivers.get(connection.name)
@@ -159,6 +196,54 @@ export function createDbAdmin(options: DbAdminOptions): DbAdmin {
         )
         if (!table) throw new DbAdminError("There's no such table.", 404, 'unknown-table')
         return { table }
+      },
+    },
+    {
+      method: 'GET',
+      path: '/api/info',
+      async run(request, viewer) {
+        const { connection } = reach(viewer, new URL(request.url).searchParams.get('connection'))
+        return { info: await driver(connection).info() }
+      },
+    },
+    {
+      method: 'POST',
+      path: '/api/count',
+      async run(request, viewer) {
+        const body = await json(request)
+        const { connection } = reach(viewer, body.connection)
+        const target = {
+          schema: text(body.schema, 'schema'),
+          table: text(body.table, 'table'),
+          filters: filtersOf(body.filters),
+        }
+        const started = performance.now()
+        const statement = `count ${target.schema}.${target.table}`
+        try {
+          const rows = await driver(connection).count(target, {
+            timeoutMs: limits.timeoutMs,
+            signal: request.signal,
+          })
+          await record({
+            viewer: viewer.id,
+            connection: connection.name,
+            action: 'count',
+            statement,
+            durationMs: Math.round(performance.now() - started),
+            rows,
+          })
+          return { count: rows }
+        } catch (error) {
+          await record({
+            viewer: viewer.id,
+            connection: connection.name,
+            action: 'count',
+            statement,
+            durationMs: Math.round(performance.now() - started),
+            error: (error as Error).message,
+          })
+          throw error
+        }
       },
     },
     {
@@ -266,11 +351,42 @@ export function createDbAdmin(options: DbAdminOptions): DbAdmin {
     },
   ]
 
-  const routes: DbAdminRoute[] = endpoints.map((endpoint) => ({
+  const api: DbAdminRoute[] = endpoints.map((endpoint) => ({
     method: endpoint.method,
     path: endpoint.path,
     handler: (request) => respond(request, (viewer) => endpoint.run(request, viewer)),
   }))
+
+  /** The app's files hold no data, so they need no viewer: the API they call does. */
+  function assets(): Promise<UiAssets> {
+    ui ??= loadUi!().catch((error: unknown) => {
+      ui = undefined
+      throw error
+    })
+    return ui
+  }
+  const config = {
+    api: `${basePath}/api`,
+    ...(options.signInUrl ? { signInUrl: options.signInUrl } : {}),
+  }
+  const pages: DbAdminRoute[] = loadUi
+    ? [
+        {
+          method: 'GET',
+          path: '/',
+          handler: () => page(async () => renderIndex(await assets(), basePath, config)),
+        },
+        {
+          method: 'GET',
+          path: '/assets/:file',
+          handler: (request) =>
+            page(async () =>
+              renderAsset(await assets(), new URL(request.url).pathname.split('/').pop()!),
+            ),
+        },
+      ]
+    : []
+  const routes = [...pages, ...api]
 
   async function respond(request: Request, run: (viewer: Viewer) => Promise<unknown>) {
     try {
@@ -293,8 +409,9 @@ export function createDbAdmin(options: DbAdminOptions): DbAdmin {
     routes,
     async fetch(request) {
       const pathname = new URL(request.url).pathname
-      const path = pathname.startsWith(basePath) ? pathname.slice(basePath.length) || '/' : null
-      const matches = path === null ? [] : routes.filter((route) => route.path === path)
+      const within = pathname === basePath || pathname.startsWith(`${basePath}/`)
+      const path = within ? pathname.slice(basePath.length) || '/' : null
+      const matches = path === null ? [] : routes.filter((route) => pathMatches(route.path, path))
       const route = matches.find((r) => r.method === request.method)
       if (route) return route.handler(request)
       if (matches.length) {
@@ -319,16 +436,48 @@ export function createDbAdmin(options: DbAdminOptions): DbAdmin {
   }
 }
 
+/** A page's response, or a 500 when its files can't be loaded (a build that's missing). */
+async function page(render: () => Promise<Response>): Promise<Response> {
+  try {
+    return await render()
+  } catch (error) {
+    console.error('otw-db: the browser app could not be loaded', error)
+    return new Response('OTW DB could not load its browser app.', { status: 500 })
+  }
+}
+
+/** Whether `path` fits the route's: the same segments, a `:name` one matching any. */
+function pathMatches(pattern: string, path: string): boolean {
+  if (!pattern.includes(':')) return pattern === path
+  const want = pattern.split('/')
+  const have = path.split('/')
+  return (
+    want.length === have.length &&
+    want.every((segment, i) => (segment.startsWith(':') ? have[i] !== '' : segment === have[i]))
+  )
+}
+
+/** `@otwdesign/db-ui`'s files, imported on the first page view and never before. */
+async function defaultUi(): Promise<UiAssets> {
+  const { assets } = (await import('@otwdesign/db-ui')) as { assets: UiAssets }
+  return assets
+}
+
 function accessOf(viewer: Viewer, connection: ConnectionConfig): Access | null {
   const granted = viewer.access ? viewer.access(connection) : connection.access
   if (!granted) return null
   return granted === 'write' && connection.access === 'write' ? 'write' : 'read'
 }
 
+/** Segments of letters, digits and `. _ ~ -`: nothing a URL would encode, or HTML escape. */
+const BASE_PATH = /^(?:\/[A-Za-z0-9._~-]+)*$/
+
 function normalizeBase(basePath: string): string {
   const trimmed = basePath.replace(/\/+$/, '')
-  if (trimmed && !trimmed.startsWith('/')) {
-    throw new Error(`basePath starts with a slash, as in "/db", not "${basePath}".`)
+  if (!BASE_PATH.test(trimmed)) {
+    throw new Error(
+      `basePath is a path such as "/db" or "/admin/db": segments of letters, digits, . _ ~ and -, not "${basePath}".`,
+    )
   }
   return trimmed
 }
@@ -426,7 +575,43 @@ function rowsRequest(body: Record<string, unknown>): RowsRequest {
       }
       return { column: text(column, 'order.column'), descending: descending === true }
     }),
+    filters: filtersOf(body.filters),
   }
+}
+
+function bad(message: string): DbAdminError {
+  return new DbAdminError(message, 400, 'bad-request')
+}
+
+const strings = (value: unknown): value is string[] =>
+  Array.isArray(value) && value.every((v) => typeof v === 'string')
+
+/** The filter bar's conditions, each with the values its operator takes. */
+function filtersOf(value: unknown): Filter[] {
+  if (value === undefined) return []
+  if (!Array.isArray(value) || value.length > MAX_FILTERS) {
+    throw bad(`"filters" is a list of up to ${MAX_FILTERS} conditions.`)
+  }
+  return value.map((entry: unknown) => {
+    const { column, operator, value: given } = (entry ?? {}) as Record<string, unknown>
+    if (typeof operator !== 'string' || !OPERATORS.has(operator)) {
+      throw bad(`"${String(operator)}" isn't a filter.`)
+    }
+    const filter = { column: text(column, 'filters.column'), operator: operator as FilterOperator }
+    if (operator === 'is null' || operator === 'is not null') return filter
+    if (operator === 'in' || operator === 'not in') {
+      if (!strings(given) || !given.length || given.length > MAX_LIST) {
+        throw bad(`"${operator}" takes a list of 1 to ${MAX_LIST} values.`)
+      }
+      return { ...filter, value: given }
+    }
+    if (operator === 'between' || operator === 'not between') {
+      if (!strings(given) || given.length !== 2) throw bad(`"${operator}" takes two values.`)
+      return { ...filter, value: given }
+    }
+    if (typeof given !== 'string') throw bad(`"${operator}" takes one value.`)
+    return { ...filter, value: given }
+  })
 }
 
 function reply(status: number, body: unknown, headers: Record<string, string> = {}): Response {

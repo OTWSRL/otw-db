@@ -168,6 +168,91 @@ describe('the PostgreSQL driver', () => {
     expect(last.truncated).toBe(false)
   })
 
+  describe('filters', () => {
+    const page = (filters: Parameters<Driver['rows']>[0]['filters']) =>
+      db.rows(
+        {
+          schema: 'shop',
+          table: 'products',
+          limit: 10,
+          offset: 0,
+          order: [{ column: 'id' }],
+          filters,
+        },
+        { timeoutMs: 5_000 },
+      )
+    const names = async (filters: Parameters<typeof page>[0]) =>
+      (await page(filters)).rows.map((r) => r[1])
+
+    it.each([
+      [[{ column: 'price', operator: '>', value: '10' }], ['book', 'lamp']],
+      [[{ column: 'price', operator: '<=', value: '12' }], ['pen', 'book']],
+      [[{ column: 'name', operator: '=', value: 'pen' }], ['pen']],
+      [[{ column: 'name', operator: '<>', value: 'pen' }], ['book', 'lamp']],
+      [[{ column: 'id', operator: 'in', value: ['1', '3'] }], ['pen', 'lamp']],
+      [[{ column: 'id', operator: 'not in', value: ['1', '3'] }], ['book']],
+      [[{ column: 'price', operator: 'between', value: ['1', '12'] }], ['pen', 'book']],
+      [[{ column: 'price', operator: 'not between', value: ['1', '12'] }], ['lamp']],
+      [[{ column: 'details', operator: 'is null' }], ['book', 'lamp']],
+      [[{ column: 'details', operator: 'is not null' }], ['pen']],
+      [[{ column: 'name', operator: 'contains', value: 'AM' }], ['lamp']],
+      [[{ column: 'name', operator: 'not contains', value: 'o' }], ['pen', 'lamp']],
+      [[{ column: 'name', operator: 'starts with', value: 'B' }], ['book']],
+      [[{ column: 'name', operator: 'ends with', value: 'n' }], ['pen']],
+      [[{ column: 'name', operator: 'like', value: 'b%k' }], ['book']],
+      [[{ column: 'name', operator: 'not like', value: 'b%' }], ['pen', 'lamp']],
+      // A number's text, searched like any text.
+      [[{ column: 'price', operator: 'contains', value: '.25' }], ['lamp']],
+      [
+        [
+          { column: 'price', operator: '>', value: '1' },
+          { column: 'name', operator: 'contains', value: 'o' },
+        ],
+        ['book'],
+      ],
+    ] as const)('%j', async (filters, expected) => {
+      expect(await names(filters as never)).toEqual(expected)
+    })
+
+    it('takes % and _ in a search literally', async () => {
+      await db.query(
+        "INSERT INTO shop.products (name, price) VALUES ('100% wool', 5), ('1000 wool', 5)",
+        write,
+      )
+      expect(await names([{ column: 'name', operator: 'contains', value: '0%' }])).toEqual([
+        '100% wool',
+      ])
+      expect(await names([{ column: 'name', operator: 'contains', value: '0_w' }])).toEqual([])
+      await db.query("DELETE FROM shop.products WHERE name LIKE '%wool'", write)
+    })
+
+    it('passes values as parameters, so a quote is just a quote', async () => {
+      expect(await names([{ column: 'name', operator: '=', value: "x' OR '1'='1" }])).toEqual([])
+    })
+
+    it('reports a value the column can’t take as the database does', async () => {
+      await expect(
+        page([{ column: 'price', operator: '>', value: 'cheap' }]),
+      ).rejects.toMatchObject({ sqlState: '22P02' })
+    })
+
+    it('counts what matches', async () => {
+      const count = (filters?: Parameters<typeof page>[0]) =>
+        db.count({ schema: 'shop', table: 'products', filters }, { timeoutMs: 5_000 })
+      expect(await count()).toBe(3)
+      expect(await count([{ column: 'price', operator: '>', value: '10' }])).toBe(2)
+    })
+  })
+
+  it('reports the server, its database and who it connects as', async () => {
+    expect(await db.info()).toEqual({
+      product: 'PostgreSQL',
+      version: expect.stringMatching(/^17\.\d+$/),
+      database: 'postgres',
+      user: 'postgres',
+    })
+  })
+
   it('takes any name as a name, never as SQL', async () => {
     await expect(
       db.rows(

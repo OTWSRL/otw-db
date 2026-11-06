@@ -3,14 +3,29 @@
 A database manager in your app: browse, query and inspect PostgreSQL (MySQL/MariaDB and SQLite
 are next) from an OTW CMS site, any Next.js app, any Node server, or on its own. Apache-2.0.
 
-> Work in progress. The engine and its HTTP API are here; the browser UI is milestone 2. See
-> [docs/plan.md](docs/plan.md).
+> Work in progress: the engine, its API and the browser app are here; editing rows and export
+> are next. See [docs/plan.md](docs/plan.md).
 
 | Package              | For                                                          |
 | -------------------- | ------------------------------------------------------------ |
 | `@otwdesign/db-core` | The engine and its API, as one standard Fetch handler        |
 | `@otwdesign/db-node` | node:http, Express and Connect                               |
 | `@otwdesign/db`      | The `otw-db` command, with every driver: `npx @otwdesign/db` |
+
+## The app
+
+It works the way TablePlus does, with its own look: a connection list in environment colors, then
+a window with the schema's tables in a sidebar, tabs for tables and SQL editors, and a console.
+
+- **Tables:** pages of rows in a fast grid (sort by a header, resize, arrow keys, ⌘C), a filter bar
+  with TablePlus's operators, exact counts on demand, the Structure view, and the selected row whole
+  in the right-hand panel.
+- **SQL editor:** completion of tables; ⌘↵ runs the statement at the cursor, ⇧⌘↵ them all, each
+  with its own result; errors point at their line and column; Cancel stops the query on the server.
+  Writes on a `production` connection ask first.
+- **Shortcuts:** ⌘P open a table, ⌘E new SQL editor, ⌘R refresh, ⌘F filter, ⌥W close the tab (a
+  browser keeps ⌘W), ⌘[ and ⌘] switch tabs. Ctrl instead of ⌘ off a Mac.
+- Light and dark, following the system. Tabs and history are kept per connection in the browser.
 
 ## Connections
 
@@ -92,8 +107,9 @@ Install the ones you use; nothing else is loaded.
 
 ```sh
 pnpm install
-pnpm check   # lint, format, types, tests; the tests start PostgreSQL in Docker
+pnpm check      # lint, format, types, tests; the tests start PostgreSQL in Docker
 pnpm build
+pnpm test:e2e   # the app in Chromium against PostgreSQL in Docker (E2E_POSTGRES_URL for your own)
 ```
 
 Set `TEST_POSTGRES_URL` to test against a server of your own instead of Docker.

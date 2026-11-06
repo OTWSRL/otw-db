@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   createDbAdmin,
   QueryError,
+  renderIndex,
   type AuditEvent,
   type ConnectionConfig,
   type DbAdminOptions,
@@ -48,6 +49,8 @@ function fakeDriver(overrides: Partial<Driver> = {}) {
       truncated: false,
       durationMs: 1,
     }),
+    count: async () => 42,
+    info: async () => ({ product: 'PostgreSQL', version: '17.11', database: 'shop', user: 'ana' }),
     query: async (sql, options) => {
       calls.push({ sql, options })
       return {
@@ -65,6 +68,12 @@ function fakeDriver(overrides: Partial<Driver> = {}) {
   return { driver, calls }
 }
 
+const UI = {
+  index:
+    '<meta name="otw-db" content="%OTW_DB_CONFIG%"><script src="%OTW_DB_BASE%/assets/app-1.js"></script>',
+  files: { 'app-1.js': { type: 'text/javascript; charset=utf-8', body: 'console.log("app")' } },
+}
+
 const admins: { close(): Promise<void> }[] = []
 afterEach(async () => {
   await Promise.all(admins.splice(0).map((a) => a.close()))
@@ -79,6 +88,7 @@ function setup(options: Partial<DbAdminOptions> = {}, driver = fakeDriver()) {
       request.headers.get('authorization') === 'Bearer ok' ? { id: 'ana' } : null,
     driver: () => driver.driver,
     audit,
+    ui: false,
     ...options,
   })
   admins.push(admin)
@@ -316,17 +326,169 @@ describe('createDbAdmin', () => {
     expect(response.headers.get('x-content-type-options')).toBe('nosniff')
   })
 
-  it('lists its routes flat, for routers that match fixed segments only', () => {
-    const { admin } = setup()
+  it('lists its routes flat, for routers that match fixed segments and one-segment parameters', () => {
+    const { admin } = setup({ ui: async () => UI })
     expect(admin.routes.map((r) => `${r.method} ${r.path}`)).toEqual([
+      'GET /',
+      'GET /assets/:file',
       'GET /api/connections',
       'GET /api/tables',
       'GET /api/table',
+      'GET /api/info',
+      'POST /api/count',
       'POST /api/rows',
       'POST /api/query',
       'POST /api/cancel',
     ])
-    for (const route of admin.routes) expect(route.path).not.toMatch(/[:*[]/)
+    for (const route of admin.routes) expect(route.path).not.toMatch(/[*[]|:.*:/)
+  })
+
+  it('reports the server and counts rows', async () => {
+    const { admin, audit } = setup()
+    const info = await json(await admin.fetch(call('/db/api/info?connection=main')))
+    expect(info.body.info).toEqual({
+      product: 'PostgreSQL',
+      version: '17.11',
+      database: 'shop',
+      user: 'ana',
+    })
+    const counted = await json(
+      await admin.fetch(
+        call('/db/api/count', { body: { connection: 'main', schema: 'public', table: 'posts' } }),
+      ),
+    )
+    expect(counted.body).toEqual({ count: 42 })
+    expect(audit).toHaveBeenCalledWith(
+      expect.objectContaining({ action: 'count', statement: 'count public.posts', rows: 42 }),
+    )
+  })
+
+  describe('filters', () => {
+    const page = (filters: unknown) => ({
+      connection: 'main',
+      schema: 'public',
+      table: 'posts',
+      filters,
+    })
+
+    it('passes valid conditions on, each with the values its operator takes', async () => {
+      let seen: unknown
+      const { admin } = setup(
+        {},
+        fakeDriver({
+          rows: async (request) => {
+            seen = request.filters
+            return { columns: [], rows: [], truncated: false, durationMs: 0 }
+          },
+        }),
+      )
+      const filters = [
+        { column: 'title', operator: 'contains', value: 'db' },
+        { column: 'id', operator: 'in', value: ['1', '2'] },
+        { column: 'id', operator: 'between', value: ['1', '9'] },
+        { column: 'body', operator: 'is null', value: 'ignored' },
+        { column: 'title', operator: '=', value: '' },
+      ]
+      expect((await admin.fetch(call('/db/api/rows', { body: page(filters) }))).status).toBe(200)
+      expect(seen).toEqual([
+        { column: 'title', operator: 'contains', value: 'db' },
+        { column: 'id', operator: 'in', value: ['1', '2'] },
+        { column: 'id', operator: 'between', value: ['1', '9'] },
+        { column: 'body', operator: 'is null' },
+        { column: 'title', operator: '=', value: '' },
+      ])
+    })
+
+    it.each([
+      [{ column: 'id', operator: 'regex', value: 'x' }, '"regex" isn\'t a filter.'],
+      [{ column: 'id', operator: 'in', value: [] }, '"in" takes a list of 1 to 1000 values.'],
+      [{ column: 'id', operator: 'in', value: '1,2' }, '"in" takes a list of 1 to 1000 values.'],
+      [{ column: 'id', operator: 'between', value: ['1'] }, '"between" takes two values.'],
+      [{ column: 'id', operator: '=', value: 1 }, '"=" takes one value.'],
+      [{ operator: '=', value: '1' }, '"filters.column" is required.'],
+    ])('refuses %o', async (filter, message) => {
+      const { admin } = setup()
+      const { status, body } = await json(
+        await admin.fetch(call('/db/api/rows', { body: page([filter]) })),
+      )
+      expect(status).toBe(400)
+      expect(body.error.message).toBe(message)
+    })
+
+    it('refuses more than 20 conditions', async () => {
+      const { admin } = setup()
+      const many = Array(21).fill({ column: 'id', operator: 'is null' })
+      const { body } = await json(await admin.fetch(call('/db/api/count', { body: page(many) })))
+      expect(body.error.message).toBe('"filters" is a list of up to 20 conditions.')
+    })
+  })
+
+  describe('the browser app', () => {
+    const page = (path: string) => new Request(`http://example.com${path}`)
+
+    it('serves its page at the base path, with or without the slash, to anyone: the API it calls checks', async () => {
+      const { admin } = setup({ ui: async () => UI, signInUrl: '/login?next=/db' })
+      for (const path of ['/db', '/db/']) {
+        const response = await admin.fetch(page(path))
+        expect(response.status).toBe(200)
+        expect(response.headers.get('content-type')).toBe('text/html; charset=utf-8')
+        expect(response.headers.get('content-security-policy')).toContain("script-src 'self'")
+        expect(response.headers.get('content-security-policy')).toContain("frame-ancestors 'self'")
+        const html = await response.text()
+        expect(html).toContain('<script src="/db/assets/app-1.js">')
+        expect(html).toContain(
+          '<meta name="otw-db" content="{&quot;api&quot;:&quot;/db/api&quot;,&quot;signInUrl&quot;:&quot;/login?next=/db&quot;}">',
+        )
+      }
+    })
+
+    it('serves its files to be kept a year, as their names change with them', async () => {
+      const { admin } = setup({ ui: async () => UI })
+      const file = await admin.fetch(page('/db/assets/app-1.js'))
+      expect(file.headers.get('content-type')).toBe('text/javascript; charset=utf-8')
+      expect(file.headers.get('cache-control')).toBe('public, max-age=31536000, immutable')
+      expect(await file.text()).toBe('console.log("app")')
+      expect((await admin.fetch(page('/db/assets/nope.js'))).status).toBe(404)
+      expect((await admin.fetch(page('/db/assets/__proto__'))).status).toBe(404)
+      expect((await admin.fetch(page('/db/assets/a/b.js'))).status).toBe(404)
+    })
+
+    it('escapes what it writes into the page', async () => {
+      const html = await renderIndex(UI, '/x"><script>', {
+        api: '/x/api',
+        signInUrl: '"><b>',
+      }).text()
+      expect(html).not.toMatch(/"><(script|b)>/)
+      expect(html).toContain('/x&quot;&gt;&lt;script&gt;/assets/app-1.js')
+    })
+
+    it.each(['db', '/my db', '/x"><script>', '/a//b'])('refuses the base path %j', (basePath) => {
+      expect(() => createDbAdmin({ basePath, connections: [], authorize: () => null })).toThrow(
+        'basePath is a path such as "/db"',
+      )
+    })
+
+    it('loads its files once, and again after a failure', async () => {
+      let calls = 0
+      const error = vi.spyOn(console, 'error').mockImplementation(() => {})
+      const { admin } = setup({
+        ui: async () => {
+          calls++
+          if (calls === 1) throw new Error('not built')
+          return UI
+        },
+      })
+      expect((await admin.fetch(page('/db/'))).status).toBe(500)
+      expect((await admin.fetch(page('/db/'))).status).toBe(200)
+      expect((await admin.fetch(page('/db/assets/app-1.js'))).status).toBe(200)
+      expect(calls).toBe(2)
+      error.mockRestore()
+    })
+
+    it('serves the API alone with ui: false', async () => {
+      const { admin } = setup({ ui: false })
+      expect((await admin.fetch(page('/db/'))).status).toBe(404)
+    })
   })
 
   it('reads tables, a table and a page of rows', async () => {

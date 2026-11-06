@@ -127,7 +127,7 @@ icons and artwork are our own; none of TablePlus's branding or assets.
   - ⌘R: refresh;
   - ⌘F: filter;
   - ⌘S: commit;
-  - ⌘W: close tab;
+  - ⌥W: close tab (browsers keep ⌘W for their own tabs);
   - ⌘[ / ⌘]: switch tab.
 - **Themes:** light and dark, following the system.
 
@@ -138,11 +138,12 @@ zone, numerics and int8 their digits, json its spelling), rows as arrays beside 
 
 ## Milestones
 
-1. **Engine** (`db-core`, `db-node`): the driver contract and capability flags, Postgres
+1. **Engine** (`db-core`, `db-node`), done 2026-11-06: the driver contract and capability flags, Postgres
    (introspection, browsing, queries with timeout, row limit, read-only mode, cancel),
    environment connections, the Fetch handler, the Node adapter, the `otw-db` command. Tests on
    real Postgres in Docker.
-2. **UI** (`db-ui`): connections, schema tree, table browser (virtualized grid), SQL editor
+2. **UI** (`db-ui`), done 2026-11-07, without saved queries (history only) and `mount()` untried in
+   a host: connections, schema tree, table browser (virtualized grid), SQL editor
    (CodeMirror 6, schema-aware), results; served by the handler; `mount()`.
 3. **Editing and export:** row edits as previewed SQL in one transaction, destructive-statement
    confirmation, CSV/JSON/SQL export streamed.

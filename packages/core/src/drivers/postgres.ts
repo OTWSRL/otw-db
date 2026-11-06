@@ -4,6 +4,7 @@ import type { FieldDef, Pool, PoolClient, PoolConfig } from 'pg'
 import { ConnectionError, DbAdminError, QueryError } from '../errors.ts'
 import type {
   Capabilities,
+  Filter,
   Column,
   Definition,
   Driver,
@@ -11,6 +12,7 @@ import type {
   QueryResult,
   ResultSet,
   RowsRequest,
+  ServerInfo,
   TableDetail,
   TableKind,
   TableSummary,
@@ -180,15 +182,16 @@ class PostgresDriver implements Driver {
   }
 
   async rows(
-    { schema, table, limit, offset, order = [] }: RowsRequest,
+    { schema, table, limit, offset, order = [], filters = [] }: RowsRequest,
     options: Omit<QueryOptions, 'access' | 'maxRows'>,
   ): Promise<ResultSet> {
+    const values: unknown[] = []
     const orderBy = order.length
       ? ` ORDER BY ${order.map((o) => `${quote(o.column)}${o.descending ? ' DESC' : ''}`).join(', ')}`
       : ''
     // One row past the page tells whether there's another.
-    const sql = `SELECT * FROM ${quote(schema)}.${quote(table)}${orderBy} LIMIT ${whole(limit) + 1} OFFSET ${whole(offset)}`
-    const { columns, rows, truncated, durationMs } = await this.query(sql, {
+    const sql = `SELECT * FROM ${quote(schema)}.${quote(table)}${where(filters, values)}${orderBy} LIMIT ${whole(limit) + 1} OFFSET ${whole(offset)}`
+    const { columns, rows, truncated, durationMs } = await this.#run(sql, values, {
       ...options,
       access: 'read',
       maxRows: limit,
@@ -196,13 +199,40 @@ class PostgresDriver implements Driver {
     return { columns, rows, truncated, durationMs }
   }
 
+  async count(
+    { schema, table, filters = [] }: Pick<RowsRequest, 'schema' | 'table' | 'filters'>,
+    options: Omit<QueryOptions, 'access' | 'maxRows'>,
+  ): Promise<number> {
+    const values: unknown[] = []
+    const sql = `SELECT count(*) FROM ${quote(schema)}.${quote(table)}${where(filters, values)}`
+    const { rows } = await this.#run(sql, values, { ...options, access: 'read', maxRows: 1 })
+    return Number(rows[0]![0])
+  }
+
+  async info(): Promise<ServerInfo> {
+    const [row] = await this.#catalog<Omit<ServerInfo, 'product'>>(
+      `SELECT current_setting('server_version') AS version, current_database() AS database,
+              current_user AS user`,
+    )
+    // Distributions add their own words after the number, as "17.2 (Debian 17.2-1)".
+    return { product: 'PostgreSQL', ...row!, version: row!.version.split(' ')[0]! }
+  }
+
+  query(sql: string, options: QueryOptions): Promise<QueryResult> {
+    return this.#run(sql, undefined, options)
+  }
+
   /**
    * One statement, in a transaction with its own statement timeout. Through pg-cursor, so the
    * extended protocol runs it, which takes one statement only: `COMMIT; DROP …` can't step out of
    * a read-only transaction. A statement that refuses to run in a transaction (VACUUM) runs
-   * alone, with write access.
+   * alone, with write access. `values` are the statement's parameters, `$1` onwards.
    */
-  async query(sql: string, options: QueryOptions): Promise<QueryResult> {
+  async #run(
+    sql: string,
+    values: unknown[] | undefined,
+    options: QueryOptions,
+  ): Promise<QueryResult> {
     const { client, modules } = await this.#connect()
     const started = performance.now()
     const cancel = () => sendCancel(client)
@@ -221,7 +251,7 @@ class PostgresDriver implements Driver {
       )
       let alone = false
       try {
-        result = await readCursor(modules, client, sql, options.maxRows)
+        result = await readCursor(modules, client, sql, values, options.maxRows)
       } catch (error) {
         let rolledBack = true
         // The statement's own error is the one to report, whatever the cleanup does.
@@ -232,7 +262,7 @@ class PostgresDriver implements Driver {
         if (read || !rolledBack || sqlState(error) !== NOT_IN_TRANSACTION) throw error
         // VACUUM and the like: alone, on a connection closed afterwards like every write's.
         await client.query(`SET statement_timeout = ${whole(options.timeoutMs)}`)
-        result = await readCursor(modules, client, sql, options.maxRows)
+        result = await readCursor(modules, client, sql, values, options.maxRows)
         alone = true
       }
       if (!alone) await client.query(read ? READ_CLEANUP : 'COMMIT')
@@ -325,10 +355,11 @@ function readCursor(
   modules: Modules,
   client: PoolClient,
   sql: string,
+  values: unknown[] | undefined,
   maxRows: number,
 ): Promise<CursorResult> {
   const cursor = client.query(
-    new modules.Cursor(sql, undefined, { rowMode: 'array', types: AS_TEXT } as never),
+    new modules.Cursor(sql, values, { rowMode: 'array', types: AS_TEXT } as never),
   )
   return new Promise((resolve, reject) => {
     cursor.read(maxRows + 1, (error, rows, result) => {
@@ -413,6 +444,61 @@ export function quote(identifier: string): string {
     throw new DbAdminError(`"${identifier}" isn't a name.`, 400, 'bad-request')
   }
   return `"${identifier.replaceAll('"', '""')}"`
+}
+
+const COMPARISONS = new Set(['=', '<>', '<', '>', '<=', '>='])
+const SEARCHES: Record<string, { not: boolean; pattern(value: string): string }> = {
+  contains: { not: false, pattern: (v) => `%${escapeLike(v)}%` },
+  'not contains': { not: true, pattern: (v) => `%${escapeLike(v)}%` },
+  'starts with': { not: false, pattern: (v) => `${escapeLike(v)}%` },
+  'ends with': { not: false, pattern: (v) => `%${escapeLike(v)}` },
+}
+
+/**
+ * The WHERE clause for the filters, every value a parameter added to `values`. The database
+ * reads a parameter as its column's type, so `price > '10'` compares numbers. Text searches
+ * (contains, starts with, like) compare the column's text, whatever its type; all but `like`
+ * ignore case.
+ */
+function where(filters: readonly Filter[], values: unknown[]): string {
+  const parameter = (value: unknown) => {
+    values.push(value)
+    return `$${values.length}`
+  }
+  const conditions = filters.map(({ column, operator, value }) => {
+    const name = quote(column)
+    if (COMPARISONS.has(operator)) return `${name} ${operator} ${parameter(value)}`
+    switch (operator) {
+      case 'is null':
+        return `${name} IS NULL`
+      case 'is not null':
+        return `${name} IS NOT NULL`
+      case 'in':
+        return `${name} = ANY(${parameter(value)})`
+      case 'not in':
+        return `NOT (${name} = ANY(${parameter(value)}))`
+      case 'between':
+      case 'not between': {
+        const [low, high] = value as readonly string[]
+        const not = operator === 'not between' ? 'NOT ' : ''
+        return `${name} ${not}BETWEEN ${parameter(low)} AND ${parameter(high)}`
+      }
+      case 'like':
+        return `${name}::text LIKE ${parameter(value)}`
+      case 'not like':
+        return `${name}::text NOT LIKE ${parameter(value)}`
+    }
+    const search = SEARCHES[operator]
+    if (!search) throw new DbAdminError(`"${operator}" isn't a filter.`, 400, 'bad-request')
+    const not = search.not ? 'NOT ' : ''
+    return `${name}::text ${not}ILIKE ${parameter(search.pattern(value as string))}`
+  })
+  return conditions.length ? ` WHERE ${conditions.join(' AND ')}` : ''
+}
+
+/** A LIKE pattern matching `value` as it is: its %, _ and \ taken literally. */
+function escapeLike(value: string): string {
+  return value.replace(/[\\%_]/g, (c) => `\\${c}`)
 }
 
 /** A whole number for SQL text, which only ever takes numbers checked here. */

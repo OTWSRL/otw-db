@@ -9,6 +9,7 @@ export default defineConfig({
   ssr: { resolve: { conditions } },
   test: {
     include: ['packages/*/test/**/*.test.ts'],
+    exclude: ['**/node_modules/**', 'e2e/**'],
     globalSetup: ['./test/postgres.ts'],
     testTimeout: 15_000,
   },

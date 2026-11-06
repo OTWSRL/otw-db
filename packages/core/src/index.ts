@@ -1,5 +1,7 @@
 export { connectionsFromEnv, driverKind } from './connections.ts'
 export { openDriver } from './drivers/index.ts'
+export { backtick, mysqlDriver, mysqlLiteral } from './drivers/mysql.ts'
+export { sqliteDriver, sqliteLiteral, sqlitePath } from './drivers/sqlite.ts'
 export {
   literal as literalPostgres,
   postgresDriver,

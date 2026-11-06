@@ -5,7 +5,15 @@ import {
   completionKeymap,
 } from '@codemirror/autocomplete'
 import { defaultKeymap, history, historyKeymap, indentWithTab } from '@codemirror/commands'
-import { PostgreSQL, sql, type SQLNamespace } from '@codemirror/lang-sql'
+import {
+  MariaSQL,
+  MySQL,
+  PostgreSQL,
+  SQLite,
+  sql,
+  type SQLDialect,
+  type SQLNamespace,
+} from '@codemirror/lang-sql'
 import { bracketMatching, HighlightStyle, syntaxHighlighting } from '@codemirror/language'
 import { highlightSelectionMatches, searchKeymap } from '@codemirror/search'
 import { Compartment, EditorState, Prec } from '@codemirror/state'
@@ -64,11 +72,21 @@ interface Props {
   schema: SQLNamespace
   /** Where unqualified names are looked up, such as `public`. */
   defaultSchema: string
+  /** The database's kind, for its dialect: keywords, quoting, comments. */
+  kind: string
   label: string
 }
 
-/** The SQL editor: CodeMirror 6, PostgreSQL's dialect, completion from the schema. */
-export function Editor({ value, onChange, onRun, schema, defaultSchema, label }: Props) {
+const DIALECTS: Record<string, SQLDialect> = {
+  postgres: PostgreSQL,
+  mysql: MySQL,
+  mariadb: MariaSQL,
+  sqlite: SQLite,
+}
+
+/** The SQL editor: CodeMirror 6, in the database's dialect, completion from the schema. */
+export function Editor({ value, onChange, onRun, schema, defaultSchema, kind, label }: Props) {
+  const dialect = DIALECTS[kind] ?? PostgreSQL
   const host = useRef<HTMLDivElement>(null)
   const view = useRef<EditorView | null>(null)
   const language = useRef(new Compartment())
@@ -104,9 +122,7 @@ export function Editor({ value, onChange, onRun, schema, defaultSchema, label }:
           autocompletion(),
           highlightSelectionMatches(),
           syntaxHighlighting(highlight),
-          language.current.of(
-            sql({ dialect: PostgreSQL, schema, defaultSchema, upperCaseKeywords: true }),
-          ),
+          language.current.of(sql({ dialect, schema, defaultSchema, upperCaseKeywords: true })),
           keymap.of([
             ...closeBracketsKeymap,
             ...defaultKeymap,
@@ -141,10 +157,10 @@ export function Editor({ value, onChange, onRun, schema, defaultSchema, label }:
   useEffect(() => {
     view.current?.dispatch({
       effects: language.current.reconfigure(
-        sql({ dialect: PostgreSQL, schema, defaultSchema, upperCaseKeywords: true }),
+        sql({ dialect, schema, defaultSchema, upperCaseKeywords: true }),
       ),
     })
-  }, [schema, defaultSchema])
+  }, [schema, defaultSchema, dialect])
 
   return <div className="editor" ref={host} />
 }

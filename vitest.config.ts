@@ -10,7 +10,7 @@ export default defineConfig({
   test: {
     include: ['packages/*/test/**/*.test.ts'],
     exclude: ['**/node_modules/**', 'e2e/**'],
-    globalSetup: ['./test/postgres.ts'],
+    globalSetup: ['./test/databases.ts'],
     testTimeout: 15_000,
   },
 })

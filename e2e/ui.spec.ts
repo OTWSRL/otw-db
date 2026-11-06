@@ -37,9 +37,10 @@ test('asks to sign in without the token, and lists connections with it', async (
   await expect(page.getByRole('heading', { name: 'Sign in to continue' })).toBeVisible()
   await signIn(page)
   const list = page.getByRole('list', { name: 'Connections' })
-  // In the order of their names: live, main, ops.
+  // In the order of their names: live, local, main, ops.
   await expect(list.getByRole('button')).toHaveText([
     /Blog \(read-only\)\s*PostgreSQL · live\s*staging/i,
+    /Notes\s*SQLite · local\s*local/i,
     /Blog\s*PostgreSQL · main\s*development/i,
     /Operations\s*PostgreSQL · ops\s*production/i,
   ])
@@ -394,4 +395,32 @@ test.describe('exporting', () => {
     ).text()
     expect(JSON.parse(text)).toEqual([{ n: '1', nothing: null, t: 'x' }])
   })
+})
+
+test('works the same on SQLite: browse, edit, commit and query', async ({ page }) => {
+  await signIn(page)
+  await page.getByRole('button', { name: 'Notes', exact: true }).click()
+  await expect(page.getByLabel('Connection', { exact: true })).toContainText(
+    /SQLite 3\.\d+.*Notes.*notes\.db/,
+  )
+  // One schema: no schema picker.
+  await expect(page.getByLabel('Schema')).toBeHidden()
+  await page.getByRole('button', { name: /^notes/ }).click()
+  await expect(cell(page, 'main.notes', 2, 2)).toHaveText('Ship OTW DB')
+  await cell(page, 'main.notes', 1, 2).dblclick()
+  await page.getByLabel('Edit title').fill('Buy oat milk')
+  await page.getByLabel('Edit title').press('Enter')
+  await page.keyboard.press(`${MOD}+s`)
+  const dialog = page.getByRole('alertdialog')
+  await expect(dialog.locator('pre')).toHaveText(
+    `UPDATE "main"."notes" SET "title" = 'Buy oat milk' WHERE "id" = '1';`,
+  )
+  await dialog.getByRole('button', { name: 'Commit' }).click()
+  await expect(cell(page, 'main.notes', 1, 2)).toHaveText('Buy oat milk')
+  await sql(page, 'SELECT title FROM notes WHERE done = 0 ORDER BY id')
+  await page.keyboard.press(`${MOD}+Enter`)
+  await expect(grid(page, 'Result').getByRole('gridcell')).toHaveText([
+    'Buy oat milk',
+    'Write docs',
+  ])
 })

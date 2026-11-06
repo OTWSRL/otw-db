@@ -1,7 +1,10 @@
 // The e2e server: PostgreSQL in Docker (or E2E_POSTGRES_URL), seeded, and OTW DB's built
 // standalone server in front of it with a known token. Playwright starts and stops it.
 import { execFileSync, spawn } from 'node:child_process'
-import { readFileSync } from 'node:fs'
+import { mkdtempSync, readFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { DatabaseSync } from 'node:sqlite'
 import { createRequire } from 'node:module'
 import { setTimeout as sleep } from 'node:timers/promises'
 import { startServer } from '@otwdesign/db-node/cli'
@@ -57,7 +60,18 @@ await client.connect()
 await client.query(readFileSync(new URL('./seed.sql', import.meta.url), 'utf8'))
 await client.end()
 
+// A SQLite file beside it, for the same app on another database.
+const notes = join(mkdtempSync(join(tmpdir(), 'otw-db-e2e-')), 'notes.db')
+const sqlite = new DatabaseSync(notes)
+sqlite.exec(`CREATE TABLE notes (id INTEGER PRIMARY KEY, title TEXT NOT NULL, done INTEGER NOT NULL DEFAULT 0);
+  INSERT INTO notes (title, done) VALUES ('Buy milk', 0), ('Ship OTW DB', 1), ('Write docs', 0);`)
+sqlite.close()
+
 const connections = connectionsFromEnv({
+  DB_ADMIN_LOCAL_URL: `sqlite:${notes}`,
+  DB_ADMIN_LOCAL_ACCESS: 'write',
+  DB_ADMIN_LOCAL_LABEL: 'Notes',
+  DB_ADMIN_LOCAL_TAG: 'local',
   DB_ADMIN_MAIN_URL: url,
   DB_ADMIN_MAIN_ACCESS: 'write',
   DB_ADMIN_MAIN_LABEL: 'Blog',

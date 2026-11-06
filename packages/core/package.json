@@ -32,7 +32,8 @@
   },
   "peerDependencies": {
     "pg": "^8.11.0",
-    "pg-cursor": "^2.10.0"
+    "pg-cursor": "^2.10.0",
+    "mysql2": "^3.11.0"
   },
   "peerDependenciesMeta": {
     "pg": {
@@ -40,12 +41,16 @@
     },
     "pg-cursor": {
       "optional": true
+    },
+    "mysql2": {
+      "optional": true
     }
   },
   "devDependencies": {
     "@types/pg": "^8.23.1",
     "@types/pg-cursor": "^2.7.2",
     "pg": "^8.23.1",
-    "pg-cursor": "^2.22.1"
+    "pg-cursor": "^2.22.1",
+    "mysql2": "^3.24.6"
   }
 }

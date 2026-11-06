@@ -15,6 +15,14 @@ import { QuickOpen } from './QuickOpen.tsx'
 import { Sidebar } from './Sidebar.tsx'
 import { TableTab } from './TableTab.tsx'
 
+/** The schema to show first: the connection's database, then public, then the first there is. */
+export function firstSchema(tables: readonly TableSummary[], database: string): string {
+  const schemas = new Set(tables.map((t) => t.schema))
+  if (database && schemas.has(database)) return database
+  if (schemas.has('public')) return 'public'
+  return tables[0]?.schema ?? 'public'
+}
+
 const MAC = typeof navigator !== 'undefined' && /Mac|iPhone|iPad/.test(navigator.platform)
 export const MOD = MAC ? '⌘' : 'Ctrl+'
 
@@ -51,11 +59,8 @@ export function Workspace({ api, connection, onSwitch }: Props) {
         setInfo(i)
         setTables(t)
         setError(null)
-        // public when there is one, as psql's search path starts there.
-        setSchema(
-          (s) =>
-            s ?? (t.some((x) => x.schema === 'public') ? 'public' : (t[0]?.schema ?? 'public')),
-        )
+        // The database connected to (MySQL), else public, where psql's search path starts.
+        setSchema((s) => s ?? firstSchema(t, i.database))
       },
       (e: unknown) => current && setError(e as ApiError),
     )
@@ -218,6 +223,7 @@ export function Workspace({ api, connection, onSwitch }: Props) {
                   onChange={(sql) => dispatch({ type: 'edit-sql', id: tab.id, sql })}
                   schema={namespace}
                   defaultSchema={schema ?? 'public'}
+                  kind={connection.kind}
                   active={tab.id === tabs.active}
                   onHistory={() => setHistory(loadHistory(connection.name))}
                 />

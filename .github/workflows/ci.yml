@@ -20,8 +20,28 @@ jobs:
         options: >-
           --health-cmd "pg_isready -U postgres" --health-interval 2s --health-timeout 5s
           --health-retries 30
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: test
+          MYSQL_DATABASE: conf
+        ports: ['3306:3306']
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -uroot -ptest" --health-interval 3s
+          --health-timeout 5s --health-retries 40
+      mariadb:
+        image: mariadb:11.4
+        env:
+          MARIADB_ROOT_PASSWORD: test
+          MARIADB_DATABASE: conf
+        ports: ['3307:3306']
+        options: >-
+          --health-cmd "healthcheck.sh --connect --innodb_initialized" --health-interval 3s
+          --health-timeout 5s --health-retries 40
     env:
       TEST_POSTGRES_URL: postgres://postgres:test@127.0.0.1:5432/postgres
+      TEST_MYSQL_URL: mysql://root:test@127.0.0.1:3306/conf
+      TEST_MARIADB_URL: mariadb://root:test@127.0.0.1:3307/conf
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4

@@ -1,10 +1,10 @@
 # OTW DB
 
-A database manager in your app: browse, query and inspect PostgreSQL (MySQL/MariaDB and SQLite
-are next) from an OTW CMS site, any Next.js app, any Node server, or on its own. Apache-2.0.
+A database manager in your app: browse, query and edit PostgreSQL, MySQL, MariaDB and SQLite from an OTW CMS site, any Next.js app, any Node server, or on its own. Apache-2.0.
 
-> Work in progress: the engine, its API and the browser app, with editing and export, are here;
-> MySQL/MariaDB and SQLite are next. See [docs/plan.md](docs/plan.md).
+> Work in progress: the engine, its API and the browser app, with editing and export, for
+> PostgreSQL, MySQL, MariaDB and SQLite. The hosts (Next.js examples, the CMS plugin) are next. See
+> [docs/plan.md](docs/plan.md).
 
 | Package              | For                                                          |
 | -------------------- | ------------------------------------------------------------ |
@@ -105,9 +105,14 @@ It listens on 127.0.0.1:4010 and prints a link with a one-time token, which sign
 
 Install the ones you use; nothing else is loaded.
 
-| Database   | Install              |
-| ---------- | -------------------- |
-| PostgreSQL | `pg` and `pg-cursor` |
+| Database                         | Install                                                   |
+| -------------------------------- | --------------------------------------------------------- |
+| PostgreSQL (and compatible ones) | `pg` and `pg-cursor`                                      |
+| MySQL and MariaDB                | `mysql2`                                                  |
+| SQLite                           | nothing: Node's own `node:sqlite`, on a thread of its own |
+
+Addresses: `postgres://…`, `mysql://…` or `mariadb://…`, and `sqlite:/path/to/file.db` (or
+`sqlite:./relative.db`; the file must exist).
 
 ## Development
 
@@ -118,4 +123,5 @@ pnpm build
 pnpm test:e2e   # the app in Chromium against PostgreSQL in Docker (E2E_POSTGRES_URL for your own)
 ```
 
-Set `TEST_POSTGRES_URL` to test against a server of your own instead of Docker.
+Set `TEST_POSTGRES_URL`, `TEST_MYSQL_URL` and `TEST_MARIADB_URL` to test against servers of your own
+instead of Docker. Every driver passes the same conformance suite (`packages/core/test/conformance.ts`).

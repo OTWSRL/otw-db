@@ -2,11 +2,19 @@ import type CursorClass from 'pg-cursor'
 import { connect } from 'node:net'
 import type { FieldDef, Pool, PoolClient, PoolConfig } from 'pg'
 import { ConnectionError, DbAdminError, QueryError } from '../errors.ts'
+import {
+  changeStatement,
+  doubleQuote,
+  orderBy,
+  Parameters,
+  where,
+  whole,
+  type Dialect,
+} from './sql.ts'
 import type {
   ApplyResult,
   Capabilities,
   Change,
-  Filter,
   Column,
   Definition,
   Driver,
@@ -31,6 +39,29 @@ const KINDS: Record<string, TableKind> = {
   p: 'partitioned-table',
 }
 const RELKINDS = `('r','v','m','f','p')`
+
+/** A name in double quotes, so any name is taken as a name and never as SQL. */
+export const quote = doubleQuote
+
+/** A value as a PostgreSQL literal, for statements shown to people and SQL exports. */
+export function literal(value: string | null): string {
+  if (value === null) return 'NULL'
+  // standard_conforming_strings, on since PostgreSQL 9.1, keeps backslashes literal in '…'.
+  return `'${value.replaceAll("'", "''")}'`
+}
+
+const dialect: Dialect = {
+  identifier: quote,
+  literal,
+  placeholder: (n) => `$${n}`,
+  text: (expression) => `${expression}::text`,
+  ilike: 'ILIKE',
+  likeEscapeChar: '\\',
+  likeEscape: '',
+  // One array parameter, read as the column's type's array.
+  inList: (expression, values, parameter) => `${expression} = ANY(${parameter(values)})`,
+  insertDefaults: 'DEFAULT VALUES',
+}
 
 /**
  * Ends a read: ROLLBACK undoes its settings (SET, SET ROLE) and anything it declared; session
@@ -188,13 +219,11 @@ class PostgresDriver implements Driver {
     { schema, table, limit, offset, order = [], filters = [] }: RowsRequest,
     options: Omit<QueryOptions, 'access' | 'maxRows'>,
   ): Promise<ResultSet> {
-    const values: unknown[] = []
-    const orderBy = order.length
-      ? ` ORDER BY ${order.map((o) => `${quote(o.column)}${o.descending ? ' DESC' : ''}`).join(', ')}`
-      : ''
+    const parameters = new Parameters(dialect)
+    const filtered = `${quote(schema)}.${quote(table)}${where(dialect, filters, parameters)}`
     // One row past the page tells whether there's another.
-    const sql = `SELECT * FROM ${quote(schema)}.${quote(table)}${where(filters, values)}${orderBy} LIMIT ${whole(limit) + 1} OFFSET ${whole(offset)}`
-    const { columns, rows, truncated, durationMs } = await this.#run(sql, values, {
+    const sql = `SELECT * FROM ${filtered}${orderBy(dialect, order)} LIMIT ${whole(limit) + 1} OFFSET ${whole(offset)}`
+    const { columns, rows, truncated, durationMs } = await this.#run(sql, parameters.values, {
       ...options,
       access: 'read',
       maxRows: limit,
@@ -206,9 +235,13 @@ class PostgresDriver implements Driver {
     { schema, table, filters = [] }: Pick<RowsRequest, 'schema' | 'table' | 'filters'>,
     options: Omit<QueryOptions, 'access' | 'maxRows'>,
   ): Promise<number> {
-    const values: unknown[] = []
-    const sql = `SELECT count(*) FROM ${quote(schema)}.${quote(table)}${where(filters, values)}`
-    const { rows } = await this.#run(sql, values, { ...options, access: 'read', maxRows: 1 })
+    const parameters = new Parameters(dialect)
+    const sql = `SELECT count(*) FROM ${quote(schema)}.${quote(table)}${where(dialect, filters, parameters)}`
+    const { rows } = await this.#run(sql, parameters.values, {
+      ...options,
+      access: 'read',
+      maxRows: 1,
+    })
     return Number(rows[0]![0])
   }
 
@@ -231,7 +264,7 @@ class PostgresDriver implements Driver {
     { timeoutMs, dryRun = false }: { timeoutMs: number; dryRun?: boolean },
   ): Promise<ApplyResult> {
     const statements = changes.map((change) =>
-      statementFor(`${quote(schema)}.${quote(table)}`, change),
+      changeStatement(dialect, `${quote(schema)}.${quote(table)}`, change),
     )
     const shown = statements.map((s) => s.shown)
     if (dryRun) return { statements: shown, applied: false }
@@ -268,11 +301,9 @@ class PostgresDriver implements Driver {
     }: Pick<RowsRequest, 'schema' | 'table' | 'filters' | 'order'>,
     { timeoutMs }: { timeoutMs: number },
   ): AsyncGenerator<{ columns: { name: string }[]; rows: (string | null)[][] }> {
-    const values: unknown[] = []
-    const orderBy = order.length
-      ? ` ORDER BY ${order.map((o) => `${quote(o.column)}${o.descending ? ' DESC' : ''}`).join(', ')}`
-      : ''
-    const sql = `SELECT * FROM ${quote(schema)}.${quote(table)}${where(filters, values)}${orderBy}`
+    const parameters = new Parameters(dialect)
+    const values = parameters.values
+    const sql = `SELECT * FROM ${quote(schema)}.${quote(table)}${where(dialect, filters, parameters)}${orderBy(dialect, order)}`
     const { client, modules } = await this.#connect()
     // Until the last batch is read, the connection is mid-transaction: a stop on the way closes it.
     let finished = false
@@ -430,46 +461,6 @@ function readBatch(
   )
 }
 
-/** A change as SQL: the text with parameters to run, and with its values written in to show. */
-function statementFor(
-  target: string,
-  change: Change,
-): { text: string; values: (string | null)[]; shown: string; oneRow: boolean } {
-  const values: (string | null)[] = []
-  const shownValues: string[] = []
-  const parameter = (value: string | null) => {
-    values.push(value)
-    shownValues.push(literal(value))
-    return `$${values.length}`
-  }
-  const assignments = (record: Readonly<Record<string, string | null>>) =>
-    Object.entries(record).map(([column, value]) => `${quote(column)} = ${parameter(value)}`)
-  let text: string
-  if (change.type === 'insert') {
-    const columns = Object.keys(change.values)
-    text = columns.length
-      ? `INSERT INTO ${target} (${columns.map(quote).join(', ')}) VALUES (${columns.map((c) => parameter(change.values[c]!)).join(', ')})`
-      : `INSERT INTO ${target} DEFAULT VALUES`
-  } else {
-    const set = change.type === 'update' ? assignments(change.values).join(', ') : ''
-    const key = assignments(change.key).join(' AND ')
-    text =
-      change.type === 'update'
-        ? `UPDATE ${target} SET ${set} WHERE ${key}`
-        : `DELETE FROM ${target} WHERE ${key}`
-  }
-  // $10 before $1, so one parameter's number is never read as the start of another's.
-  const shown = text.replace(/\$(\d+)/g, (_, n: string) => shownValues[Number(n) - 1]!)
-  return { text, values, shown, oneRow: change.type !== 'insert' }
-}
-
-/** A value as a PostgreSQL literal, for statements shown to people and SQL exports. */
-export function literal(value: string | null): string {
-  if (value === null) return 'NULL'
-  // standard_conforming_strings, on since PostgreSQL 9.1, keeps backslashes literal in '…'.
-  return `'${value.replaceAll("'", "''")}'`
-}
-
 interface CursorResult {
   fields: FieldDef[]
   rows: (string | null)[][]
@@ -564,77 +555,6 @@ function column(c: CatalogColumn): Column {
     generated,
     comment: c.comment,
   }
-}
-
-/** A PostgreSQL identifier, double-quoted, so any name is taken as a name and never as SQL. */
-export function quote(identifier: string): string {
-  if (typeof identifier !== 'string' || !identifier || identifier.includes('\0')) {
-    throw new DbAdminError(`"${identifier}" isn't a name.`, 400, 'bad-request')
-  }
-  return `"${identifier.replaceAll('"', '""')}"`
-}
-
-const COMPARISONS = new Set(['=', '<>', '<', '>', '<=', '>='])
-const SEARCHES: Record<string, { not: boolean; pattern(value: string): string }> = {
-  contains: { not: false, pattern: (v) => `%${escapeLike(v)}%` },
-  'not contains': { not: true, pattern: (v) => `%${escapeLike(v)}%` },
-  'starts with': { not: false, pattern: (v) => `${escapeLike(v)}%` },
-  'ends with': { not: false, pattern: (v) => `%${escapeLike(v)}` },
-}
-
-/**
- * The WHERE clause for the filters, every value a parameter added to `values`. The database
- * reads a parameter as its column's type, so `price > '10'` compares numbers. Text searches
- * (contains, starts with, like) compare the column's text, whatever its type; all but `like`
- * ignore case.
- */
-function where(filters: readonly Filter[], values: unknown[]): string {
-  const parameter = (value: unknown) => {
-    values.push(value)
-    return `$${values.length}`
-  }
-  const conditions = filters.map(({ column, operator, value }) => {
-    const name = quote(column)
-    if (COMPARISONS.has(operator)) return `${name} ${operator} ${parameter(value)}`
-    switch (operator) {
-      case 'is null':
-        return `${name} IS NULL`
-      case 'is not null':
-        return `${name} IS NOT NULL`
-      case 'in':
-        return `${name} = ANY(${parameter(value)})`
-      case 'not in':
-        return `NOT (${name} = ANY(${parameter(value)}))`
-      case 'between':
-      case 'not between': {
-        const [low, high] = value as readonly string[]
-        const not = operator === 'not between' ? 'NOT ' : ''
-        return `${name} ${not}BETWEEN ${parameter(low)} AND ${parameter(high)}`
-      }
-      case 'like':
-        return `${name}::text LIKE ${parameter(value)}`
-      case 'not like':
-        return `${name}::text NOT LIKE ${parameter(value)}`
-    }
-    const search = SEARCHES[operator]
-    if (!search) throw new DbAdminError(`"${operator}" isn't a filter.`, 400, 'bad-request')
-    const not = search.not ? 'NOT ' : ''
-    return `${name}::text ${not}ILIKE ${parameter(search.pattern(value as string))}`
-  })
-  return conditions.length ? ` WHERE ${conditions.join(' AND ')}` : ''
-}
-
-/** A LIKE pattern matching `value` as it is: its %, _ and \ taken literally. */
-function escapeLike(value: string): string {
-  return value.replace(/[\\%_]/g, (c) => `\\${c}`)
-}
-
-/** A whole number for SQL text, which only ever takes numbers checked here. */
-function whole(value: number): number {
-  if (!Number.isSafeInteger(value) || value < 0) {
-    throw new DbAdminError(`${value} isn't a whole number.`, 400, 'bad-request')
-  }
-  return value
 }
 
 function sqlState(error: unknown): string | undefined {

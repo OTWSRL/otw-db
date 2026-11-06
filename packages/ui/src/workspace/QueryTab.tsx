@@ -24,6 +24,8 @@ interface Props {
   schema: SQLNamespace
   /** Where unqualified names are looked up, for completion. */
   defaultSchema: string
+  /** The database's kind, for the editor's dialect. */
+  kind: string
   active: boolean
   onHistory(): void
 }
@@ -32,7 +34,16 @@ let runs = 0
 const queryId = () => `q${Date.now().toString(36)}${(runs++).toString(36)}`
 
 /** A SQL editor's tab: the editor above, each statement's result below. */
-export function QueryTab({ id, sql, onChange, schema, defaultSchema, active, onHistory }: Props) {
+export function QueryTab({
+  id,
+  sql,
+  onChange,
+  schema,
+  defaultSchema,
+  kind,
+  active,
+  onHistory,
+}: Props) {
   const { api, connection, log, showRow } = useWorkspace()
   const [outcomes, setOutcomes] = useState<Outcome[]>([])
   const [shown, setShown] = useState(0)
@@ -138,6 +149,7 @@ export function QueryTab({ id, sql, onChange, schema, defaultSchema, active, onH
           onRun={run}
           schema={schema}
           defaultSchema={defaultSchema}
+          kind={kind}
           label={`SQL editor ${id}`}
         />
         <div

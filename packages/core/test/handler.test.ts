@@ -163,16 +163,16 @@ describe('createDbAdmin', () => {
     expect(JSON.stringify(body)).not.toContain('postgres://')
   })
 
-  it('lists a connection whose database has no driver yet, without capabilities', async () => {
+  it('lists a connection it can’t open, without capabilities', async () => {
     const admin = createDbAdmin({
-      connections: [{ name: 'legacy', url: 'mysql://legacy', access: 'read' }],
+      connections: [{ name: 'legacy', url: 'sqlite::memory:', access: 'read' }],
       authorize: () => ({ id: 'ana' }),
       audit: false,
     })
     admins.push(admin)
     const { body } = await json(await admin.fetch(call('/api/connections')))
     expect(body.connections).toEqual([
-      expect.objectContaining({ name: 'legacy', kind: 'mysql', capabilities: null }),
+      expect.objectContaining({ name: 'legacy', kind: 'sqlite', capabilities: null }),
     ])
   })
 

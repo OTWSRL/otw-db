@@ -49,7 +49,9 @@ export function Workspace({ api, connection, onSwitch }: Props) {
   const [filterKey, setFilterKey] = useState(0)
   const [history, setHistory] = useState(() => loadHistory(connection.name))
 
-  useEffect(() => saveTabs(connection.name, tabs), [connection.name, tabs])
+  useEffect(() => {
+    saveTabs(connection.name, tabs)
+  }, [connection.name, tabs])
 
   useEffect(() => {
     let current = true

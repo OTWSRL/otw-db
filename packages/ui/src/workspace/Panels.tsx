@@ -88,7 +88,9 @@ export function RowPanel({ row }: { row: ShownRow | null }) {
 /** The console: every statement run, newest last, with how long it took or how it failed. */
 export function ConsolePanel({ entries }: { entries: readonly LogEntry[] }) {
   const end = useRef<HTMLDivElement>(null)
-  useEffect(() => end.current?.scrollIntoView({ block: 'nearest' }), [entries])
+  useEffect(() => {
+    end.current?.scrollIntoView({ block: 'nearest' })
+  }, [entries])
   return (
     <div className="console" role="log" aria-label="Console">
       {entries.map((entry, i) => (

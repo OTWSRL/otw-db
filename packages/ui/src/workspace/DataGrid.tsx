@@ -100,7 +100,9 @@ export function DataGrid({
     estimateSize: (i) => widths[i] ?? 120,
     overscan: 4,
   })
-  useEffect(() => columnVirtualizer.measure(), [widths, columnVirtualizer])
+  useEffect(() => {
+    columnVirtualizer.measure()
+  }, [widths, columnVirtualizer])
 
   const width = NUMBER + columnVirtualizer.getTotalSize()
   const visibleColumns = columnVirtualizer.getVirtualItems()

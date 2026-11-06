@@ -26,7 +26,9 @@ export function QuickOpen({
   const [needle, setNeedle] = useState('')
   const [index, setIndex] = useState(0)
   const input = useRef<HTMLInputElement>(null)
-  useEffect(() => input.current?.focus(), [])
+  useEffect(() => {
+    input.current?.focus()
+  }, [])
   const matches = tables
     .filter((t) => fuzzy(t.name, needle.trim()))
     // Names that start with what was typed first, then the rest as they come.

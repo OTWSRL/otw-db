@@ -29,6 +29,19 @@ export default tseslint.config(
     files: ['**/*.tsx'],
     languageOptions: { globals: { ...globals.browser } },
     plugins: { 'react-hooks': reactHooks },
-    rules: reactHooks.configs.recommended.rules,
+    rules: {
+      ...reactHooks.configs.recommended.rules,
+      // React calls whatever an effect returns as its cleanup. An arrow with an expression body
+      // returns that expression, such as scrollIntoView()'s promise in today's Chrome.
+      'no-restricted-syntax': [
+        'error',
+        {
+          selector:
+            "CallExpression[callee.name=/^use(Layout|Insertion)?Effect$/] > ArrowFunctionExpression[expression=true][body.type!='ArrowFunctionExpression']",
+          message:
+            'Give the effect a block body: React calls what it returns as its cleanup, so it may return a function or nothing.',
+        },
+      ],
+    },
   },
 )

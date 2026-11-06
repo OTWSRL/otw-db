@@ -4,6 +4,7 @@ import { expect, test, type Page } from '@playwright/test'
 test.describe.configure({ mode: 'serial' })
 
 const ADMIN = { name: 'Ada Admin', email: 'ada@example.com', password: 'a strong e2e password' }
+const MOD = process.platform === 'darwin' ? 'Meta' : 'Control'
 
 async function signIn(page: Page) {
   await page.goto('/admin')
@@ -80,6 +81,61 @@ test('keeps its styles to itself: the admin’s page has none of its elements', 
       () => document.querySelector('otw-db-app')!.shadowRoot!.querySelectorAll('.toolbar').length,
     ),
   ).toBe(1)
+})
+
+test('opens and closes the console, which lists what ran', async ({ page }) => {
+  const failures: string[] = []
+  page.on('pageerror', (error) => failures.push(error.message))
+  await openDatabase(page)
+  await app(page).getByRole('button', { name: 'New SQL editor' }).click()
+  const editor = app(page).locator('.tab-body:not([hidden]) .cm-content')
+  await editor.click()
+  await page.keyboard.insertText('SELECT 1 AS one')
+  await page.keyboard.press(`${MOD}+Enter`)
+  await expect(app(page).getByRole('grid', { name: 'Result' })).toBeVisible()
+  await app(page).getByRole('button', { name: 'Console' }).click()
+  const log = app(page).getByRole('log', { name: 'Console' })
+  await expect(log).toContainText('SELECT 1 AS one')
+  await editor.fill('SELECT 2 AS two')
+  await page.keyboard.press(`${MOD}+Enter`)
+  await expect(log.locator('.console-entry')).toHaveCount(2)
+  await app(page).getByRole('button', { name: 'Console' }).click()
+  await expect(log).toBeHidden()
+  await expect(app(page).getByLabel('Connection', { exact: true })).toBeVisible()
+  expect(failures).toEqual([])
+})
+
+// From inside a shadow root, a listener on the window sees the host as every click's target:
+// the export menu once took a click on a format for a click outside it, and closed first.
+test('exports a table and a query’s result from inside its shadow root', async ({ page }) => {
+  await openDatabase(page)
+  await app(page)
+    .getByRole('button', { name: /^cms_users/ })
+    .click()
+  await expect(
+    app(page)
+      .getByRole('grid', { name: 'public.cms_users' })
+      .getByRole('gridcell', { name: ADMIN.email }),
+  ).toBeVisible()
+  await app(page).getByRole('button', { name: 'Export' }).click()
+  let saved = page.waitForEvent('download')
+  await app(page).getByRole('menuitem', { name: 'CSV' }).click()
+  let file = await saved
+  expect(file.suggestedFilename()).toBe('cms_users.csv')
+  const read = async () =>
+    new Response((await file.createReadStream()) as unknown as ReadableStream).text()
+  expect(await read()).toContain(ADMIN.email)
+
+  await app(page).getByRole('button', { name: 'New SQL editor' }).click()
+  await app(page).locator('.tab-body:not([hidden]) .cm-content').click()
+  await page.keyboard.insertText("SELECT 1 AS n, 'x' AS t")
+  await page.keyboard.press(`${MOD}+Enter`)
+  await expect(app(page).getByRole('grid', { name: 'Result' })).toBeVisible()
+  await app(page).getByRole('button', { name: 'Export' }).click()
+  saved = page.waitForEvent('download')
+  await app(page).getByRole('menuitem', { name: 'JSON' }).click()
+  file = await saved
+  expect(JSON.parse(await read())).toEqual([{ n: '1', t: 'x' }])
 })
 
 test('serves its API to administrators only', async ({ request }) => {

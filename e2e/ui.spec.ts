@@ -220,6 +220,27 @@ test('opens any table with ⌘P, and closes tabs with ⌥W', async ({ page }) =>
   await expect(page.getByRole('tab')).toHaveCount(0)
 })
 
+// React calls whatever an effect returns as its cleanup: the console's scroll once returned
+// scrollIntoView()'s promise (Chrome's, since scroll methods return one), and the app fell over.
+test('opens and closes the console, which lists every statement run', async ({ page }) => {
+  const failures: string[] = []
+  page.on('pageerror', (error) => failures.push(error.message))
+  await open(page, 'Blog')
+  await sql(page, 'SELECT 42 AS answer')
+  await page.keyboard.press(`${MOD}+Enter`)
+  await expect(cell(page, 'Result', 1, 1)).toHaveText('42')
+  await page.getByRole('button', { name: 'Console' }).click()
+  const log = page.getByRole('log', { name: 'Console' })
+  await expect(log).toContainText('SELECT 42 AS answer')
+  await page.locator('.tab-body:not([hidden]) .cm-content').fill('SELECT 43 AS answer')
+  await page.keyboard.press(`${MOD}+Enter`)
+  await expect(log.locator('.console-entry')).toHaveCount(2)
+  await page.getByRole('button', { name: 'Console' }).click()
+  await expect(log).toBeHidden()
+  await expect(page.getByLabel('Connection', { exact: true })).toBeVisible()
+  expect(failures).toEqual([])
+})
+
 test('keeps the history of statements run, and its tabs across a reload', async ({ page }) => {
   await open(page, 'Blog')
   await sql(page, 'SELECT 42 AS answer')

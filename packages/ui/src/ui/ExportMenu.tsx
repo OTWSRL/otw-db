@@ -15,8 +15,10 @@ export function ExportMenu({
   const box = useRef<HTMLDivElement>(null)
   useEffect(() => {
     if (!open) return
+    // The event's path, not its target: from inside a shadow root, a listener on the window gets
+    // the host as the target of every click, the menu's own included.
     const close = (event: MouseEvent) => {
-      if (!box.current?.contains(event.target as Node)) setOpen(false)
+      if (box.current && !event.composedPath().includes(box.current)) setOpen(false)
     }
     window.addEventListener('mousedown', close)
     return () => window.removeEventListener('mousedown', close)

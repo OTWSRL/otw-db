@@ -1,0 +1,36 @@
+{
+  "name": "@otwdesign/db-node",
+  "version": "0.0.0",
+  "description": "OTW DB for Node servers: mount it in node:http, Express or Connect, or run it on its own with otw-db.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "engines": {
+    "node": ">=22.18"
+  },
+  "bin": {
+    "otw-db": "./bin/otw-db.js"
+  },
+  "exports": {
+    ".": {
+      "@otwdesign/source": "./src/index.ts",
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "bin",
+    "dist",
+    "src"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@otwdesign/db-core": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "express": "^5.3.0"
+  }
+}

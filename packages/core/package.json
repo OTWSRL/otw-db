@@ -1,0 +1,43 @@
+{
+  "name": "@otwdesign/db-core",
+  "version": "0.0.0",
+  "description": "A database manager's engine and HTTP API, as one Fetch handler: browse, query and inspect PostgreSQL, MySQL and SQLite from any app.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "engines": {
+    "node": ">=22.18"
+  },
+  "exports": {
+    ".": {
+      "@otwdesign/source": "./src/index.ts",
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "src"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "peerDependencies": {
+    "pg": "^8.11.0",
+    "pg-cursor": "^2.10.0"
+  },
+  "peerDependenciesMeta": {
+    "pg": {
+      "optional": true
+    },
+    "pg-cursor": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@types/pg": "^8.23.1",
+    "@types/pg-cursor": "^2.7.2",
+    "pg": "^8.23.1",
+    "pg-cursor": "^2.22.1"
+  }
+}

@@ -1,0 +1,164 @@
+/** The databases a connection can be, chosen by its URL's scheme. */
+export type DriverKind = 'postgres' | 'mysql' | 'sqlite'
+
+/**
+ * What a connection may do. `read` runs every query in a read-only transaction; `write` runs
+ * anything the database role may. The role is the real boundary: give read connections a role
+ * that may only SELECT.
+ */
+export type Access = 'read' | 'write'
+
+/** A database the tool may open. Its URL stays on the server; the browser knows its name only. */
+export interface ConnectionConfig {
+  /** Lowercase letters, digits and hyphens: how the API and the browser name it. */
+  name: string
+  url: string
+  access: Access
+  /** Shown instead of the name. */
+  label?: string
+  /** Which environment it is, shown as the connection's color; `production` asks before writes. */
+  tag?: ConnectionTag
+}
+
+/** A connection's environment, as a color: production red, staging orange, and so on. */
+export type ConnectionTag = 'local' | 'development' | 'testing' | 'staging' | 'production'
+
+/** What a driver can do, so the UI offers only that. */
+export interface Capabilities {
+  /** Tables live in schemas (PostgreSQL), not straight in the database (SQLite). */
+  schemas: boolean
+  /** Schema changes roll back with their transaction. */
+  transactionalDdl: boolean
+  /** A running query can be stopped. */
+  cancel: boolean
+}
+
+export type TableKind =
+  'table' | 'view' | 'materialized-view' | 'foreign-table' | 'partitioned-table'
+
+/** A table or view in the schema tree. */
+export interface TableSummary {
+  schema: string
+  name: string
+  kind: TableKind
+  /** The planner's estimate, null when the database has none yet (never analyzed). */
+  estimatedRows: number | null
+  /** On disk, with indexes and TOAST; null for views. */
+  bytes: number | null
+}
+
+export interface Column {
+  name: string
+  /** As the database spells it, such as `numeric(10,2)` or `timestamp with time zone`. */
+  type: string
+  nullable: boolean
+  /** The default's SQL, such as `now()`. */
+  default: string | null
+  /**
+   * `always` or `by default` for identity columns; `stored` or `virtual` (PostgreSQL 18) for
+   * generated ones, whose expression is then the default.
+   */
+  generated: 'always' | 'by default' | 'stored' | 'virtual' | null
+  comment: string | null
+}
+
+/** An index, a foreign key or a check, with the SQL that defines it. */
+export interface Definition {
+  name: string
+  definition: string
+}
+
+export interface TableDetail extends TableSummary {
+  columns: Column[]
+  /** The primary key's columns, in order; empty without one. */
+  primaryKey: string[]
+  indexes: Definition[]
+  foreignKeys: Definition[]
+  checks: Definition[]
+  comment: string | null
+}
+
+export interface ResultColumn {
+  name: string
+  /** The column's type as the database names it, such as `bigint` or `jsonb`. */
+  type: string
+}
+
+/**
+ * Rows as arrays beside one column list. Values are the database's own text, so nothing is lost
+ * on the way: a timestamp keeps its zone, a numeric or int8 its digits, JSON its spelling.
+ */
+export interface ResultSet {
+  columns: ResultColumn[]
+  rows: (string | null)[][]
+  /** More rows were left than the limit allowed. */
+  truncated: boolean
+  durationMs: number
+}
+
+export interface QueryResult extends ResultSet {
+  /** The statement's command, the first word of its tag: `SELECT`, `UPDATE`, `CREATE`. */
+  command: string
+  /** Rows the statement changed or returned, as the database counts them; null if it doesn't say. */
+  affectedRows: number | null
+}
+
+/** One page of a table, in the order given. */
+export interface RowsRequest {
+  schema: string
+  table: string
+  limit: number
+  offset: number
+  order?: readonly { column: string; descending?: boolean }[]
+}
+
+export interface Limits {
+  /** Rows sent back at most; the rest are cut, and the result says so. */
+  maxRows: number
+  /** How long one statement may run, in milliseconds. */
+  timeoutMs: number
+}
+
+export interface QueryOptions extends Limits {
+  access: Access
+  /** Aborting it stops the query on the server. */
+  signal?: AbortSignal
+}
+
+/** One database's engine. Drivers open their connections on first use. */
+export interface Driver {
+  readonly kind: DriverKind
+  readonly capabilities: Capabilities
+  tables(): Promise<TableSummary[]>
+  /** Null when there's no such table. */
+  table(schema: string, name: string): Promise<TableDetail | null>
+  rows(request: RowsRequest, options: Omit<QueryOptions, 'access' | 'maxRows'>): Promise<ResultSet>
+  /** One statement. */
+  query(sql: string, options: QueryOptions): Promise<QueryResult>
+  close(): Promise<void>
+}
+
+/** Who is asking, as the host's `authorize()` says. */
+export interface Viewer {
+  /** Recorded in the audit log, such as a user id or an email. */
+  id: string
+  /**
+   * This viewer's access to a connection, at most the connection's own; null hides it. Without
+   * it, every connection at its own access.
+   */
+  access?(connection: ConnectionConfig): Access | null
+}
+
+/** A statement run, for the audit log. */
+export interface AuditEvent {
+  at: string
+  viewer: string
+  connection: string
+  action: 'query' | 'rows' | 'cancel'
+  /** The SQL run, or for `rows`, the table read. */
+  statement: string
+  durationMs: number
+  /** Rows returned or changed. */
+  rows?: number
+  error?: string
+}

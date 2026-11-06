@@ -1,5 +1,12 @@
 # @otwdesign/db-core
 
+## 1.0.1
+
+### Patch Changes
+
+- 175e4a1: Every export has a doc comment, shown in editors and in the OTW CMS Code Reference.
+- @otwdesign/db-ui@1.0.1
+
 ## 1.0.0
 
 ### Major Changes

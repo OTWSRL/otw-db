@@ -1,5 +1,14 @@
 # @otwdesign/plugin-db
 
+## 1.0.1
+
+### Patch Changes
+
+- 175e4a1: The Database screen no longer adds `<otw-db-app>` to the site's JSX types. A site that links the plugin from a checkout, with its own copy of React's types, now type-checks.
+- Updated dependencies [175e4a1]
+  - @otwdesign/db-core@1.0.1
+  - @otwdesign/db-ui@1.0.1
+
 ## 1.0.0
 
 ### Major Changes

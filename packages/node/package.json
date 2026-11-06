@@ -1,6 +1,6 @@
 {
   "name": "@otwdesign/db-node",
-  "version": "0.0.0",
+  "version": "1.0.0",
   "description": "OTW DB for Node servers: node:http, Express, Connect, Fastify and Koa; Hono, Bun and Deno take db-core's Fetch handler as it is.",
   "license": "Apache-2.0",
   "author": "OTW SRL",

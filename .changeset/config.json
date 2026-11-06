@@ -1,0 +1,19 @@
+{
+  "$schema": "https://unpkg.com/@changesets/config@4.0.1/schema.json",
+  "changelog": "@changesets/cli/changelog",
+  "commit": false,
+  "access": "public",
+  "baseBranch": "main",
+  "fixed": [
+    [
+      "@otwdesign/db-core",
+      "@otwdesign/db-ui",
+      "@otwdesign/db-node",
+      "@otwdesign/db",
+      "@otwdesign/plugin-db"
+    ]
+  ],
+  "linked": [],
+  "updateInternalDependencies": "patch",
+  "ignore": ["@otwdesign/db-example-next", "@otwdesign/db-example-cms"]
+}

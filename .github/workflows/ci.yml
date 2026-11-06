@@ -75,6 +75,43 @@ jobs:
       - run: pnpm check
       - run: pnpm build
 
+  # The five packages packed as npm would publish them, installed with npm into an Express app, the
+  # otw-db command and a CMS site from create-otw-cms, then type-checked, built and run.
+  packed:
+    needs: check
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_PASSWORD: e2e
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 2s --health-timeout 5s
+          --health-retries 30
+    env:
+      E2E_POSTGRES_URL: postgres://postgres:e2e@127.0.0.1:5432/postgres
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          path: otw-db
+      - uses: actions/checkout@v5
+        with:
+          repository: OTWSRL/otw-cms
+          path: nextjs-cms
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: otw-db/package.json
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+          cache: pnpm
+          cache-dependency-path: '*/pnpm-lock.yaml'
+      - run: pnpm install --frozen-lockfile
+        working-directory: nextjs-cms
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm packed
+
   e2e:
     needs: check
     runs-on: ubuntu-latest

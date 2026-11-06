@@ -18,7 +18,8 @@
     "test:e2e": "pnpm build && playwright test && pnpm --filter @otwdesign/db-example-next test:e2e && pnpm --filter @otwdesign/db-example-cms build && pnpm --filter @otwdesign/db-example-cms test:e2e",
     "changeset": "changeset",
     "version-packages": "changeset version && node scripts/sync-plugin-version.mjs",
-    "release": "pnpm build && changeset publish"
+    "release": "pnpm build && changeset publish",
+    "packed": "node scripts/packed-check.mjs"
   },
   "devDependencies": {
     "@changesets/cli": "^3.0.3",

@@ -3,13 +3,33 @@
   "version": "0.0.0",
   "description": "OTW DB in the OTW CMS admin: browse, query and edit the site's database, and any other, the way TablePlus does.",
   "license": "Apache-2.0",
+  "author": "OTW SRL",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/OTWSRL/otw-db.git",
+    "directory": "packages/plugin"
+  },
+  "homepage": "https://github.com/OTWSRL/otw-db/tree/main/packages/plugin#readme",
+  "bugs": {
+    "url": "https://github.com/OTWSRL/otw-db/issues"
+  },
+  "keywords": [
+    "otw-cms",
+    "cms",
+    "plugin",
+    "database"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
   "type": "module",
   "exports": {
     ".": "./src/index.ts",
     "./admin": "./src/admin.tsx"
   },
   "files": [
-    "src"
+    "src",
+    "NOTICE"
   ],
   "engines": {
     "node": ">=22.18"

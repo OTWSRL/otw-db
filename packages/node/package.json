@@ -3,6 +3,26 @@
   "version": "0.0.0",
   "description": "OTW DB for Node servers: node:http, Express, Connect, Fastify and Koa; Hono, Bun and Deno take db-core's Fetch handler as it is.",
   "license": "Apache-2.0",
+  "author": "OTW SRL",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/OTWSRL/otw-db.git",
+    "directory": "packages/node"
+  },
+  "homepage": "https://github.com/OTWSRL/otw-db/tree/main/packages/node#readme",
+  "bugs": {
+    "url": "https://github.com/OTWSRL/otw-db/issues"
+  },
+  "keywords": [
+    "database",
+    "admin",
+    "express",
+    "fastify",
+    "koa"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
   "type": "module",
   "engines": {
     "node": ">=22.18"
@@ -21,7 +41,8 @@
   },
   "files": [
     "dist",
-    "src"
+    "src",
+    "NOTICE"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.build.json",

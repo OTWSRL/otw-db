@@ -3,6 +3,24 @@
   "version": "0.0.0",
   "description": "OTW DB's browser app, prebuilt: the files db-core serves, as one module.",
   "license": "Apache-2.0",
+  "author": "OTW SRL",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/OTWSRL/otw-db.git",
+    "directory": "packages/ui"
+  },
+  "homepage": "https://github.com/OTWSRL/otw-db/tree/main/packages/ui#readme",
+  "bugs": {
+    "url": "https://github.com/OTWSRL/otw-db/issues"
+  },
+  "keywords": [
+    "database",
+    "admin",
+    "ui"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
   "type": "module",
   "exports": {
     ".": {
@@ -18,7 +36,8 @@
     "assets.d.ts",
     "entry.d.ts",
     "dist/assets.js",
-    "dist/entry.js"
+    "dist/entry.js",
+    "NOTICE"
   ],
   "scripts": {
     "build": "vite build && node scripts/pack-assets.mjs",

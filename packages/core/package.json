@@ -3,6 +3,28 @@
   "version": "0.0.0",
   "description": "A database manager's engine and HTTP API, as one Fetch handler: browse, query and inspect PostgreSQL, MySQL and SQLite from any app.",
   "license": "Apache-2.0",
+  "author": "OTW SRL",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/OTWSRL/otw-db.git",
+    "directory": "packages/core"
+  },
+  "homepage": "https://github.com/OTWSRL/otw-db/tree/main/packages/core#readme",
+  "bugs": {
+    "url": "https://github.com/OTWSRL/otw-db/issues"
+  },
+  "keywords": [
+    "database",
+    "postgresql",
+    "mysql",
+    "mariadb",
+    "sqlite",
+    "sql",
+    "admin"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
   "type": "module",
   "engines": {
     "node": ">=22.18"
@@ -26,7 +48,8 @@
   },
   "files": [
     "dist",
-    "src"
+    "src",
+    "NOTICE"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.build.json",

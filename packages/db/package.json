@@ -3,6 +3,27 @@
   "version": "0.0.0",
   "description": "OTW DB on its own: npx @otwdesign/db opens a database manager in your browser, with every driver included.",
   "license": "Apache-2.0",
+  "author": "OTW SRL",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/OTWSRL/otw-db.git",
+    "directory": "packages/db"
+  },
+  "homepage": "https://github.com/OTWSRL/otw-db/tree/main/packages/db#readme",
+  "bugs": {
+    "url": "https://github.com/OTWSRL/otw-db/issues"
+  },
+  "keywords": [
+    "database",
+    "gui",
+    "cli",
+    "postgresql",
+    "mysql",
+    "sqlite"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
   "type": "module",
   "engines": {
     "node": ">=22.18"
@@ -11,7 +32,8 @@
     "otw-db": "./bin/otw-db.js"
   },
   "files": [
-    "bin"
+    "bin",
+    "NOTICE"
   ],
   "dependencies": {
     "@otwdesign/db-core": "workspace:*",

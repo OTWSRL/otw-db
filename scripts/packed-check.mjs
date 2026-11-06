@@ -234,6 +234,23 @@ const server = app.listen(0, '127.0.0.1', () => {
   config.plugins = [...(config.plugins ?? []), '@otwdesign/plugin-db']
   write(join(site, 'cms.config.json'), config)
   run('npm', ['install', '--no-audit', '--no-fund'], site)
+  // A site on PostgreSQL (DATABASE_URL) opens its own database with the pg driver: the plugin
+  // brings what that needs, which a CMS site doesn't have of its own (pg-cursor).
+  run(
+    'node',
+    [
+      '--input-type=module',
+      '-e',
+      `const { postgresDriver } = await import('@otwdesign/db-core')
+const db = postgresDriver(process.env.DB_ADMIN_MAIN_URL)
+const { rows } = await db.query('SELECT name FROM packed_items', { access: 'read', maxRows: 10, timeoutMs: 5000 })
+await db.close()
+if (rows[0]?.[0] !== 'from the packed packages') throw new Error('The pg driver read ' + JSON.stringify(rows))`,
+    ],
+    site,
+    connection,
+  )
+  console.log('  ✓ the site’s PostgreSQL driver loads and reads, with what the plugin brings')
   run('npm', ['run', 'typecheck'], site)
   run('npm', ['run', 'build'], site)
   const sitePort = await freePort()

@@ -201,6 +201,12 @@ importers:
       '@otwdesign/db-ui':
         specifier: workspace:*
         version: link:../ui
+      pg:
+        specifier: ^8.23.1
+        version: 8.23.1
+      pg-cursor:
+        specifier: ^2.22.1
+        version: 2.22.1(pg@8.23.1)
     devDependencies:
       '@otwdesign/sdk':
         specifier: link:../../../nextjs-cms/packages/sdk

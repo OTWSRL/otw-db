@@ -39,7 +39,9 @@
   },
   "dependencies": {
     "@otwdesign/db-core": "workspace:*",
-    "@otwdesign/db-ui": "workspace:*"
+    "@otwdesign/db-ui": "workspace:*",
+    "pg": "^8.23.1",
+    "pg-cursor": "^2.22.1"
   },
   "peerDependencies": {
     "@otwdesign/sdk": "^1.1.0",

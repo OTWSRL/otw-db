@@ -1,5 +1,13 @@
 # @otwdesign/db
 
+## 1.2.0
+
+### Patch Changes
+
+- Updated dependencies [2bbcc89]
+  - @otwdesign/db-core@1.2.0
+  - @otwdesign/db-node@1.2.0
+
 ## 1.1.0
 
 ### Patch Changes

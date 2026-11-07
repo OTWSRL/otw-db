@@ -201,6 +201,12 @@ importers:
       '@otwdesign/db-ui':
         specifier: workspace:*
         version: link:../ui
+      '@types/pg':
+        specifier: ^8.23.1
+        version: 8.23.1
+      '@types/pg-cursor':
+        specifier: ^2.7.2
+        version: 2.7.2
       pg:
         specifier: ^8.23.1
         version: 8.23.1

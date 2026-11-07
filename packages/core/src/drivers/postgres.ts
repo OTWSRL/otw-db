@@ -50,35 +50,69 @@ interface Modules {
   Cursor: typeof CursorClass
 }
 
-let modules: Promise<Modules> | undefined
+/**
+ * Imports pg and pg-cursor, as `() => Promise.all([import('pg'), import('pg-cursor')])` does.
+ * Each may be its import's namespace or the package's own export.
+ */
+export type PostgresModules = () => Promise<readonly [pg: unknown, pgCursor: unknown]>
 
-/** pg and pg-cursor, imported on the first PostgreSQL connection, so other hosts never load them. */
-function loadModules(): Promise<Modules> {
-  // Imported where the host runs, not bundled: a site installs only the drivers it uses, and a
-  // bundler (Next.js) mustn't fail on one it doesn't have.
-  modules ??= Promise.all([
+/** How a PostgreSQL driver gets the packages it runs on. */
+export interface PostgresOptions {
+  /**
+   * Where pg and pg-cursor come from. By default they're imported where the app runs, from the
+   * app's own dependencies. A package that brings them as its own dependencies and is bundled into
+   * the app, such as the OTW CMS plugin, passes its own imports: the app's bundler resolves those
+   * from that package, which pnpm requires, since it keeps a package's dependencies beside it.
+   */
+  modules?: PostgresModules
+}
+
+// Imported where the app runs, not bundled: an app installs only the drivers it uses, and a
+// bundler (Next.js) mustn't fail on one it doesn't have.
+const fromApp: PostgresModules = () =>
+  Promise.all([
     import(/* webpackIgnore: true */ /* turbopackIgnore: true */ 'pg'),
     import(/* webpackIgnore: true */ /* turbopackIgnore: true */ 'pg-cursor'),
-  ]).then(
-    ([pg, cursor]) => ({ Pool: pg.Pool, Cursor: cursor.default }),
-    (error: unknown) => {
-      modules = undefined
-      throw new DbAdminError(
-        `PostgreSQL connections need the pg and pg-cursor packages: npm install pg pg-cursor (${(error as Error).message})`,
-        500,
-        'driver-missing',
-      )
-    },
-  )
-  return modules
+  ])
+
+let appModules: Promise<Modules> | undefined
+
+/** pg and pg-cursor, imported on the first PostgreSQL connection, so other hosts never load them. */
+function loadModules(given: PostgresModules | undefined): Promise<Modules> {
+  if (given) return load(given, 'Could not load pg and pg-cursor')
+  appModules ??= load(
+    fromApp,
+    'PostgreSQL connections need the pg and pg-cursor packages, installed in the app: npm install pg pg-cursor',
+  ).catch((error: unknown) => {
+    appModules = undefined
+    throw error
+  })
+  return appModules
+}
+
+async function load(modules: PostgresModules, failure: string): Promise<Modules> {
+  let pg: unknown, cursor: unknown
+  try {
+    ;[pg, cursor] = await modules()
+  } catch (error) {
+    throw new DbAdminError(`${failure}: ${(error as Error).message}`, 500, 'driver-missing')
+  }
+  // A CommonJS package's import has its export as the default, and pg's ESM entry names Pool too.
+  const exports = pg as { Pool?: typeof Pool; default?: { Pool?: typeof Pool } }
+  const PoolClass = exports.Pool ?? exports.default?.Pool
+  const Cursor = (cursor as { default?: unknown } | undefined)?.default ?? cursor
+  if (typeof PoolClass !== 'function' || typeof Cursor !== 'function') {
+    throw new DbAdminError(`${failure}: they aren't pg's and pg-cursor's`, 500, 'driver-missing')
+  }
+  return { Pool: PoolClass, Cursor: Cursor as typeof CursorClass }
 }
 
 /**
  * A PostgreSQL driver for `url`. It connects on first use, with a pool of up to three
  * connections, each closed after 10 s unused; an admin tool needs few.
  */
-export function postgresDriver(url: string): Driver {
-  return new PostgresDriver(url)
+export function postgresDriver(url: string, options: PostgresOptions = {}): Driver {
+  return new PostgresDriver(url, options.modules)
 }
 
 class PostgresDriver implements Driver {
@@ -86,11 +120,13 @@ class PostgresDriver implements Driver {
   readonly capabilities: Capabilities = { schemas: true, transactionalDdl: true, cancel: true }
   readonly sql = { identifier: quote, literal }
   readonly #config: PoolConfig
+  readonly #modules: PostgresModules | undefined
   #pool: Promise<{ pool: Pool; modules: Modules }> | undefined
   /** Type names by OID, filled as results bring new ones. */
   readonly #typeNames = new Map<number, string>()
 
-  constructor(url: string) {
+  constructor(url: string, modules: PostgresModules | undefined) {
+    this.#modules = modules
     this.#config = {
       connectionString: url,
       max: 3,
@@ -101,12 +137,19 @@ class PostgresDriver implements Driver {
   }
 
   #open(): Promise<{ pool: Pool; modules: Modules }> {
-    this.#pool ??= loadModules().then((modules) => {
-      const pool = new modules.Pool(this.#config)
-      // An idle connection the server drops would otherwise take the whole process with it.
-      pool.on('error', (error) => console.error('otw-db: a PostgreSQL connection failed', error))
-      return { pool, modules }
-    })
+    this.#pool ??= loadModules(this.#modules).then(
+      (modules) => {
+        const pool = new modules.Pool(this.#config)
+        // An idle connection the server drops would otherwise take the whole process with it.
+        pool.on('error', (error) => console.error('otw-db: a PostgreSQL connection failed', error))
+        return { pool, modules }
+      },
+      (error: unknown) => {
+        // Nothing opened: the next call tries again.
+        this.#pool = undefined
+        throw error
+      },
+    )
     return this.#pool
   }
 
@@ -332,7 +375,9 @@ class PostgresDriver implements Driver {
   async close(): Promise<void> {
     const opened = this.#pool
     this.#pool = undefined
-    if (opened) await (await opened).pool.end()
+    // One that failed to open has nothing to close.
+    const pool = await opened?.catch(() => undefined)
+    await pool?.pool.end()
   }
 }
 

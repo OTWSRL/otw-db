@@ -1,5 +1,5 @@
 import { definePlugin, type ApiContext, type PluginContext } from '@otwdesign/sdk'
-import type { ConnectionConfig, DbAdmin, PGliteLike } from '@otwdesign/db-core'
+import type { ConnectionConfig, DbAdmin, PGliteLike, PostgresOptions } from '@otwdesign/db-core'
 import { ROUTES } from '@otwdesign/db-core/routes'
 
 declare module '@otwdesign/sdk' {
@@ -37,6 +37,16 @@ export function siteConnection(env: NodeJS.ProcessEnv = process.env): Connection
 }
 
 /**
+ * pg and pg-cursor from the plugin's own dependencies, imported on the first PostgreSQL
+ * connection. The site's bundler resolves these imports from the plugin. db-core's own imports are
+ * resolved from where the site's bundle runs, which under pnpm has neither: pnpm keeps them beside
+ * the plugin, not in the site's root.
+ */
+const postgres: PostgresOptions = {
+  modules: () => Promise.all([import('pg'), import('pg-cursor')]),
+}
+
+/**
  * Registers the tool's API under /api/p/db from its static route table. The tool itself (its
  * engine, drivers and browser app) loads on the first request to it, so a site that never opens
  * the Database screen never loads it, and boots as fast as without the plugin.
@@ -57,10 +67,10 @@ export function setup(cms: PluginContext): void {
           return user && cms.auth.can(user, 'db.manage') ? { id: user.email } : null
         },
         driver(connection) {
-          if (connection.name !== SITE) return core.openDriver(connection)
+          if (connection.name !== SITE) return core.openDriver(connection, { postgres })
           return site.warning
             ? core.pgliteDriver((cms.db as unknown as { $client: PGliteLike }).$client)
-            : core.postgresDriver(connection.url)
+            : core.postgresDriver(connection.url, postgres)
         },
         signInUrl: '/admin',
       })

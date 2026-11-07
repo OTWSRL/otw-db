@@ -2,9 +2,11 @@ import { afterAll, beforeAll, describe, expect, inject, it } from 'vitest'
 import {
   ConnectionError,
   DbAdminError,
+  openDriver,
   postgresDriver,
   QueryError,
   type Driver,
+  type PostgresModules,
 } from '../src/index.ts'
 
 const url = inject('postgresUrl')
@@ -546,5 +548,67 @@ describe('the PostgreSQL driver', () => {
     const unreachable = postgresDriver('postgres://nobody:x@127.0.0.1:1/none')
     await expect(unreachable.tables()).rejects.toBeInstanceOf(ConnectionError)
     await unreachable.close()
+  })
+})
+
+// A package that brings pg and pg-cursor as its own dependencies and is bundled into the app (the
+// CMS plugin) hands them over: under pnpm they can't be imported from where the app's bundle runs.
+describe('where pg and pg-cursor come from', () => {
+  const imports: PostgresModules = () => Promise.all([import('pg'), import('pg-cursor')])
+
+  it('uses the ones it’s given, loaded once', async () => {
+    let loads = 0
+    const given = postgresDriver(url, {
+      modules: () => {
+        loads++
+        return imports()
+      },
+    })
+    expect((await given.query('SELECT 1 AS one', read)).rows).toEqual([['1']])
+    await given.query('SELECT 2 AS two', read)
+    expect(loads).toBe(1)
+    await given.close()
+  })
+
+  it('takes each as its import’s namespace or as the package’s own export', async () => {
+    const [pg, cursor] = await Promise.all([import('pg'), import('pg-cursor')])
+    const given = postgresDriver(url, { modules: async () => [pg.default, cursor.default] })
+    expect((await given.query('SELECT 1 AS one', read)).rows).toEqual([['1']])
+    await given.close()
+  })
+
+  it('says why, when they can’t be loaded, and tries again on the next call', async () => {
+    let loads = 0
+    const broken = postgresDriver(url, {
+      modules: () => {
+        loads++
+        return Promise.reject(new Error('no pg here'))
+      },
+    })
+    const error = await broken.tables().catch((e: unknown) => e)
+    expect(error).toBeInstanceOf(DbAdminError)
+    expect(error).toMatchObject({ code: 'driver-missing', status: 500 })
+    expect((error as Error).message).toBe('Could not load pg and pg-cursor: no pg here')
+    await expect(broken.tables()).rejects.toThrow('no pg here')
+    expect(loads).toBe(2)
+    await broken.close()
+  })
+
+  it('reaches a PostgreSQL connection opened by openDriver', async () => {
+    let loads = 0
+    const opened = openDriver(
+      { name: 'given', url, access: 'read' },
+      {
+        postgres: {
+          modules: () => {
+            loads++
+            return imports()
+          },
+        },
+      },
+    )
+    expect((await opened.query('SELECT 1 AS one', read)).rows).toEqual([['1']])
+    expect(loads).toBe(1)
+    await opened.close()
   })
 })

@@ -40,6 +40,8 @@
   "dependencies": {
     "@otwdesign/db-core": "workspace:*",
     "@otwdesign/db-ui": "workspace:*",
+    "@types/pg": "^8.23.1",
+    "@types/pg-cursor": "^2.7.2",
     "pg": "^8.23.1",
     "pg-cursor": "^2.22.1"
   },

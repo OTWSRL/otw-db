@@ -4,7 +4,8 @@
 //
 //   1. a TypeScript Express app (type-checked without skipLibCheck, so our .d.ts files are too);
 //   2. the otw-db command, from @otwdesign/db alone;
-//   3. an OTW CMS site made by create-otw-cms from npm, with the Database plugin.
+//   3. an OTW CMS site made by create-otw-cms from npm, with the Database plugin;
+//   4. the same site installed with pnpm, querying PostgreSQL through the plugin.
 //
 // It catches what the workspace hides, where every package's devDependencies are installed: a
 // file, a type or a dependency the published packages forgot.
@@ -17,6 +18,7 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { setTimeout as sleep } from 'node:timers/promises'
+import { chromium } from '@playwright/test'
 import { startPostgres } from '../e2e/postgres.mjs'
 
 const ROOT = resolve(import.meta.dirname, '..')
@@ -272,6 +274,59 @@ if (rows[0]?.[0] !== 'from the packed packages') throw new Error('The pg driver 
     (await fetch(`${siteBase}/api/p/db/assets/${entry.script}`)).status,
     200,
   )
+
+  // 4. The same site installed with pnpm, which keeps a package's dependencies beside it rather
+  // than in the site's root: the plugin's pg and pg-cursor can't be imported from where the site's
+  // bundle runs, only from the plugin.
+  console.log(`\n— The CMS site installed with pnpm, querying PostgreSQL through the plugin`)
+  const pnpmSite = join(work, 'pnpm-site')
+  run('npx', ['-y', `create-otw-cms@${CMS}`, pnpmSite, '--no-install'], work, {
+    npm_config_user_agent: 'pnpm/10',
+  })
+  const pnpmManifest = manifestOf(pnpmSite)
+  pnpmManifest.dependencies['@otwdesign/plugin-db'] = local('@otwdesign/plugin-db')
+  pnpmManifest.pnpm = { overrides }
+  write(join(pnpmSite, 'package.json'), pnpmManifest)
+  write(join(pnpmSite, 'cms.config.json'), config)
+  // A new site has no lockfile, and pnpm wants a frozen one on CI.
+  run('pnpm', ['install', '--no-frozen-lockfile', '--config.confirmModulesPurge=false'], pnpmSite)
+  run('pnpm', ['run', 'build'], pnpmSite)
+  const pnpmPort = await freePort()
+  serve('pnpm', ['exec', 'next', 'start', '-p', String(pnpmPort)], pnpmSite, {
+    ...connection,
+    CMS_DATA_DIR: join(work, 'pnpm-site-data'),
+    DATABASE_URL: '',
+  })
+  // localhost, not 127.0.0.1: the admin's forms check the origin they're posted from.
+  const pnpmBase = `http://localhost:${pnpmPort}`
+  await until('the pnpm site', async () => (await fetch(pnpmBase)).ok, 120)
+  const browser = await chromium.launch()
+  try {
+    const page = await browser.newPage()
+    await page.goto(`${pnpmBase}/admin`)
+    await page.waitForURL(/\/admin\/setup/)
+    await page.getByLabel('Name').fill('Packed Admin')
+    await page.getByLabel('Email').fill('packed@example.com')
+    await page.getByLabel('Password').fill('a strong packed password')
+    await page.getByRole('button', { name: 'Create administrator' }).click()
+    await page.getByRole('status').filter({ hasText: 'Your site is ready.' }).waitFor()
+    // The administrator's own session, as the Database screen sends it.
+    const answer = await page.evaluate(async () => {
+      const response = await fetch('/api/p/db/api/query', {
+        method: 'POST',
+        headers: { 'x-db-admin': '1', 'content-type': 'application/json' },
+        body: JSON.stringify({ connection: 'main', sql: 'SELECT name FROM packed_items' }),
+      })
+      return response.json()
+    })
+    expect(
+      'opens a PostgreSQL connection with the pg the plugin brings',
+      answer.rows?.[0]?.[0] ?? answer.error?.message,
+      'from the packed packages',
+    )
+  } finally {
+    await browser.close()
+  }
 
   console.log(`\nThe packed packages install, type-check, build and run${keep ? `: ${work}` : '.'}`)
 } finally {

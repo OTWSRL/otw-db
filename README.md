@@ -98,7 +98,8 @@ administrators (the `db.manage` capability), on the site's own database (read-on
 `DB_ADMIN_SITE_ACCESS=write`) and any `DB_ADMIN_<NAME>_URL` connections. On a site's embedded
 database (PGlite), a heavy statement holds the whole site until it finishes, and the tool says
 so. The plugin registers four routes at boot (about 0.2 ms) and loads the tool on the first
-request to it.
+request to it. It brings `pg` and `pg-cursor` itself, with npm or pnpm; MySQL and MariaDB
+connections need `mysql2` installed in the site.
 
 **Routers that register paths one by one:** `dbAdmin.routes`, or `ROUTES` from
 `@otwdesign/db-core/routes` to register at boot without loading the tool: four patterns.
@@ -123,6 +124,20 @@ Install the ones you use; nothing else is loaded.
 
 Addresses: `postgres://…`, `mysql://…` or `mariadb://…`, and `sqlite:/path/to/file.db` (or
 `sqlite:./relative.db`; the file must exist).
+
+A driver is imported where the app runs, so from the app's own dependencies. A package that
+brings `pg` and `pg-cursor` as its own dependencies and is bundled into an app, as the CMS plugin
+is, hands its imports over instead. Under pnpm they sit beside that package, not in the app's
+root, and only the app's bundler finds them there:
+
+```ts
+import { openDriver, type PostgresOptions } from '@otwdesign/db-core'
+
+const postgres: PostgresOptions = {
+  modules: () => Promise.all([import('pg'), import('pg-cursor')]),
+}
+createDbAdmin({ ...options, driver: (connection) => openDriver(connection, { postgres }) })
+```
 
 ## Development
 

@@ -16,6 +16,7 @@
     "test:watch": "vitest",
     "check": "pnpm lint && pnpm format:check && pnpm typecheck && pnpm test",
     "test:e2e": "pnpm build && playwright test && pnpm --filter @otwdesign/db-example-next test:e2e && pnpm --filter @otwdesign/db-example-cms build && pnpm --filter @otwdesign/db-example-cms test:e2e",
+    "test:all": "pnpm check && pnpm test:e2e && pnpm packed",
     "changeset": "changeset",
     "version-packages": "changeset version && node scripts/sync-plugin-version.mjs",
     "release": "pnpm build && changeset publish",

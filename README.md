@@ -163,6 +163,7 @@ pnpm check      # lint, format, types, tests; the tests start PostgreSQL in Dock
 pnpm build
 pnpm test:e2e   # the app in Chromium against PostgreSQL in Docker (E2E_POSTGRES_URL for your own)
 pnpm packed     # the packages packed as npm would publish them, installed into fresh apps and run
+pnpm test:all   # everything CI runs: check, e2e, packed
 ```
 
 Set `TEST_POSTGRES_URL`, `TEST_MYSQL_URL` and `TEST_MARIADB_URL` to test against servers of your own

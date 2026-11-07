@@ -375,6 +375,27 @@ kbd {
 .status-pill .sep {
   color: var(--text-faint);
 }
+.database-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  min-width: 0;
+  height: 20px;
+  padding: 0 4px 0 6px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+.database-button:hover,
+.database-button:focus-visible {
+  background: color-mix(in srgb, var(--text) 10%, transparent);
+}
+.database-button svg {
+  color: var(--text-dim);
+}
 .status-pill .read-only {
   color: var(--text-dim);
   font-size: 11px;

@@ -13,6 +13,19 @@ export function fuzzy(name: string, needle: string): boolean {
   return true
 }
 
+/** The items whose name has `needle`'s letters, those that start with it first; 50 at most. */
+export function matching<T>(items: readonly T[], name: (item: T) => string, needle: string): T[] {
+  const typed = needle.trim().toLowerCase()
+  return items
+    .filter((item) => fuzzy(name(item), typed))
+    .sort(
+      (a, b) =>
+        Number(!name(a).toLowerCase().startsWith(typed)) -
+        Number(!name(b).toLowerCase().startsWith(typed)),
+    )
+    .slice(0, 50)
+}
+
 /** ⌘P: open any table by typing a few letters of its name. */
 export function QuickOpen({
   tables,
@@ -29,15 +42,7 @@ export function QuickOpen({
   useEffect(() => {
     input.current?.focus()
   }, [])
-  const matches = tables
-    .filter((t) => fuzzy(t.name, needle.trim()))
-    // Names that start with what was typed first, then the rest as they come.
-    .sort(
-      (a, b) =>
-        Number(!a.name.toLowerCase().startsWith(needle.toLowerCase())) -
-        Number(!b.name.toLowerCase().startsWith(needle.toLowerCase())),
-    )
-    .slice(0, 50)
+  const matches = matching(tables, (t) => t.name, needle)
   const choice = matches[Math.min(index, matches.length - 1)]
 
   return (

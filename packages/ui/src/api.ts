@@ -4,6 +4,7 @@ import type {
   Capabilities,
   Change,
   ConnectionTag,
+  DatabaseList,
   DriverKind,
   ExportFormat,
   Filter,
@@ -18,6 +19,7 @@ import type {
 export type {
   ApplyResult,
   Change,
+  DatabaseList,
   ExportFormat,
   Filter,
   QueryResult,
@@ -76,8 +78,20 @@ export interface RowsQuery {
   filters?: Filter[]
 }
 
-/** The API, with the header every call needs and its errors as ApiError. */
-export function createApi(config: UiConfig, onUnauthorized: () => void) {
+/**
+ * The API, with the header every call needs and its errors as ApiError. With `database`, every
+ * call that reads or runs something does so on that database of the connection's server.
+ */
+export function createApi(config: UiConfig, onUnauthorized: () => void, database?: string) {
+  const q = (params: Record<string, string>) => new URLSearchParams(params).toString()
+
+  /** `path` and `body` naming the database, when there is one. */
+  function at(path: string, body?: unknown): [string, unknown] {
+    if (!database) return [path, body]
+    if (body !== undefined) return [path, { ...(body as object), database }]
+    return [`${path}${path.includes('?') ? '&' : '?'}${q({ database })}`, body]
+  }
+
   function send(path: string, body?: unknown, signal?: AbortSignal): Promise<Response> {
     return fetch(`${config.api}${path}`, {
       method: body === undefined ? 'GET' : 'POST',
@@ -120,36 +134,42 @@ export function createApi(config: UiConfig, onUnauthorized: () => void) {
       e?.hint,
     )
   }
-  const q = (params: Record<string, string>) => new URLSearchParams(params).toString()
+  /** A call on the database this API is for. */
+  function on<T>(path: string, body?: unknown, signal?: AbortSignal): Promise<T> {
+    const [where, sent] = at(path, body)
+    return call<T>(where, sent, signal)
+  }
 
   return {
+    /** The same API on another of the connection's server's databases; null for its own. */
+    forDatabase: (name: string | null) => createApi(config, onUnauthorized, name ?? undefined),
     connections: () =>
       call<{ connections: Connection[] }>('/connections').then((r) => r.connections),
+    /** The server's databases the connection's login may open, from the connection's own. */
+    databases: (connection: string) => call<DatabaseList>(`/databases?${q({ connection })}`),
     info: (connection: string) =>
-      call<{ info: ServerInfo }>(`/info?${q({ connection })}`).then((r) => r.info),
+      on<{ info: ServerInfo }>(`/info?${q({ connection })}`).then((r) => r.info),
     tables: (connection: string) =>
-      call<{ tables: TableSummary[] }>(`/tables?${q({ connection })}`).then((r) => r.tables),
+      on<{ tables: TableSummary[] }>(`/tables?${q({ connection })}`).then((r) => r.tables),
     table: (connection: string, schema: string, name: string) =>
-      call<{ table: TableDetail }>(`/table?${q({ connection, schema, name })}`).then(
-        (r) => r.table,
-      ),
-    rows: (request: RowsQuery, signal?: AbortSignal) => call<ResultSet>('/rows', request, signal),
+      on<{ table: TableDetail }>(`/table?${q({ connection, schema, name })}`).then((r) => r.table),
+    rows: (request: RowsQuery, signal?: AbortSignal) => on<ResultSet>('/rows', request, signal),
     count: (request: Omit<RowsQuery, 'limit' | 'offset' | 'order'>, signal?: AbortSignal) =>
-      call<{ count: number }>('/count', request, signal).then((r) => r.count),
+      on<{ count: number }>('/count', request, signal).then((r) => r.count),
     query: (connection: string, sql: string, queryId: string, signal?: AbortSignal) =>
-      call<QueryResult>('/query', { connection, sql, queryId }, signal),
+      on<QueryResult>('/query', { connection, sql, queryId }, signal),
     apply: (request: {
       connection: string
       schema: string
       table: string
       changes: Change[]
       dryRun?: boolean
-    }) => call<ApplyResult>('/apply', request),
+    }) => on<ApplyResult>('/apply', request),
     /** A table (filtered and in order) as a file, with the name the server gave it. */
     exportTable: async (
       request: Omit<RowsQuery, 'limit' | 'offset'> & { format: ExportFormat },
     ): Promise<{ blob: Blob; filename: string }> => {
-      const response = await send('/export', request)
+      const response = await send(...at('/export', request))
       if (!response.ok) throw await failure(response)
       const disposition = response.headers.get('content-disposition') ?? ''
       const filename =

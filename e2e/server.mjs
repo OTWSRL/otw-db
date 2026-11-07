@@ -10,7 +10,11 @@ import { startPostgres } from './postgres.mjs'
 
 const PORT = Number(process.env.E2E_PORT ?? 3472)
 const TOKEN = process.env.E2E_TOKEN ?? 'e2e-token'
-const url = await startPostgres(readFileSync(new URL('./seed.sql', import.meta.url), 'utf8'))
+// And another database on the same server, for the database picker.
+const url = await startPostgres(readFileSync(new URL('./seed.sql', import.meta.url), 'utf8'), {
+  archive: `CREATE TABLE public.letters (id integer PRIMARY KEY, sender text NOT NULL);
+    INSERT INTO public.letters VALUES (1, 'Ada'), (2, 'Grace');`,
+})
 
 // A SQLite file beside it, for the same app on another database.
 const notes = join(mkdtempSync(join(tmpdir(), 'otw-db-e2e-')), 'notes.db')
@@ -35,6 +39,7 @@ const connections = connectionsFromEnv({
   DB_ADMIN_OPS_ACCESS: 'write',
   DB_ADMIN_OPS_LABEL: 'Operations',
   DB_ADMIN_OPS_TAG: 'production',
+  DB_ADMIN_OPS_DATABASES: 'one',
 })
 await startServer({ connections, port: PORT, token: TOKEN })
 console.log(`e2e server on http://127.0.0.1:${PORT}`)

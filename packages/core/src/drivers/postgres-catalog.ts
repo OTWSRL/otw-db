@@ -79,6 +79,17 @@ export const TABLE_SQL = `SELECT n.nspname AS schema, c.relname AS name, c.relki
 export const INFO_SQL = `SELECT current_setting('server_version') AS version, current_database() AS database,
               current_user AS user`
 
+/**
+ * The databases the login may connect to, the current one always among them: no templates, none
+ * that refuse connections, none a failed DROP DATABASE left invalid (a connection limit of -2).
+ */
+export const DATABASES_SQL = `SELECT datname AS name, datname = current_database() AS current
+  FROM pg_database
+  WHERE datname = current_database()
+     OR (datallowconn AND NOT datistemplate AND datconnlimit <> -2
+         AND has_database_privilege(oid, 'CONNECT'))
+  ORDER BY lower(datname), datname`
+
 /** Names for type OIDs: $1 an array of them. */
 export const TYPE_NAMES_SQL =
   'SELECT oid::text AS oid, format_type(oid, NULL) AS name FROM pg_type WHERE oid = ANY($1::oid[])'

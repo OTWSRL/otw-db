@@ -3,6 +3,7 @@ import { connect } from 'node:net'
 import type { FieldDef, Pool, PoolClient, PoolConfig } from 'pg'
 import { ConnectionError, DbAdminError, QueryError } from '../errors.ts'
 import {
+  DATABASES_SQL,
   detail,
   dialect,
   INFO_SQL,
@@ -21,6 +22,7 @@ import type {
   ApplyResult,
   Capabilities,
   Change,
+  DatabaseList,
   Driver,
   QueryOptions,
   QueryResult,
@@ -107,6 +109,38 @@ async function load(modules: PostgresModules, failure: string): Promise<Modules>
   return { Pool: PoolClass, Cursor: Cursor as typeof CursorClass }
 }
 
+/** A placeholder host for a URL with none, as pg's own parser uses: `user@/db?host=/socket`. */
+const NO_HOST = '___otw_db_no_host___'
+
+/**
+ * `url` at another of its server's databases: its path swapped for `database`, its login, host and
+ * settings kept. pg reads the path back with decodeURI, which leaves `?` and `#` escaped, so a
+ * name with either can't be carried.
+ */
+export function postgresUrlAt(url: string, database: string): string {
+  if (/[?#]/.test(database)) {
+    throw new DbAdminError(
+      `The database "${database}" can't be opened: a connection URL can't name a database with ? or #.`,
+      400,
+      'bad-database',
+    )
+  }
+  const hostless = url.includes('@/')
+  let parsed: URL
+  try {
+    parsed = new URL(hostless ? url.replace('@/', `@${NO_HOST}/`) : url)
+  } catch {
+    // Not the URL itself, which may hold a password.
+    throw new DbAdminError(
+      "The connection's URL can't be moved to another database.",
+      500,
+      'bad-url',
+    )
+  }
+  parsed.pathname = `/${encodeURI(database)}`
+  return hostless ? parsed.href.replace(`@${NO_HOST}/`, '@/') : parsed.href
+}
+
 /**
  * A PostgreSQL driver for `url`. It connects on first use, with a pool of up to three
  * connections, each closed after 10 s unused; an admin tool needs few.
@@ -119,6 +153,7 @@ class PostgresDriver implements Driver {
   readonly kind = 'postgres'
   readonly capabilities: Capabilities = { schemas: true, transactionalDdl: true, cancel: true }
   readonly sql = { identifier: quote, literal }
+  readonly #url: string
   readonly #config: PoolConfig
   readonly #modules: PostgresModules | undefined
   #pool: Promise<{ pool: Pool; modules: Modules }> | undefined
@@ -126,6 +161,7 @@ class PostgresDriver implements Driver {
   readonly #typeNames = new Map<number, string>()
 
   constructor(url: string, modules: PostgresModules | undefined) {
+    this.#url = url
     this.#modules = modules
     this.#config = {
       connectionString: url,
@@ -220,6 +256,18 @@ class PostgresDriver implements Driver {
 
   query(sql: string, options: QueryOptions): Promise<QueryResult> {
     return this.#run(sql, undefined, options)
+  }
+
+  async databases(): Promise<DatabaseList> {
+    const rows = await this.#catalog<{ name: string; current: string }>(DATABASES_SQL)
+    return {
+      current: rows.find((row) => row.current === 't')?.name ?? '',
+      databases: rows.map((row) => row.name),
+    }
+  }
+
+  withDatabase(name: string): Driver {
+    return new PostgresDriver(postgresUrlAt(this.#url, name), this.#modules)
   }
 
   async apply(

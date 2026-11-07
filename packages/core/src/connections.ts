@@ -15,9 +15,10 @@ const SCHEMES: Record<string, DriverKind> = {
 
 /**
  * Connections from the environment: `DB_ADMIN_<NAME>_URL`, with `DB_ADMIN_<NAME>_ACCESS`
- * (`read`, the default, or `write`), `DB_ADMIN_<NAME>_LABEL` and `DB_ADMIN_<NAME>_TAG` (`local`,
- * `development`, `testing`, `staging` or `production`). `DB_ADMIN_SHOP_DATA_URL` becomes the
- * connection `shop-data`. Sorted by name; an empty URL is skipped.
+ * (`read`, the default, or `write`), `DB_ADMIN_<NAME>_LABEL`, `DB_ADMIN_<NAME>_TAG` (`local`,
+ * `development`, `testing`, `staging` or `production`) and `DB_ADMIN_<NAME>_DATABASES` (`all`, the
+ * default, or `one`: the URL's database only). `DB_ADMIN_SHOP_DATA_URL` becomes the connection
+ * `shop-data`. Sorted by name; an empty URL is skipped.
  */
 export function connectionsFromEnv(env: Env = process.env): ConnectionConfig[] {
   const connections: ConnectionConfig[] = []
@@ -29,12 +30,14 @@ export function connectionsFromEnv(env: Env = process.env): ConnectionConfig[] {
     driverKind(url, variable)
     const label = env[`${prefix}_LABEL`]?.trim()
     const tag = tagOf(env, `${prefix}_TAG`)
+    const databases = databasesOf(env, `${prefix}_DATABASES`)
     connections.push({
       name: match[1]!.toLowerCase().replaceAll('_', '-'),
       url,
       access: access(env, `${prefix}_ACCESS`),
       ...(label ? { label } : {}),
       ...(tag ? { tag } : {}),
+      ...(databases ? { databases } : {}),
     })
   }
   return connections.sort((a, b) => a.name.localeCompare(b.name))
@@ -44,6 +47,13 @@ function access(env: Env, variable: string): Access {
   const value = env[variable]?.trim() || 'read'
   if (value === 'read' || value === 'write') return value
   throw new Error(`${variable} must be "read" or "write", not "${env[variable]}".`)
+}
+
+function databasesOf(env: Env, variable: string): 'all' | 'one' | undefined {
+  const value = env[variable]?.trim()
+  if (!value) return undefined
+  if (value === 'all' || value === 'one') return value
+  throw new Error(`${variable} must be "all" or "one", not "${env[variable]}".`)
 }
 
 function tagOf(env: Env, variable: string): ConnectionTag | undefined {

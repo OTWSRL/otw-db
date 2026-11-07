@@ -5,9 +5,11 @@ import {
   openDriver,
   postgresDriver,
   QueryError,
+  quotePostgres as quote,
   type Driver,
   type PostgresModules,
 } from '../src/index.ts'
+import { postgresUrlAt } from '../src/drivers/postgres.ts'
 
 const url = inject('postgresUrl')
 const LIMITS = { maxRows: 1_000, timeoutMs: 5_000 }
@@ -610,5 +612,121 @@ describe('where pg and pg-cursor come from', () => {
     expect((await opened.query('SELECT 1 AS one', read)).rows).toEqual([['1']])
     expect(loads).toBe(1)
     await opened.close()
+  })
+})
+
+describe('postgresUrlAt', () => {
+  it.each([
+    [
+      'postgres://u:p@db:5432/shop?sslmode=require',
+      'postgres://u:p@db:5432/archive?sslmode=require',
+    ],
+    ['postgresql://u@db', 'postgresql://u@db/archive'],
+    ['postgres://u:p%40ss@db/shop', 'postgres://u:p%40ss@db/archive'],
+    ['postgres:///shop?host=/var/run/postgresql', 'postgres:///archive?host=/var/run/postgresql'],
+    ['postgres://u:p@/shop?host=/tmp', 'postgres://u:p@/archive?host=/tmp'],
+  ])('moves %s to another database, keeping the rest', (url, moved) => {
+    expect(postgresUrlAt(url, 'archive')).toBe(moved)
+  })
+
+  it('escapes a name the way pg reads it back', () => {
+    const moved = new URL(postgresUrlAt('postgres://u@db/shop', 'odd name/ü%41'))
+    expect(decodeURI(moved.pathname.slice(1))).toBe('odd name/ü%41')
+  })
+
+  it.each(['what?', 'one#two'])('refuses %s, which pg can’t read back from a URL', (name) => {
+    expect(() => postgresUrlAt('postgres://u@db/shop', name)).toThrow(
+      new DbAdminError(
+        `The database "${name}" can't be opened: a connection URL can't name a database with ? or #.`,
+        400,
+        'bad-database',
+      ),
+    )
+  })
+
+  it('names nothing of a URL it can’t read, which may hold a password', () => {
+    expect(() => postgresUrlAt('postgres://u:s3cret@db:port/shop', 'archive')).toThrow(
+      "The connection's URL can't be moved to another database.",
+    )
+    expect(() => postgresUrlAt('postgres://u:s3cret@db:port/shop', 'archive')).not.toThrow('s3cret')
+  })
+})
+
+describe('the server’s other databases', () => {
+  const ARCHIVE = 'otw_db_test_archive'
+  const ODD = 'otw db test/ü%41'
+  const GUEST = 'otw_db_test_guest'
+  const opened: Driver[] = []
+  const at = (name: string) => {
+    const driver = db.withDatabase!(name)
+    opened.push(driver)
+    return driver
+  }
+
+  beforeAll(async () => {
+    for (const name of [ARCHIVE, ODD]) {
+      await db.query(`DROP DATABASE IF EXISTS ${quote(name)} WITH (FORCE)`, write)
+      await db.query(`CREATE DATABASE ${quote(name)}`, write)
+    }
+    await db.query(`DROP ROLE IF EXISTS ${GUEST}`, write)
+    await db.query(`CREATE ROLE ${GUEST} LOGIN PASSWORD 'guest'`, write)
+    await db.query(`REVOKE CONNECT ON DATABASE ${ARCHIVE} FROM PUBLIC`, write)
+    const archive = at(ARCHIVE)
+    await archive.query('CREATE TABLE public.notes (id integer PRIMARY KEY, body text)', write)
+    await archive.query("INSERT INTO public.notes VALUES (1, 'kept in the archive')", write)
+  })
+
+  afterAll(async () => {
+    await Promise.all(opened.map((d) => d.close()))
+    for (const name of [ARCHIVE, ODD]) {
+      await db.query(`DROP DATABASE IF EXISTS ${quote(name)} WITH (FORCE)`, write)
+    }
+    await db.query(`DROP ROLE IF EXISTS ${GUEST}`, write)
+  })
+
+  it('lists the databases its login may open, by name, with the one it opened', async () => {
+    const { current, databases } = await db.databases!()
+    expect(current).toBe('postgres')
+    expect(databases).toEqual(expect.arrayContaining(['postgres', ARCHIVE, ODD]))
+    expect(databases).not.toContain('template0')
+    expect(databases).not.toContain('template1')
+    expect(databases).toEqual(
+      [...databases].sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase())),
+    )
+  })
+
+  it('leaves out a database the login has no CONNECT on', async () => {
+    const login = new URL(url)
+    login.username = GUEST
+    login.password = 'guest'
+    const guest = postgresDriver(login.href)
+    opened.push(guest)
+    const { databases } = await guest.databases!()
+    expect(databases).toContain('postgres')
+    expect(databases).toContain(ODD)
+    expect(databases).not.toContain(ARCHIVE)
+  })
+
+  it('opens another database with the same login, its tables its own', async () => {
+    const archive = at(ARCHIVE)
+    expect(await archive.info()).toMatchObject({ database: ARCHIVE, user: 'postgres' })
+    expect((await archive.tables()).map((t) => `${t.schema}.${t.name}`)).toEqual(['public.notes'])
+    expect((await archive.query('SELECT body FROM notes', read)).rows).toEqual([
+      ['kept in the archive'],
+    ])
+    expect(await archive.databases!()).toMatchObject({ current: ARCHIVE })
+    expect(await db.table('public', 'notes')).toBeNull()
+  })
+
+  it('opens a database whose name a URL has to escape', async () => {
+    expect((await at(ODD).info()).database).toBe(ODD)
+  })
+
+  it('says so when a database is gone', async () => {
+    await expect(at('otw_db_test_missing').tables()).rejects.toThrow(
+      new ConnectionError(
+        'Could not connect to PostgreSQL: database "otw_db_test_missing" does not exist',
+      ),
+    )
   })
 })

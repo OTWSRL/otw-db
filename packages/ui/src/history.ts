@@ -7,7 +7,8 @@ export interface HistoryEntry {
 }
 
 const MAX = 200
-const key = (connection: string) => `otw-db:history:${connection}`
+/** `scope` is the connection's name, with the database when it isn't the connection's own. */
+const key = (scope: string) => `otw-db:history:${scope}`
 
 export function loadHistory(connection: string, storage = safeStorage()): HistoryEntry[] {
   try {

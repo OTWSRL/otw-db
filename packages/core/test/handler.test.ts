@@ -158,7 +158,7 @@ describe('createDbAdmin', () => {
         warning: null,
         kind: 'postgres',
         access: 'write',
-        capabilities: { schemas: true, transactionalDdl: true, cancel: true },
+        capabilities: { schemas: true, transactionalDdl: true, cancel: true, databases: false },
       },
       expect.objectContaining({ name: 'reports', access: 'read', tag: null }),
     ])
@@ -828,5 +828,169 @@ describe('createDbAdmin', () => {
     expect(opened).toHaveBeenCalledTimes(1)
     await admin.close()
     expect(close).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe('a connection’s other databases', () => {
+  /** A server's databases: each its own fake driver, opened by withDatabase() and recorded. */
+  function server(names = ['archive', 'shop']) {
+    const opened: { name: string; close: ReturnType<typeof vi.fn> }[] = []
+    const at = (name: string): Driver => {
+      const close = vi.fn(async () => {})
+      opened.push({ name, close })
+      return fakeDriver({
+        close,
+        info: async () => ({
+          product: 'PostgreSQL',
+          version: '17.11',
+          database: name,
+          user: 'ana',
+        }),
+      }).driver
+    }
+    const base = fakeDriver({
+      databases: async () => ({ current: 'shop', databases: names }),
+      withDatabase: at,
+    })
+    return { base, opened }
+  }
+
+  it('says which connections open their server’s other databases', async () => {
+    const { base } = server()
+    const { admin } = setup({ connections: [MAIN, { ...REPORTS, databases: 'one' }] }, base)
+    const { body } = await json(await admin.fetch(call('/db/api/connections')))
+    expect(
+      body.connections.map(
+        (c: { capabilities: { databases: boolean } }) => c.capabilities.databases,
+      ),
+    ).toEqual([true, false])
+  })
+
+  it('lists the databases from the connection’s own', async () => {
+    const { base } = server()
+    const { admin } = setup({}, base)
+    expect(await json(await admin.fetch(call('/db/api/databases?connection=main')))).toEqual({
+      status: 200,
+      body: { current: 'shop', databases: ['archive', 'shop'] },
+    })
+  })
+
+  it.each([
+    ['a connection pinned to its own', { ...MAIN, databases: 'one' as const }, server().base],
+    ['a driver that opens one database only', MAIN, fakeDriver()],
+  ])('refuses to list or open another database on %s', async (_, connection, driver) => {
+    const { admin } = setup({ connections: [connection] }, driver)
+    const message = 'Connection "main" opens its own database only.'
+    for (const request of [
+      call('/db/api/databases?connection=main'),
+      call('/db/api/tables?connection=main&database=archive'),
+      call('/db/api/query', { body: { connection: 'main', database: 'archive', sql: 'SELECT 1' } }),
+    ]) {
+      expect(await json(await admin.fetch(request))).toEqual({
+        status: 400,
+        body: { error: { code: 'one-database', message } },
+      })
+    }
+  })
+
+  it('runs each endpoint on the database named, opening it once, and audits which', async () => {
+    const { base, opened } = server()
+    const { admin, audit } = setup({}, base)
+    const info = await json(
+      await admin.fetch(call('/db/api/info?connection=main&database=archive')),
+    )
+    expect(info.body.info.database).toBe('archive')
+    await admin.fetch(call('/db/api/tables?connection=main&database=archive'))
+    await admin.fetch(
+      call('/db/api/table?connection=main&database=archive&schema=public&name=posts'),
+    )
+    for (const [path, body] of [
+      ['/db/api/rows', { schema: 'public', table: 'posts' }],
+      ['/db/api/count', { schema: 'public', table: 'posts' }],
+      ['/db/api/query', { sql: 'SELECT 1' }],
+      [
+        '/db/api/apply',
+        { schema: 'public', table: 'posts', changes: [{ type: 'delete', key: { id: '1' } }] },
+      ],
+      ['/db/api/export', { schema: 'public', table: 'posts', format: 'csv' }],
+    ] as const) {
+      const response = await admin.fetch(
+        call(path, { body: { connection: 'main', database: 'archive', ...body } }),
+      )
+      expect(response.status, path).toBe(200)
+      await response.text()
+    }
+    expect(opened.map((d) => d.name)).toEqual(['archive'])
+    await vi.waitFor(() => expect(audit).toHaveBeenCalledTimes(5))
+    expect(audit.mock.calls.map(([event]) => [event.action, event.database])).toEqual([
+      ['rows', 'archive'],
+      ['count', 'archive'],
+      ['query', 'archive'],
+      ['apply', 'archive'],
+      ['export', 'archive'],
+    ])
+  })
+
+  it('uses the connection’s own database when none is named, and audits no database', async () => {
+    const { base, opened } = server()
+    const { admin, audit, calls } = setup({}, base)
+    const info = await json(await admin.fetch(call('/db/api/info?connection=main&database=')))
+    expect(info.body.info.database).toBe('shop')
+    await admin.fetch(
+      call('/db/api/query', { body: { connection: 'main', database: null, sql: 'SELECT 1' } }),
+    )
+    expect(calls).toHaveLength(1)
+    expect(opened).toEqual([])
+    expect(audit.mock.calls[0]![0]).not.toHaveProperty('database')
+  })
+
+  it.each([
+    [{ database: 7 }, '"database" is a database’s name.'],
+    [{ database: 'x'.repeat(64) }, '"database" is a database’s name.'],
+    [{ database: 'é'.repeat(32) }, '"database" is a database’s name.'],
+    [{ database: 'a\u0000b' }, '"database" is a database’s name.'],
+  ])('refuses %o', async (body, message) => {
+    const { admin } = setup({}, server().base)
+    expect(
+      await json(
+        await admin.fetch(
+          call('/db/api/query', { body: { connection: 'main', sql: 'SELECT 1', ...body } }),
+        ),
+      ),
+    ).toEqual({ status: 400, body: { error: { code: 'bad-request', message } } })
+  })
+
+  it('answers an unknown connection before its database', async () => {
+    const { admin } = setup({}, server().base)
+    const { status, body } = await json(
+      await admin.fetch(call('/db/api/tables?connection=nope&database=x')),
+    )
+    expect([status, body.error.code]).toEqual([404, 'unknown-connection'])
+  })
+
+  it('keeps the 8 databases used last open, closing the one used longest ago', async () => {
+    const { base, opened } = server()
+    const { admin } = setup({}, base)
+    const use = (database: string) =>
+      admin.fetch(call(`/db/api/tables?connection=main&database=${database}`))
+    for (const database of ['d1', 'd2', 'd3', 'd4', 'd5', 'd6', 'd7', 'd8']) await use(database)
+    await use('d1')
+    await use('d9')
+    expect(opened.filter((d) => d.close.mock.calls.length).map((d) => d.name)).toEqual(['d2'])
+    await use('d2')
+    expect(opened.map((d) => d.name)).toEqual([
+      'd1',
+      'd2',
+      'd3',
+      'd4',
+      'd5',
+      'd6',
+      'd7',
+      'd8',
+      'd9',
+      'd2',
+    ])
+    await admin.close()
+    expect(opened.filter((d) => !d.close.mock.calls.length)).toEqual([])
   })
 })

@@ -20,6 +20,12 @@ export interface ConnectionConfig {
   tag?: ConnectionTag
   /** Shown wherever people run SQL on it, such as what a heavy statement does to the host. */
   warning?: string
+  /**
+   * Which of its server's databases it opens, where a connection opens one database at a time
+   * (PostgreSQL): `all`, the default, every one its login may connect to, the URL's first; `one`,
+   * the URL's only, for a login with more privileges than the tool should show.
+   */
+  databases?: 'all' | 'one'
 }
 
 /** A connection's environment, as a color: production red, staging orange, and so on. */
@@ -36,6 +42,11 @@ export interface Capabilities {
    * runs on the host's own thread.
    */
   cancel: boolean
+  /**
+   * The server's other databases open from the connection, by name. The API sets it: a driver
+   * offers them with `databases()` and `withDatabase()`, and a connection may be pinned to its own.
+   */
+  databases?: boolean
 }
 
 /** What a schema-tree entry is: SQLite and MySQL have tables and views, PostgreSQL the rest too. */
@@ -195,6 +206,14 @@ export interface ServerInfo {
   user: string
 }
 
+/** The databases a connection's login may open on its server, for the database picker. */
+export interface DatabaseList {
+  /** The one the driver opened. */
+  current: string
+  /** By name, the current one among them. */
+  databases: string[]
+}
+
 /** How many rows one statement may send back, and how long it may run. */
 export interface Limits {
   /** Rows sent back at most; the rest are cut, and the result says so. */
@@ -242,6 +261,16 @@ export interface Driver {
   readonly sql: SqlDialect
   /** One statement. */
   query(sql: string, options: QueryOptions): Promise<QueryResult>
+  /**
+   * The server's databases its login may open, where a connection opens one at a time
+   * (PostgreSQL). Absent where it has one (SQLite) or shows the rest as schemas (MySQL).
+   */
+  databases?(): Promise<DatabaseList>
+  /**
+   * A driver for another of the server's databases, with the same login and settings. It connects
+   * on first use; whoever asked for it closes it.
+   */
+  withDatabase?(name: string): Driver
   close(): Promise<void>
 }
 
@@ -261,6 +290,8 @@ export interface AuditEvent {
   at: string
   viewer: string
   connection: string
+  /** The database it ran on, when it wasn't the connection's own. */
+  database?: string
   action: 'query' | 'rows' | 'count' | 'apply' | 'export' | 'cancel'
   /** The SQL run, or for `rows`, the table read. */
   statement: string

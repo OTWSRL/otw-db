@@ -19,6 +19,8 @@ export interface ShownRow {
 export interface Workspace {
   api: Api
   connection: Connection
+  /** What tabs and history are kept under: the connection, and the database when not its own. */
+  scope: string
   log(entry: Omit<LogEntry, 'at'>): void
   showRow(row: ShownRow | null): void
   /** Bumped by ⌘R: tabs reload what they show. */

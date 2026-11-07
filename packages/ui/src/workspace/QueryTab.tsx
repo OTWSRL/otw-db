@@ -44,7 +44,7 @@ export function QueryTab({
   active,
   onHistory,
 }: Props) {
-  const { api, connection, log, showRow } = useWorkspace()
+  const { api, connection, scope, log, showRow } = useWorkspace()
   const [outcomes, setOutcomes] = useState<Outcome[]>([])
   const [shown, setShown] = useState(0)
   const [running, setRunning] = useState<string | null>(null)
@@ -101,7 +101,7 @@ export function QueryTab({
         })
         break
       } finally {
-        remember(connection.name, statement.text)
+        remember(scope, statement.text)
       }
       if (unmounted.current) return
       setOutcomes([...done])

@@ -29,9 +29,13 @@ a window with the schema's tables in a sidebar, tabs for tables and SQL editors,
 - **SQL editor:** completion of tables; ⌘↵ runs the statement at the cursor, ⇧⌘↵ them all, each
   with its own result; errors point at their line and column; Cancel stops the query on the server.
   Writes on a `production` connection ask first.
-- **Shortcuts:** ⌘P open a table, ⌘E new SQL editor, ⌘R refresh, ⌘F filter, ⌥W close the tab (a
-  browser keeps ⌘W), ⌘[ and ⌘] switch tabs. Ctrl instead of ⌘ off a Mac.
-- Light and dark, following the system. Tabs and history are kept per connection in the browser.
+- **Databases:** a PostgreSQL connection opens any of its server's databases its login may connect
+  to. Click the database's name in the toolbar, or ⌘K, and type a few letters of another.
+- **Shortcuts:** ⌘P open a table, ⌘K open another database, ⌘E new SQL editor, ⌘R refresh, ⌘F
+  filter, ⌥W close the tab (a browser keeps ⌘W), ⌘[ and ⌘] switch tabs. Ctrl instead of ⌘ off a
+  Mac.
+- Light and dark, following the system. Tabs and history are kept per connection and database in
+  the browser, and the address names both, so a reload comes back to them.
 
 ## Connections
 
@@ -42,10 +46,18 @@ DB_ADMIN_MAIN_URL=postgres://reader:secret@db.example.com:5432/shop
 DB_ADMIN_MAIN_ACCESS=read        # or write
 DB_ADMIN_MAIN_LABEL=Shop
 DB_ADMIN_MAIN_TAG=production     # local, development, testing, staging, production
+DB_ADMIN_MAIN_DATABASES=one      # or all, the default
 ```
 
 `read` runs every query in a read-only transaction. The database role is still the real boundary:
 give read connections a role that may only `SELECT`.
+
+A PostgreSQL connection opens one database at a time, the URL's first. Its login may connect to
+others on the same server, as a superuser can to all, and the tool lists those: every database
+but the templates and those the login has no `CONNECT` on. Each opens with the same login, access
+and tag, on a pool of its own that opens on first use; the eight used last stay open.
+`DATABASES=one` pins a connection to the URL's database, for a login with more privileges than the
+tool should show. MySQL needs none of this: its databases are the schemas of one connection.
 
 ## Mounting it
 
@@ -124,6 +136,10 @@ Install the ones you use; nothing else is loaded.
 
 Addresses: `postgres://…`, `mysql://…` or `mariadb://…`, and `sqlite:/path/to/file.db` (or
 `sqlite:./relative.db`; the file must exist).
+
+A driver that opens one database at a time offers the server's others with `databases()`, which
+lists them, and `withDatabase(name)`, which returns a driver for one; the PostgreSQL driver has
+both.
 
 A driver is imported where the app runs, so from the app's own dependencies. A package that
 brings `pg` and `pg-cursor` as its own dependencies and is bundled into an app, as the CMS plugin

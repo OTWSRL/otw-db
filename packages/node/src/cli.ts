@@ -98,10 +98,11 @@ const HELP = `otw-db: a database manager in your browser
 Usage: otw-db [--port 4010] [--host 127.0.0.1] [--env-file .env]
 
 Connections come from the environment (and .env, when there is one):
-  DB_ADMIN_<NAME>_URL     postgres://user:password@host:5432/db
-  DB_ADMIN_<NAME>_ACCESS  read (default) or write
-  DB_ADMIN_<NAME>_LABEL   shown instead of the name
-  DB_ADMIN_<NAME>_TAG     local, development, testing, staging or production
+  DB_ADMIN_<NAME>_URL        postgres://user:password@host:5432/db
+  DB_ADMIN_<NAME>_ACCESS     read (default) or write
+  DB_ADMIN_<NAME>_LABEL      shown instead of the name
+  DB_ADMIN_<NAME>_TAG        local, development, testing, staging or production
+  DB_ADMIN_<NAME>_DATABASES  all (default), the server's other databases too, or one, the URL's
 `
 
 /** The `otw-db` command. */

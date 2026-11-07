@@ -82,6 +82,10 @@ const QUERY_ID = /^[A-Za-z0-9_-]{1,64}$/
 const MAX_FILTERS = 20
 const MAX_CHANGES = 1_000
 const MAX_LIST = 1_000
+/** A connection's other databases kept open at once; the one used longest ago closes first. */
+const MAX_DATABASES = 8
+/** PostgreSQL's NAMEDATALEN, less its terminator: the longest database name, in bytes. */
+const MAX_DATABASE_NAME = 63
 const OPERATORS: ReadonlySet<string> = new Set<FilterOperator>([
   '=',
   '<>',
@@ -127,6 +131,8 @@ export function createDbAdmin(options: DbAdminOptions): DbAdmin {
   const limits = { ...DEFAULT_LIMITS, ...options.limits }
   const audit = options.audit === false ? undefined : (options.audit ?? logAudit)
   const drivers = new Map<string, Driver>()
+  /** Each connection's other databases' drivers, the one used last at the end. */
+  const others = new Map<string, Map<string, Driver>>()
   const running = new Map<string, { viewer: string; controller: AbortController }>()
   const open = options.driver ?? openDriver
   const loadUi = options.ui === false ? undefined : (options.ui ?? defaultUi)
@@ -141,14 +147,55 @@ export function createDbAdmin(options: DbAdminOptions): DbAdmin {
     return found
   }
 
-  /** The connection by name, with this viewer's access to it; unknown and hidden look the same. */
-  function reach(viewer: Viewer, name: unknown): { connection: ConnectionConfig; access: Access } {
+  /**
+   * The driver for one of the connection's other databases. The 8 used last stay open; opening a
+   * ninth closes the one used longest ago, so a viewer can't keep pools open without end.
+   */
+  function driverAt(connection: ConnectionConfig, database: string): Driver {
+    let open = others.get(connection.name)
+    if (!open) others.set(connection.name, (open = new Map()))
+    let found = open.get(database)
+    if (found) open.delete(database)
+    else found = driver(connection).withDatabase!(database)
+    open.set(database, found)
+    if (open.size > MAX_DATABASES) {
+      const [oldest, evicted] = open.entries().next().value!
+      open.delete(oldest)
+      evicted.close().catch((error: unknown) => {
+        console.error(`otw-db: could not close database "${oldest}" of "${connection.name}"`, error)
+      })
+    }
+    return found
+  }
+
+  /**
+   * The connection by name, with this viewer's access to it and the driver for `database`: one of
+   * the server's other databases, or the connection's own when none is named. Unknown and hidden
+   * connections look the same.
+   */
+  function reach(
+    viewer: Viewer,
+    name: unknown,
+    database?: unknown,
+  ): { connection: ConnectionConfig; access: Access; db: Driver; database?: string } {
     const connection = typeof name === 'string' ? connections.get(name) : undefined
     const access = connection ? accessOf(viewer, connection) : null
     if (!connection || !access) {
       throw new DbAdminError(`There's no connection "${String(name)}".`, 404, 'unknown-connection')
     }
-    return { connection, access }
+    if (database === undefined || database === null || database === '') {
+      return { connection, access, db: driver(connection) }
+    }
+    const named = databaseName(database)
+    if (!opensOthers(connection)) throw oneDatabase(connection)
+    return { connection, access, db: driverAt(connection, named), database: named }
+  }
+
+  /** Whether the connection may open its server's other databases, and its driver can. */
+  function opensOthers(connection: ConnectionConfig): boolean {
+    if (connection.databases === 'one') return false
+    const opened = driver(connection)
+    return typeof opened.databases === 'function' && typeof opened.withDatabase === 'function'
   }
 
   async function record(event: Omit<AuditEvent, 'at'>): Promise<void> {
@@ -176,7 +223,10 @@ export function createDbAdmin(options: DbAdminOptions): DbAdmin {
           // A kind without a driver yet is listed, but can't be opened.
           let capabilities: Driver['capabilities'] | null = null
           try {
-            capabilities = driver(connection).capabilities
+            capabilities = {
+              ...driver(connection).capabilities,
+              databases: opensOthers(connection),
+            }
           } catch (error) {
             if (!(error instanceof DbAdminError)) throw error
           }
@@ -190,10 +240,23 @@ export function createDbAdmin(options: DbAdminOptions): DbAdmin {
     },
     {
       method: 'GET',
+      path: '/api/databases',
+      async run(request, viewer) {
+        const { connection, db } = reach(
+          viewer,
+          new URL(request.url).searchParams.get('connection'),
+        )
+        if (!opensOthers(connection)) throw oneDatabase(connection)
+        return await db.databases!()
+      },
+    },
+    {
+      method: 'GET',
       path: '/api/tables',
       async run(request, viewer) {
-        const { connection } = reach(viewer, new URL(request.url).searchParams.get('connection'))
-        return { tables: await driver(connection).tables() }
+        const params = new URL(request.url).searchParams
+        const { db } = reach(viewer, params.get('connection'), params.get('database'))
+        return { tables: await db.tables() }
       },
     },
     {
@@ -201,8 +264,8 @@ export function createDbAdmin(options: DbAdminOptions): DbAdmin {
       path: '/api/table',
       async run(request, viewer) {
         const params = new URL(request.url).searchParams
-        const { connection } = reach(viewer, params.get('connection'))
-        const table = await driver(connection).table(
+        const { db } = reach(viewer, params.get('connection'), params.get('database'))
+        const table = await db.table(
           text(params.get('schema'), 'schema'),
           text(params.get('name'), 'name'),
         )
@@ -214,8 +277,9 @@ export function createDbAdmin(options: DbAdminOptions): DbAdmin {
       method: 'GET',
       path: '/api/info',
       async run(request, viewer) {
-        const { connection } = reach(viewer, new URL(request.url).searchParams.get('connection'))
-        return { info: await driver(connection).info() }
+        const params = new URL(request.url).searchParams
+        const { db } = reach(viewer, params.get('connection'), params.get('database'))
+        return { info: await db.info() }
       },
     },
     {
@@ -223,7 +287,7 @@ export function createDbAdmin(options: DbAdminOptions): DbAdmin {
       path: '/api/count',
       async run(request, viewer) {
         const body = await json(request)
-        const { connection } = reach(viewer, body.connection)
+        const { connection, db, database } = reach(viewer, body.connection, body.database)
         const target = {
           schema: text(body.schema, 'schema'),
           table: text(body.table, 'table'),
@@ -232,13 +296,14 @@ export function createDbAdmin(options: DbAdminOptions): DbAdmin {
         const started = performance.now()
         const statement = `count ${target.schema}.${target.table}`
         try {
-          const rows = await driver(connection).count(target, {
+          const rows = await db.count(target, {
             timeoutMs: limits.timeoutMs,
             signal: request.signal,
           })
           await record({
             viewer: viewer.id,
             connection: connection.name,
+            ...(database ? { database } : {}),
             action: 'count',
             statement,
             durationMs: Math.round(performance.now() - started),
@@ -249,6 +314,7 @@ export function createDbAdmin(options: DbAdminOptions): DbAdmin {
           await record({
             viewer: viewer.id,
             connection: connection.name,
+            ...(database ? { database } : {}),
             action: 'count',
             statement,
             durationMs: Math.round(performance.now() - started),
@@ -263,18 +329,19 @@ export function createDbAdmin(options: DbAdminOptions): DbAdmin {
       path: '/api/rows',
       async run(request, viewer) {
         const body = await json(request)
-        const { connection } = reach(viewer, body.connection)
+        const { connection, db, database } = reach(viewer, body.connection, body.database)
         const page = rowsRequest(body)
         const started = performance.now()
         const statement = `${page.schema}.${page.table}`
         try {
-          const result = await driver(connection).rows(page, {
+          const result = await db.rows(page, {
             timeoutMs: limits.timeoutMs,
             signal: request.signal,
           })
           await record({
             viewer: viewer.id,
             connection: connection.name,
+            ...(database ? { database } : {}),
             action: 'rows',
             statement,
             durationMs: result.durationMs,
@@ -285,6 +352,7 @@ export function createDbAdmin(options: DbAdminOptions): DbAdmin {
           await record({
             viewer: viewer.id,
             connection: connection.name,
+            ...(database ? { database } : {}),
             action: 'rows',
             statement,
             durationMs: Math.round(performance.now() - started),
@@ -299,7 +367,7 @@ export function createDbAdmin(options: DbAdminOptions): DbAdmin {
       path: '/api/query',
       async run(request, viewer) {
         const body = await json(request)
-        const { connection, access } = reach(viewer, body.connection)
+        const { connection, access, db, database } = reach(viewer, body.connection, body.database)
         const sql = text(body.sql, 'sql')
         const maxRows =
           body.maxRows === undefined
@@ -318,7 +386,7 @@ export function createDbAdmin(options: DbAdminOptions): DbAdmin {
         }
         const started = performance.now()
         try {
-          const result = await driver(connection).query(sql, {
+          const result = await db.query(sql, {
             access,
             maxRows,
             timeoutMs: limits.timeoutMs,
@@ -327,6 +395,7 @@ export function createDbAdmin(options: DbAdminOptions): DbAdmin {
           await record({
             viewer: viewer.id,
             connection: connection.name,
+            ...(database ? { database } : {}),
             action: 'query',
             statement: sql,
             durationMs: result.durationMs,
@@ -337,6 +406,7 @@ export function createDbAdmin(options: DbAdminOptions): DbAdmin {
           await record({
             viewer: viewer.id,
             connection: connection.name,
+            ...(database ? { database } : {}),
             action: 'query',
             statement: sql,
             durationMs: Math.round(performance.now() - started),
@@ -354,7 +424,7 @@ export function createDbAdmin(options: DbAdminOptions): DbAdmin {
       path: '/api/apply',
       async run(request, viewer) {
         const body = await json(request)
-        const { connection, access } = reach(viewer, body.connection)
+        const { connection, access, db, database } = reach(viewer, body.connection, body.database)
         const target = { schema: text(body.schema, 'schema'), table: text(body.table, 'table') }
         const changes = changesOf(body.changes)
         const dryRun = body.dryRun === true
@@ -363,7 +433,7 @@ export function createDbAdmin(options: DbAdminOptions): DbAdmin {
         }
         const started = performance.now()
         try {
-          const result = await driver(connection).apply(target, changes, {
+          const result = await db.apply(target, changes, {
             timeoutMs: limits.timeoutMs,
             dryRun,
           })
@@ -371,6 +441,7 @@ export function createDbAdmin(options: DbAdminOptions): DbAdmin {
             await record({
               viewer: viewer.id,
               connection: connection.name,
+              ...(database ? { database } : {}),
               action: 'apply',
               statement: result.statements.join(';\n'),
               durationMs: Math.round(performance.now() - started),
@@ -383,6 +454,7 @@ export function createDbAdmin(options: DbAdminOptions): DbAdmin {
             await record({
               viewer: viewer.id,
               connection: connection.name,
+              ...(database ? { database } : {}),
               action: 'apply',
               statement: `${changes.length} changes to ${target.schema}.${target.table}`,
               durationMs: Math.round(performance.now() - started),
@@ -398,12 +470,11 @@ export function createDbAdmin(options: DbAdminOptions): DbAdmin {
       path: '/api/export',
       async run(request, viewer) {
         const body = await json(request)
-        const { connection } = reach(viewer, body.connection)
+        const { connection, db, database } = reach(viewer, body.connection, body.database)
         const format = formatOf(body.format)
         const page = rowsRequest({ ...body, limit: undefined, offset: undefined })
-        const opened = driver(connection)
         const started = performance.now()
-        const batches = opened.export(page, { timeoutMs: limits.timeoutMs })
+        const batches = db.export(page, { timeoutMs: limits.timeoutMs })
         // Read the first batch before answering, so a bad table or filter is a proper error.
         const first = await batches.next()
         let replayed = false
@@ -419,11 +490,12 @@ export function createDbAdmin(options: DbAdminOptions): DbAdmin {
           format,
           replay,
           page,
-          opened.sql,
+          db.sql,
           (rows, error) =>
             void record({
               viewer: viewer.id,
               connection: connection.name,
+              ...(database ? { database } : {}),
               action: 'export',
               statement: `${page.schema}.${page.table} as ${format}`,
               durationMs: Math.round(performance.now() - started),
@@ -541,8 +613,9 @@ export function createDbAdmin(options: DbAdminOptions): DbAdmin {
       return reply(404, { error: { code: 'not-found', message: 'Not found.' } })
     },
     async close() {
-      const open = [...drivers.values()]
+      const open = [...drivers.values(), ...[...others.values()].flatMap((o) => [...o.values()])]
       drivers.clear()
+      others.clear()
       await Promise.all(open.map((d) => d.close()))
     },
   }
@@ -574,6 +647,26 @@ function pathMatches(pattern: string, path: string): boolean {
 async function defaultUi(): Promise<UiAssets> {
   const { assets } = (await import('@otwdesign/db-ui')) as { assets: UiAssets }
   return assets
+}
+
+function oneDatabase(connection: ConnectionConfig): DbAdminError {
+  return new DbAdminError(
+    `Connection "${connection.name}" opens its own database only.`,
+    400,
+    'one-database',
+  )
+}
+
+/** A database's name as PostgreSQL takes it: up to 63 bytes, with no NUL. */
+function databaseName(value: unknown): string {
+  if (
+    typeof value !== 'string' ||
+    value.includes('\0') ||
+    new TextEncoder().encode(value).length > MAX_DATABASE_NAME
+  ) {
+    throw bad('"database" is a database’s name.')
+  }
+  return value
 }
 
 function accessOf(viewer: Viewer, connection: ConnectionConfig): Access | null {

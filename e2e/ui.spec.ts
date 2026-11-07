@@ -445,3 +445,54 @@ test('works the same on SQLite: browse, edit, commit and query', async ({ page }
     'Write docs',
   ])
 })
+
+test('opens the server’s other databases from the toolbar, each with its own tabs', async ({
+  page,
+}) => {
+  await open(page, 'Blog')
+  const pill = page.getByLabel('Connection', { exact: true })
+  await pill.getByRole('button', { name: 'postgres' }).click()
+  const picker = page.getByRole('dialog', { name: 'Open database' })
+  await expect(picker.getByRole('option', { name: /postgres/ })).toHaveText(/postgres\s*open/)
+  await expect(picker.getByRole('option', { name: /archive/ })).toBeVisible()
+  await expect(picker.getByRole('option', { name: /template/ })).toHaveCount(0)
+  await picker.getByLabel('Database name').fill('arch')
+  await page.keyboard.press('Enter')
+
+  await expect(page).toHaveURL(/#main\/archive$/)
+  await expect(pill).toContainText(/Blog\s*:\s*archive/)
+  await expect(
+    page.getByRole('list', { name: 'Tables', exact: true }).getByRole('button'),
+  ).toHaveText([/letters/])
+  await page.getByRole('button', { name: /^letters/ }).click()
+  await expect(cell(page, 'public.letters', 2, 2)).toHaveText('Grace')
+  await sql(page, 'SELECT current_database()')
+  await page.keyboard.press(`${MOD}+Enter`)
+  await expect(cell(page, 'Result', 1, 1)).toHaveText('archive')
+
+  // A reload comes back to the database, with its tabs.
+  await page.reload()
+  await expect(pill).toContainText(/Blog\s*:\s*archive/)
+  await expect(page.getByRole('tab', { name: /letters/ })).toBeVisible()
+
+  // The connection's own database keeps tabs of its own.
+  await page.keyboard.press(`${MOD}+k`)
+  await picker.getByRole('option', { name: /postgres/ }).click()
+  await expect(page).toHaveURL(/#main$/)
+  await expect(pill).toContainText(/Blog\s*:\s*postgres/)
+  await expect(page.getByRole('tab', { name: /letters/ })).toHaveCount(0)
+  await page.goBack()
+  await expect(pill).toContainText(/Blog\s*:\s*archive/)
+})
+
+test('keeps a connection pinned to its own database there', async ({ page }) => {
+  await open(page, 'Operations')
+  const pill = page.getByLabel('Connection', { exact: true })
+  await expect(pill.getByRole('button')).toHaveCount(0)
+  await page.keyboard.press(`${MOD}+k`)
+  await expect(page.getByRole('dialog', { name: 'Open database' })).toHaveCount(0)
+  // Even when the address names another.
+  await page.goto('/#ops/archive')
+  await expect(pill).toContainText(/Operations\s*:\s*postgres/)
+  await expect(page.getByRole('button', { name: /^users/ })).toBeVisible()
+})

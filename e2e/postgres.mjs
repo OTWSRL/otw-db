@@ -10,8 +10,11 @@ const { Client } = require('pg')
 
 const docker = (...args) => execFileSync('docker', args, { encoding: 'utf8' }).trim()
 
-/** A seeded database's URL. The container goes when this process does, however it ends. */
-export async function startPostgres(seed) {
+/**
+ * A seeded database's URL. `databases` are more on the same server, by name, each made afresh
+ * and seeded with its SQL. The container goes when this process does, however it ends.
+ */
+export async function startPostgres(seed, databases = {}) {
   let url = process.env.E2E_POSTGRES_URL
   if (!url) {
     const name = `otw-db-e2e-${process.pid}`
@@ -53,6 +56,16 @@ export async function startPostgres(seed) {
   const client = new Client({ connectionString: url })
   await client.connect()
   await client.query(seed)
+  for (const [name, sql] of Object.entries(databases)) {
+    await client.query(`DROP DATABASE IF EXISTS "${name}" WITH (FORCE)`)
+    await client.query(`CREATE DATABASE "${name}"`)
+    const at = new URL(url)
+    at.pathname = `/${name}`
+    const other = new Client({ connectionString: at.href })
+    await other.connect()
+    await other.query(sql)
+    await other.end()
+  }
   await client.end()
   return url
 }

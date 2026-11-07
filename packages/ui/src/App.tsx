@@ -1,32 +1,30 @@
 import { useEffect, useMemo, useState } from 'react'
+import { addressOf, readAddress, storageScope, type Address } from './address.ts'
 import { createApi, type ApiError, type Connection } from './api.ts'
 import { ConnectionList } from './ConnectionList.tsx'
 import { Workspace } from './workspace/Workspace.tsx'
 import type { UiConfig } from '@otwdesign/db-core'
-
-/** The open connection's name, kept in the address (`#main`) so a reload comes back to it. */
-const fromHash = () => decodeURIComponent(location.hash.slice(1))
 
 export function App({ config }: { config: UiConfig }) {
   const [signedOut, setSignedOut] = useState(false)
   const api = useMemo(() => createApi(config, () => setSignedOut(true)), [config])
   const [connections, setConnections] = useState<Connection[] | null>(null)
   const [error, setError] = useState<ApiError | null>(null)
-  const [open, setOpen] = useState(fromHash)
+  const [open, setOpen] = useState(() => readAddress(location.hash))
 
   useEffect(() => {
     api.connections().then(setConnections, (e: unknown) => setError(e as ApiError))
   }, [api])
 
   useEffect(() => {
-    const follow = () => setOpen(fromHash())
+    const follow = () => setOpen(readAddress(location.hash))
     window.addEventListener('hashchange', follow)
     return () => window.removeEventListener('hashchange', follow)
   }, [])
 
-  const choose = (name: string) => {
-    location.hash = name ? encodeURIComponent(name) : ''
-    setOpen(name)
+  const go = (address: Address) => {
+    location.hash = addressOf(address)
+    setOpen(address)
   }
 
   if (signedOut) {
@@ -51,16 +49,25 @@ export function App({ config }: { config: UiConfig }) {
   }
   if (!connections) return <div className="signed-out">Loading…</div>
 
-  const connection = connections.find((c) => c.name === open && c.capabilities)
+  const connection = connections.find((c) => c.name === open.connection && c.capabilities)
   if (connection) {
+    // Another database only where the connection opens others; else its own.
+    const database = connection.capabilities?.databases ? open.database : null
     return (
       <Workspace
-        key={connection.name}
+        key={storageScope(connection.name, database)}
         api={api}
         connection={connection}
-        onSwitch={() => choose('')}
+        database={database}
+        onDatabase={(name) => go({ connection: connection.name, database: name })}
+        onSwitch={() => go({ connection: '', database: null })}
       />
     )
   }
-  return <ConnectionList connections={connections} onOpen={(c) => choose(c.name)} />
+  return (
+    <ConnectionList
+      connections={connections}
+      onOpen={(c) => go({ connection: c.name, database: null })}
+    />
+  )
 }

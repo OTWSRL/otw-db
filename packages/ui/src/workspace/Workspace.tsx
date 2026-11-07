@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useReducer, useState } from 'react'
+import { storageScope } from '../address.ts'
 import type { Api, ApiError, Connection, ServerInfo, TableSummary } from '../api.ts'
 import { loadHistory } from '../history.ts'
 import { loadTabs, saveTabs, tabsReducer } from '../tabs.ts'
@@ -9,6 +10,7 @@ import {
   type ShownRow,
   type Workspace as WorkspaceValue,
 } from './context.ts'
+import { DatabasePicker } from './DatabasePicker.tsx'
 import { ConsolePanel, RowPanel, TabBar, ToolButton } from './Panels.tsx'
 import { QueryTab } from './QueryTab.tsx'
 import { QuickOpen } from './QuickOpen.tsx'
@@ -29,29 +31,43 @@ export const MOD = MAC ? '⌘' : 'Ctrl+'
 interface Props {
   api: Api
   connection: Connection
+  /** One of the server's other databases; null for the connection's own. */
+  database: string | null
+  /** Opens another database of the server (null: the connection's own) in the workspace's place. */
+  onDatabase(database: string | null): void
   onSwitch(): void
 }
 
-/** A connection's window: toolbar, sidebar, tabs, row panel and console. */
-export function Workspace({ api, connection, onSwitch }: Props) {
+/** A connection's window, on one of its databases: toolbar, sidebar, tabs, row panel and console. */
+export function Workspace({
+  api: connectionApi,
+  connection,
+  database,
+  onDatabase,
+  onSwitch,
+}: Props) {
+  const api = useMemo(() => connectionApi.forDatabase(database), [connectionApi, database])
+  const scope = storageScope(connection.name, database)
+  const others = connection.capabilities?.databases === true
   const [info, setInfo] = useState<ServerInfo | null>(null)
   const [tables, setTables] = useState<TableSummary[] | null>(null)
   const [error, setError] = useState<ApiError | null>(null)
   const [schema, setSchema] = useState<string | null>(null)
-  const [tabs, dispatch] = useReducer(tabsReducer, connection.name, loadTabs)
+  const [tabs, dispatch] = useReducer(tabsReducer, scope, loadTabs)
   const [entries, setEntries] = useState<LogEntry[]>([])
   const [row, setRow] = useState<ShownRow | null>(null)
   const [sidebar, setSidebar] = useState(true)
   const [panel, setPanel] = useState(false)
   const [consoleOpen, setConsoleOpen] = useState(false)
   const [quickOpen, setQuickOpen] = useState(false)
+  const [picking, setPicking] = useState(false)
   const [refreshKey, setRefreshKey] = useState(0)
   const [filterKey, setFilterKey] = useState(0)
-  const [history, setHistory] = useState(() => loadHistory(connection.name))
+  const [history, setHistory] = useState(() => loadHistory(scope))
 
   useEffect(() => {
-    saveTabs(connection.name, tabs)
-  }, [connection.name, tabs])
+    saveTabs(scope, tabs)
+  }, [scope, tabs])
 
   useEffect(() => {
     let current = true
@@ -86,6 +102,7 @@ export function Workspace({ api, connection, onSwitch }: Props) {
       const handled = (() => {
         if (mod && key === 'e') dispatch({ type: 'new-query' })
         else if (mod && key === 'p') setQuickOpen(true)
+        else if (mod && key === 'k' && others) setPicking(true)
         else if (mod && !event.shiftKey && key === 'r') setRefreshKey((n) => n + 1)
         else if (mod && key === 'f' && activeTab?.kind === 'table') setFilterKey((n) => n + 1)
         // ⌘W closes the browser's tab whatever a page does, so ⌥W closes ours.
@@ -100,11 +117,11 @@ export function Workspace({ api, connection, onSwitch }: Props) {
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [activeTab])
+  }, [activeTab, others])
 
   const value = useMemo<WorkspaceValue>(
-    () => ({ api, connection, log, showRow: setRow, refreshKey, filterKey }),
-    [api, connection, log, refreshKey, filterKey],
+    () => ({ api, connection, scope, log, showRow: setRow, refreshKey, filterKey }),
+    [api, connection, scope, log, refreshKey, filterKey],
   )
   const summaries = useMemo(
     () => new Map((tables ?? []).map((t) => [`${t.schema}.${t.name}`, t])),
@@ -119,6 +136,8 @@ export function Workspace({ api, connection, onSwitch }: Props) {
   const tag = connection.tag ? `tag-${connection.tag}` : ''
   const current =
     activeTab?.kind === 'table' ? { schema: activeTab.schema, table: activeTab.table } : null
+  // The database asked for until the server names it, which it does even when it can't open it.
+  const shownDatabase = info?.database ?? database
 
   return (
     <WorkspaceContext.Provider value={value}>
@@ -149,7 +168,20 @@ export function Workspace({ api, connection, onSwitch }: Props) {
             <span className="sep">:</span>
             <span>{connection.label}</span>
             <span className="sep">:</span>
-            <span>{info?.database ?? '…'}</span>
+            {others ? (
+              <button
+                type="button"
+                className="database-button"
+                aria-haspopup="dialog"
+                title={`Open another database (${MOD}K)`}
+                onClick={() => setPicking(true)}
+              >
+                {shownDatabase ?? '…'}
+                <Icon name="down" size={11} />
+              </button>
+            ) : (
+              <span>{shownDatabase ?? '…'}</span>
+            )}
             {connection.access === 'read' && (
               <span className="read-only" title="Read-only: writes are refused">
                 <Icon name="lock" size={12} /> read-only
@@ -209,6 +241,12 @@ export function Workspace({ api, connection, onSwitch }: Props) {
                 <div>Open a table from the sidebar, or</div>
                 <div>
                   Open anything <kbd>{MOD}P</kbd> · New SQL editor <kbd>{MOD}E</kbd>
+                  {others && (
+                    <>
+                      {' '}
+                      · Open database <kbd>{MOD}K</kbd>
+                    </>
+                  )}
                 </div>
               </div>
             )}
@@ -231,7 +269,7 @@ export function Workspace({ api, connection, onSwitch }: Props) {
                   defaultSchema={schema ?? 'public'}
                   kind={connection.kind}
                   active={tab.id === tabs.active}
-                  onHistory={() => setHistory(loadHistory(connection.name))}
+                  onHistory={() => setHistory(loadHistory(scope))}
                 />
               ),
             )}
@@ -240,6 +278,18 @@ export function Workspace({ api, connection, onSwitch }: Props) {
           {panel ? <RowPanel row={row} /> : <div />}
         </div>
       </div>
+      {picking && (
+        <DatabasePicker
+          api={api}
+          connection={connection.name}
+          open={info?.database ?? database}
+          onClose={() => setPicking(false)}
+          onOpen={(name) => {
+            setPicking(false)
+            if (name !== database) onDatabase(name)
+          }}
+        />
+      )}
       {quickOpen && tables && (
         <QuickOpen
           tables={tables}

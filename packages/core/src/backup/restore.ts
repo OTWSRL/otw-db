@@ -43,6 +43,7 @@ export interface RestoreProgress {
   bytes: number
 }
 
+/** What a restore put back: the backup's tables and rows, and the statements it ran. */
 export interface RestoreResult extends BackupSummary {
   statements: number
 }

@@ -34,6 +34,7 @@ export interface Server {
   user: string
 }
 
+/** A schema the backup dialog offers, with what's in it and whether it's ticked at first. */
 export interface SchemaChoice {
   name: string
   owner: string

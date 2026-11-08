@@ -7,6 +7,7 @@ import { STAGING_SCHEMA } from './format.ts'
  * the PostgreSQL client), never on a serverless host. Found once, on first use.
  */
 
+/** Whether pg_dump or pg_restore can be used here, its version, and if not, why. */
 export interface PgTool {
   available: boolean
   /** Such as `pg_dump (PostgreSQL) 17.11`. */

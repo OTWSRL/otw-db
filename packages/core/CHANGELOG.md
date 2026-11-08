@@ -1,5 +1,13 @@
 # @otwdesign/db-core
 
+## 1.3.1
+
+### Patch Changes
+
+- e187960: The backup types `PgTool`, `RestoreResult` and `SchemaChoice` say what they are, as every type the
+  package exports does.
+- @otwdesign/db-ui@1.3.1
+
 ## 1.3.0
 
 ### Minor Changes

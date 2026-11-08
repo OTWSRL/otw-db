@@ -1,6 +1,6 @@
 {
   "name": "@otwdesign/db-core",
-  "version": "1.3.0",
+  "version": "1.3.1",
   "description": "A database manager's engine and HTTP API, as one Fetch handler: browse, query and inspect PostgreSQL, MySQL and SQLite from any app.",
   "license": "Apache-2.0",
   "author": "OTW SRL",

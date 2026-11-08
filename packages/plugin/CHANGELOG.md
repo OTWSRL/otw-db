@@ -1,5 +1,13 @@
 # @otwdesign/plugin-db
 
+## 1.3.0
+
+### Patch Changes
+
+- Updated dependencies [f6b729b]
+  - @otwdesign/db-core@1.3.0
+  - @otwdesign/db-ui@1.3.0
+
 ## 1.2.0
 
 ### Patch Changes

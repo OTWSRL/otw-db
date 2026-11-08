@@ -158,7 +158,13 @@ describe('createDbAdmin', () => {
         warning: null,
         kind: 'postgres',
         access: 'write',
-        capabilities: { schemas: true, transactionalDdl: true, cancel: true, databases: false },
+        capabilities: {
+          schemas: true,
+          transactionalDdl: true,
+          cancel: true,
+          databases: false,
+          backup: false,
+        },
       },
       expect.objectContaining({ name: 'reports', access: 'read', tag: null }),
     ])

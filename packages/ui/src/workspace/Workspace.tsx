@@ -10,6 +10,7 @@ import {
   type ShownRow,
   type Workspace as WorkspaceValue,
 } from './context.ts'
+import { BackupDialog } from './BackupDialog.tsx'
 import { DatabasePicker } from './DatabasePicker.tsx'
 import { ConsolePanel, RowPanel, TabBar, ToolButton } from './Panels.tsx'
 import { QueryTab } from './QueryTab.tsx'
@@ -49,6 +50,7 @@ export function Workspace({
   const api = useMemo(() => connectionApi.forDatabase(database), [connectionApi, database])
   const scope = storageScope(connection.name, database)
   const others = connection.capabilities?.databases === true
+  const backups = connection.capabilities?.backup === true
   const [info, setInfo] = useState<ServerInfo | null>(null)
   const [tables, setTables] = useState<TableSummary[] | null>(null)
   const [error, setError] = useState<ApiError | null>(null)
@@ -61,6 +63,7 @@ export function Workspace({
   const [consoleOpen, setConsoleOpen] = useState(false)
   const [quickOpen, setQuickOpen] = useState(false)
   const [picking, setPicking] = useState(false)
+  const [backingUp, setBackingUp] = useState(false)
   const [refreshKey, setRefreshKey] = useState(0)
   const [filterKey, setFilterKey] = useState(0)
   const [history, setHistory] = useState(() => loadHistory(scope))
@@ -189,6 +192,13 @@ export function Workspace({
             )}
           </div>
           <div className="toolbar-group end">
+            {backups && (
+              <ToolButton
+                icon="backup"
+                label="Back up and restore"
+                onClick={() => setBackingUp(true)}
+              />
+            )}
             <ToolButton
               icon="sql"
               label="New SQL editor"
@@ -288,6 +298,14 @@ export function Workspace({
             setPicking(false)
             if (name !== database) onDatabase(name)
           }}
+        />
+      )}
+      {backingUp && (
+        <BackupDialog
+          api={api}
+          connection={connection}
+          onClose={() => setBackingUp(false)}
+          onRestored={() => setRefreshKey((n) => n + 1)}
         />
       )}
       {quickOpen && tables && (

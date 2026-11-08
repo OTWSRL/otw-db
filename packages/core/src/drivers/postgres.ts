@@ -29,6 +29,7 @@ import type {
   ResultSet,
   RowsRequest,
   ServerInfo,
+  Session,
   TableDetail,
   TableSummary,
 } from '../types.ts'
@@ -153,6 +154,7 @@ class PostgresDriver implements Driver {
   readonly kind = 'postgres'
   readonly capabilities: Capabilities = { schemas: true, transactionalDdl: true, cancel: true }
   readonly sql = { identifier: quote, literal }
+  readonly pgUrl: string
   readonly #url: string
   readonly #config: PoolConfig
   readonly #modules: PostgresModules | undefined
@@ -162,6 +164,7 @@ class PostgresDriver implements Driver {
 
   constructor(url: string, modules: PostgresModules | undefined) {
     this.#url = url
+    this.pgUrl = url
     this.#modules = modules
     this.#config = {
       connectionString: url,
@@ -418,6 +421,49 @@ class PostgresDriver implements Driver {
       name: f.name,
       type: this.#typeNames.get(f.dataTypeID) ?? 'unknown',
     }))
+  }
+
+  /** A transaction on a connection of its own, closed after: a restore's SETs leave with it. */
+  async session(mode: 'snapshot' | 'write'): Promise<Session> {
+    const { client } = await this.#connect()
+    try {
+      await client.query(
+        mode === 'snapshot' ? 'BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY' : 'BEGIN',
+      )
+    } catch (error) {
+      client.release(true)
+      throw toError(error)
+    }
+    let ended = false
+    return {
+      exclusive: false,
+      async query(text, values) {
+        try {
+          const result = await client.query({
+            text,
+            values: values?.map((v) =>
+              v instanceof Uint8Array ? Buffer.from(v.buffer, v.byteOffset, v.byteLength) : v,
+            ),
+            rowMode: 'array',
+            types: AS_TEXT,
+          })
+          return { rows: result.rows as (string | null)[][] }
+        } catch (error) {
+          throw toError(error)
+        }
+      },
+      async end(commit) {
+        if (ended) return
+        ended = true
+        try {
+          await client.query(commit ? 'COMMIT' : 'ROLLBACK')
+        } catch (error) {
+          throw toError(error)
+        } finally {
+          client.release(true)
+        }
+      },
+    }
   }
 
   async close(): Promise<void> {

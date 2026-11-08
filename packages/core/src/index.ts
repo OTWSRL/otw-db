@@ -18,3 +18,9 @@ export {
 export { ROUTES } from './routes.ts'
 export { renderAsset, renderIndex, type UiAssets, type UiConfig } from './ui.ts'
 export type * from './types.ts'
+// Types only: the backup code itself loads on the first backup or restore.
+export type { BackupOptions } from './backup/api.ts'
+export type { SchemaChoice } from './backup/dump.ts'
+export type { BackupHeader, BackupSummary } from './backup/format.ts'
+export type { PgTool } from './backup/pg-tools.ts'
+export type { RestorePlan, RestoreResult } from './backup/restore.ts'

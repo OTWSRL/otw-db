@@ -1,3 +1,5 @@
+import { readFileSync } from 'node:fs'
+import { gunzipSync } from 'node:zlib'
 import { expect, test, type Page } from '@playwright/test'
 
 // The Database plugin in a CMS site on its embedded database. One site, set up by the first test.
@@ -136,6 +138,33 @@ test('exports a table and a query’s result from inside its shadow root', async
   await app(page).getByRole('menuitem', { name: 'JSON' }).click()
   file = await saved
   expect(JSON.parse(await read())).toEqual([{ n: '1', t: 'x' }])
+})
+
+test('backs up the site’s embedded database, and keeps restoring for write access', async ({
+  page,
+}) => {
+  await openDatabase(page)
+  await app(page).getByRole('button', { name: 'Back up and restore' }).click()
+  const dialog = app(page).getByRole('dialog', { name: 'Back up and restore' })
+  await expect(dialog.getByText('the site waits while the backup is taken')).toBeVisible()
+  await expect(dialog.getByRole('radio', { name: /pg_dump/ })).toBeDisabled()
+  const saved = page.waitForEvent('download')
+  await dialog.getByRole('button', { name: 'Download backup' }).click()
+  const file = await saved
+  expect(file.suggestedFilename()).toMatch(/^site-postgres-.+\.sql\.gz$/)
+  const sql = gunzipSync(readFileSync(await file.path())).toString()
+  expect(sql).toMatch(/^-- otw-db backup \{"format":"otw-db"/)
+  expect(sql).toContain('CREATE TABLE "public"."cms_users"')
+  expect(sql).toContain(ADMIN.email)
+  expect(sql.trimEnd().split('\n').pop()).toMatch(
+    /^-- otw-db backup complete \{"tables":\d+,"rows":\d+\}$/,
+  )
+
+  await app(page).getByRole('button', { name: 'Back up and restore' }).click()
+  await dialog.getByRole('tab', { name: 'Restore' }).click()
+  await expect(
+    dialog.getByText('Restoring needs write access, and this connection is read-only.'),
+  ).toBeVisible()
 })
 
 test('serves its API to administrators only', async ({ request }) => {

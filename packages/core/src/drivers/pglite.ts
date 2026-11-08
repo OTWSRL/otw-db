@@ -9,6 +9,7 @@ import type {
   ResultSet,
   RowsRequest,
   ServerInfo,
+  Session,
   TableDetail,
   TableSummary,
 } from '../types.ts'
@@ -280,6 +281,60 @@ class PGliteDriver implements Driver {
     for (let at = 0; at === 0 || at < list.length; at += EXPORT_BATCH) {
       yield { columns, rows: list.slice(at, at + EXPORT_BATCH) }
     }
+  }
+
+  /**
+   * PGlite's exclusive transaction, held open until `end`: the host's queries wait meanwhile, so
+   * whoever opens it must end it, and soon.
+   */
+  session(mode: 'snapshot' | 'write'): Promise<Session> {
+    const client = this.#client
+    const parsers = () => this.#text
+    return new Promise<Session>((resolve, reject) => {
+      let opened = false
+      const done = client.transaction(async (tx) => {
+        if (mode === 'snapshot') {
+          await tx.query('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY')
+        }
+        let decide!: (commit: boolean) => void
+        const decided = new Promise<boolean>((r) => (decide = r))
+        let ended = false
+        opened = true
+        resolve({
+          exclusive: true,
+          async query(sql, values) {
+            try {
+              const result = await tx.query(sql, values, { rowMode: 'array', parsers: parsers() })
+              return { rows: result.rows as (string | null)[][] }
+            } catch (error) {
+              throw toError(error)
+            }
+          },
+          async end(commit) {
+            if (ended) return
+            ended = true
+            decide(commit)
+            try {
+              await done
+            } catch (error) {
+              throw toError(error)
+            } finally {
+              // As after every write: nothing the session set (SET, locks) stays on the connection
+              // the host shares.
+              await client
+                .exec(mode === 'write' ? 'DISCARD ALL' : 'SELECT pg_advisory_unlock_all()')
+                .catch((error: unknown) =>
+                  console.error('otw-db: could not reset the PGlite session', error),
+                )
+            }
+          },
+        })
+        if (!(await decided)) await tx.rollback()
+      })
+      done.catch((error: unknown) => {
+        if (!opened) reject(toError(error))
+      })
+    })
   }
 
   /** The host owns the instance: nothing to close here. */

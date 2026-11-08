@@ -496,3 +496,83 @@ test('keeps a connection pinned to its own database there', async ({ page }) => 
   await expect(pill).toContainText(/Operations\s*:\s*postgres/)
   await expect(page.getByRole('button', { name: /^users/ })).toBeVisible()
 })
+
+test.describe('backing up and restoring', () => {
+  async function dialog(page: Page) {
+    await page.getByRole('button', { name: 'Back up and restore' }).click()
+    return page.getByRole('dialog', { name: 'Back up and restore' })
+  }
+
+  test('downloads a backup, and restores it over what changed since', async ({ page }) => {
+    await signIn(page)
+    await page.goto('/#main/archive')
+    const pill = page.getByLabel('Connection', { exact: true })
+    await expect(pill).toContainText(/Blog\s*:\s*archive/)
+
+    const backup = await dialog(page)
+    await expect(backup.getByText(/^archive on PostgreSQL 17/)).toBeVisible()
+    await expect(backup.getByRole('checkbox', { name: /public/ })).toBeChecked()
+    await expect(backup.getByRole('radio', { name: /SQL backup/ })).toBeChecked()
+    const saved = page.waitForEvent('download')
+    await backup.getByRole('button', { name: 'Download backup' }).click()
+    const file = await saved
+    expect(file.suggestedFilename()).toMatch(/^main-archive-\d{4}-\d{2}-\d{2}-\d{4}\.sql\.gz$/)
+    await expect(backup).toHaveCount(0)
+    const path = await file.path()
+
+    await sql(page, "UPDATE public.letters SET sender = 'Changed' WHERE id = 1")
+    await page.keyboard.press(`${MOD}+Enter`)
+    await expect(page.getByRole('status')).toContainText('UPDATE · 1 rows affected')
+
+    const restore = await dialog(page)
+    await restore.getByRole('tab', { name: 'Restore' }).click()
+    await restore.getByLabel('Backup file').setInputFiles(path)
+    await expect(restore.getByText(/^Backup of archive \(PostgreSQL 17/)).toBeVisible()
+    await expect(restore.getByText(/^Replaces in archive:/)).toBeVisible()
+    await expect(restore.getByText(/1 table, 0 views, 0 functions/)).toBeVisible()
+    const go = restore.getByRole('button', { name: 'Restore' })
+    await expect(go).toBeDisabled()
+    await restore.getByLabel('Database name, to confirm').fill('archiv')
+    await expect(go).toBeDisabled()
+    await restore.getByLabel('Database name, to confirm').fill('archive')
+    await go.click()
+    await expect(restore.getByRole('status')).toContainText(/^Restored 1 table and 2 rows in/)
+    await restore.getByRole('button', { name: 'Close' }).click()
+
+    await page.getByRole('button', { name: /^letters/ }).click()
+    await expect(cell(page, 'public.letters', 1, 2)).toHaveText('Ada')
+  })
+
+  test('says a file isn’t a backup, and a read-only connection can’t restore', async ({ page }) => {
+    await open(page, 'Blog')
+    const restore = await dialog(page)
+    await restore.getByRole('tab', { name: 'Restore' }).click()
+    await restore.getByLabel('Backup file').setInputFiles({
+      name: 'notes.sql',
+      mimeType: 'application/sql',
+      buffer: Buffer.from('DROP TABLE public.users;\n'),
+    })
+    await expect(restore.getByRole('alert')).toHaveText(
+      'This isn’t a backup made here: choose a .sql.gz from Back up, or a .dump from pg_dump.',
+    )
+    await expect(restore.getByRole('button', { name: 'Restore' })).toBeDisabled()
+    await page.keyboard.press('Escape')
+    await expect(restore).toHaveCount(0)
+
+    await page.getByRole('button', { name: 'Connections' }).click()
+    await page.getByRole('button', { name: 'Blog (read-only)', exact: true }).click()
+    const readOnly = await dialog(page)
+    await readOnly.getByRole('tab', { name: 'Restore' }).click()
+    await expect(
+      readOnly.getByText('Restoring needs write access, and this connection is read-only.'),
+    ).toBeVisible()
+    await expect(readOnly.getByRole('button', { name: 'Restore' })).toHaveCount(0)
+  })
+
+  test('offers no backups on SQLite', async ({ page }) => {
+    await signIn(page)
+    await page.getByRole('button', { name: 'Notes', exact: true }).click()
+    await expect(page.getByLabel('Connection', { exact: true })).toContainText('SQLite')
+    await expect(page.getByRole('button', { name: 'Back up and restore' })).toHaveCount(0)
+  })
+})

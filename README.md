@@ -31,6 +31,9 @@ a window with the schema's tables in a sidebar, tabs for tables and SQL editors,
   Writes on a `production` connection ask first.
 - **Databases:** a PostgreSQL connection opens any of its server's databases its login may connect
   to. Click the database's name in the toolbar, or ⌘K, and type a few letters of another.
+- **Backups:** the toolbar's Back up and restore downloads a PostgreSQL database's schemas as a
+  `.sql.gz`, and restores one, on any host, Vercel included. Where the server has `pg_dump`, it can
+  make pg_dump's `.dump` too. See [Backups](#backups).
 - **Shortcuts:** ⌘P open a table, ⌘K open another database, ⌘E new SQL editor, ⌘R refresh, ⌘F
   filter, ⌥W close the tab (a browser keeps ⌘W), ⌘[ and ⌘] switch tabs. Ctrl instead of ⌘ off a
   Mac.
@@ -58,6 +61,52 @@ but the templates and those the login has no `CONNECT` on. Each opens with the s
 and tag, on a pool of its own that opens on first use; the eight used last stay open.
 `DATABASES=one` pins a connection to the URL's database, for a login with more privileges than the
 tool should show. MySQL needs none of this: its databases are the schemas of one connection.
+
+## Backups
+
+The toolbar's **Back up and restore** (PostgreSQL connections, the CMS's embedded database
+included) does both from the browser.
+
+**Back up** saves the schemas you tick, those the login owns at first:
+
+- **SQL backup** (`.sql.gz`), always. The tool writes it from the catalog in one read-only
+  snapshot: schemas, extensions, types and domains, sequences and where they had got to,
+  tables with their rows, keys, indexes, foreign keys, views and materialized views, functions
+  and procedures, triggers and rules, row-level security and policies, statistics, comments,
+  owners and privileges. What it can't hold (aggregates, operators, C functions, foreign tables,
+  table inheritance, event triggers…) is listed before you download and in the file, never left
+  out unsaid. psql restores it too:
+  `gunzip -c backup.sql.gz | psql --single-transaction -v ON_ERROR_STOP=1 -d <url>`.
+- **pg_dump** (`.dump`), where the server running the tool has `pg_dump`, as new as the
+  database: a VPS, or a container with the PostgreSQL client. Not on Vercel, or for the embedded
+  database.
+
+**Restore** needs a `write` connection. It shows what the file holds and what it replaces, and
+asks you to type the database's name. Then:
+
+- It replaces the schemas the backup holds: what they hold is dropped and made again from the
+  file. The schema itself, its owner and its privileges stay. Other schemas aren't touched, and
+  if anything in them depends on what's replaced (a view on one of its tables, say), the restore
+  says what and refuses.
+- It runs in one transaction: if anything fails, or the file was cut short (every backup ends
+  with a line saying it's whole), nothing changes.
+- Owners, grants and policies that name a role this server lacks are skipped, and listed first.
+  Roles aren't in a backup.
+- Generated columns are computed again by the restoring server, as with pg_dump: one that calls
+  `lower()` on non-English letters, say, follows that server's locale.
+- Extensions the schemas use are made where they were. The database's other extensions are made
+  too where this server has them, and skipped where it hasn't: a function's body may call one,
+  and PostgreSQL keeps no record of what a body calls.
+- The browser sends the file in 4 MB pieces, which wait in the database itself (a schema named
+  `otw_db_restore`, gone afterwards): Vercel takes 4.5 MB a request, and serverless instances
+  share nothing else. A restore is 1 GB at most by default (`backups.maxRestoreBytes`).
+- A `.dump` is restored with `pg_restore --clean --if-exists --single-transaction --no-owner`,
+  where the server has it.
+
+Both run in a request, so a host's time limit is theirs: Vercel stops a function after 300 seconds
+by default, 800 on Pro. For a database of gigabytes, use pg_dump on a machine of your own, or your
+host's backups. On the CMS's embedded database, the site waits while either runs; restart a site
+after restoring its database, so it reads it again.
 
 ## Mounting it
 
@@ -139,7 +188,8 @@ Addresses: `postgres://…`, `mysql://…` or `mariadb://…`, and `sqlite:/path
 
 A driver that opens one database at a time offers the server's others with `databases()`, which
 lists them, and `withDatabase(name)`, which returns a driver for one; the PostgreSQL driver has
-both.
+both. Backups need `session(mode)`, one transaction on a connection of its own, which the
+PostgreSQL and PGlite drivers have; `pgUrl` is where pg_dump connects, a server's only.
 
 A driver is imported where the app runs, so from the app's own dependencies. A package that
 brings `pg` and `pg-cursor` as its own dependencies and is bundled into an app, as the CMS plugin

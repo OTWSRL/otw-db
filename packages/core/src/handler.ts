@@ -16,6 +16,7 @@ import type {
   Viewer,
 } from './types.ts'
 import { ROUTES } from './routes.ts'
+import type * as BackupApi from './backup/api.ts'
 import { renderAsset, renderIndex, type UiAssets } from './ui.ts'
 
 /** What `createDbAdmin` needs: who may use the tool, the databases it may open, its limits. */
@@ -47,6 +48,11 @@ export interface DbAdminOptions {
   ui?: (() => Promise<UiAssets>) | false
   /** Where the app sends a browser the API turns away (401): the host's sign-in page. */
   signInUrl?: string
+  /** Backups and restores (PostgreSQL). A restore's upload waits in the database it restores. */
+  backups?: {
+    /** The biggest backup a restore takes, in bytes. Defaults to 1 GiB. */
+    maxRestoreBytes?: number
+  }
 }
 
 /**
@@ -137,6 +143,17 @@ export function createDbAdmin(options: DbAdminOptions): DbAdmin {
   const open = options.driver ?? openDriver
   const loadUi = options.ui === false ? undefined : (options.ui ?? defaultUi)
   let ui: Promise<UiAssets> | undefined
+  // Loaded on the first backup or restore: a host that never makes one never loads it.
+  let backupApi: Promise<typeof BackupApi> | undefined
+  const backups = () => (backupApi ??= import('./backup/api.ts'))
+  const maxRestoreBytes = options.backups?.maxRestoreBytes ?? 1_073_741_824
+  /** What a backup endpoint needs to know, from the connection it reached. */
+  const backupContext = (target: ReturnType<typeof reach>, viewer: Viewer) => ({
+    ...target,
+    viewer,
+    record,
+    maxRestoreBytes,
+  })
 
   function driver(connection: ConnectionConfig): Driver {
     let found = drivers.get(connection.name)
@@ -223,9 +240,11 @@ export function createDbAdmin(options: DbAdminOptions): DbAdmin {
           // A kind without a driver yet is listed, but can't be opened.
           let capabilities: Driver['capabilities'] | null = null
           try {
+            const opened = driver(connection)
             capabilities = {
-              ...driver(connection).capabilities,
+              ...opened.capabilities,
               databases: opensOthers(connection),
+              backup: typeof opened.session === 'function',
             }
           } catch (error) {
             if (!(error instanceof DbAdminError)) throw error
@@ -513,6 +532,42 @@ export function createDbAdmin(options: DbAdminOptions): DbAdmin {
             'x-content-type-options': 'nosniff',
           },
         })
+      },
+    },
+    {
+      method: 'GET',
+      path: '/api/backup-options',
+      async run(request, viewer) {
+        const params = new URL(request.url).searchParams
+        const target = reach(viewer, params.get('connection'), params.get('database'))
+        return (await backups()).options(backupContext(target, viewer))
+      },
+    },
+    ...(
+      [
+        ['/api/backup', 'download'],
+        ['/api/restore-plan', 'plan'],
+        ['/api/restore-start', 'start'],
+        ['/api/restore-run', 'run'],
+        ['/api/restore-discard', 'discard'],
+      ] as const
+    ).map(([path, action]) => ({
+      method: 'POST' as const,
+      path,
+      async run(request: Request, viewer: Viewer) {
+        const body = await json(request)
+        const target = reach(viewer, body.connection, body.database)
+        return (await backups())[action](backupContext(target, viewer), body)
+      },
+    })),
+    {
+      method: 'POST',
+      path: '/api/restore-chunk',
+      async run(request, viewer) {
+        // The body is the piece itself; the rest comes in the address.
+        const params = new URL(request.url).searchParams
+        const target = reach(viewer, params.get('connection'), params.get('database'))
+        return (await backups()).chunk(backupContext(target, viewer), request)
       },
     },
     {

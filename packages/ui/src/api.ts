@@ -1,6 +1,8 @@
 import type {
   Access,
   ApplyResult,
+  BackupHeader,
+  BackupOptions,
   Capabilities,
   Change,
   ConnectionTag,
@@ -9,6 +11,8 @@ import type {
   ExportFormat,
   Filter,
   QueryResult,
+  RestorePlan,
+  RestoreResult,
   ResultSet,
   ServerInfo,
   TableDetail,
@@ -18,6 +22,10 @@ import type {
 
 export type {
   ApplyResult,
+  BackupHeader,
+  BackupOptions,
+  RestorePlan,
+  RestoreResult,
   Change,
   DatabaseList,
   ExportFormat,
@@ -59,6 +67,12 @@ export class ApiError extends Error {
     this.name = 'ApiError'
   }
 }
+
+/** A line the restore sends as it goes. */
+export type RestoreLine =
+  | { type: 'progress'; statements: number; bytes: number }
+  | ({ type: 'done'; durationMs: number } & RestoreResult)
+  | { type: 'error'; error: { code: string; message: string } }
 
 /** The page's settings, which the server put in `<meta name="otw-db">`. */
 export function readConfig(doc: Document = document): UiConfig {
@@ -178,7 +192,101 @@ export function createApi(config: UiConfig, onUnauthorized: () => void, database
     },
     cancel: (queryId: string) =>
       call<{ canceled: boolean }>('/cancel', { queryId }).then((r) => r.canceled),
+    /** What a backup of the database would hold, and whether it can be restored here. */
+    backupOptions: (connection: string) =>
+      on<BackupOptions>(`/backup-options?${q({ connection })}`),
+    /** The backup as a file, with the name the server gave it. */
+    backup: async (request: {
+      connection: string
+      schemas: string[]
+      format: 'sql' | 'pg_dump'
+    }): Promise<{ blob: Blob; filename: string }> => {
+      const response = await send(...at('/backup', request))
+      if (!response.ok) throw await failure(response)
+      const disposition = response.headers.get('content-disposition') ?? ''
+      const filename = /filename="([^"]+)"/.exec(disposition)?.[1] ?? 'backup'
+      return { blob: await response.blob(), filename }
+    },
+    restorePlan: (connection: string, header: BackupHeader) =>
+      on<RestorePlan>('/restore-plan', { connection, header }),
+    /**
+     * Uploads `file` a piece at a time (a host may take 4.5 MB a request at most), then runs the
+     * restore, telling `onLine` how it goes. Resolves with the restore's last line.
+     */
+    restore: async (
+      connection: string,
+      file: Blob & { name?: string },
+      kind: 'sql' | 'pg_dump',
+      onUpload: (sent: number) => void,
+      onLine: (line: RestoreLine) => void,
+    ): Promise<RestoreLine> => {
+      const { upload, chunkBytes } = await on<{ upload: string; chunkBytes: number }>(
+        '/restore-start',
+        { connection, size: file.size, kind, name: file.name ?? 'backup' },
+      )
+      try {
+        for (let seq = 0, sent = 0; sent < file.size; seq += 1) {
+          const piece = file.slice(sent, sent + chunkBytes)
+          const [path] = at(`/restore-chunk?${q({ connection, upload, seq: String(seq) })}`)
+          await retried(async () => {
+            const response = await fetch(`${config.api}${path}`, {
+              method: 'POST',
+              headers: { 'x-db-admin': '1', 'content-type': 'application/octet-stream' },
+              body: piece,
+              credentials: 'same-origin',
+            })
+            if (!response.ok) throw await failure(response)
+          })
+          sent += piece.size
+          onUpload(sent)
+        }
+      } catch (error) {
+        await on('/restore-discard', { connection, upload }).catch(() => {})
+        throw error
+      }
+      const response = await send(...at('/restore-run', { connection, upload }))
+      if (!response.ok) throw await failure(response)
+      let last: RestoreLine | null = null
+      for await (const line of ndjson(response)) {
+        last = line as RestoreLine
+        onLine(last)
+      }
+      if (!last)
+        throw new ApiError(500, 'failed', 'The restore stopped without saying how it went.')
+      return last
+    },
   }
+}
+
+/** Tries `work` again, twice, after a network failure or a server error: an upload goes on. */
+async function retried(work: () => Promise<void>): Promise<void> {
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      return await work()
+    } catch (error) {
+      const again = !(error instanceof ApiError) || error.status >= 500
+      if (!again || attempt === 3) throw error
+      await new Promise((resolve) => setTimeout(resolve, 500 * attempt))
+    }
+  }
+}
+
+/** A response's lines of JSON, each as it arrives. */
+async function* ndjson(response: Response): AsyncGenerator<unknown> {
+  const reader = response.body!.pipeThrough(new TextDecoderStream()).getReader()
+  let buffer = ''
+  for (;;) {
+    const { done, value } = await reader.read()
+    if (value) buffer += value
+    let end
+    while ((end = buffer.indexOf('\n')) !== -1) {
+      const line = buffer.slice(0, end).trim()
+      buffer = buffer.slice(end + 1)
+      if (line) yield JSON.parse(line)
+    }
+    if (done) break
+  }
+  if (buffer.trim()) yield JSON.parse(buffer)
 }
 
 export type Api = ReturnType<typeof createApi>

@@ -4,3 +4,8 @@
  */
 export type * from './types.ts'
 export type { UiConfig } from './ui.ts'
+export type { BackupOptions } from './backup/api.ts'
+export type { SchemaChoice } from './backup/dump.ts'
+export type { BackupHeader, BackupSummary } from './backup/format.ts'
+export type { PgTool } from './backup/pg-tools.ts'
+export type { RestorePlan, RestoreResult } from './backup/restore.ts'

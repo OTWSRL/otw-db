@@ -47,6 +47,11 @@ export interface Capabilities {
    * offers them with `databases()` and `withDatabase()`, and a connection may be pinned to its own.
    */
   databases?: boolean
+  /**
+   * Whole-database backups and restores: PostgreSQL and PGlite. The API sets it: a driver offers
+   * them with `session()`.
+   */
+  backup?: boolean
 }
 
 /** What a schema-tree entry is: SQLite and MySQL have tables and views, PostgreSQL the rest too. */
@@ -271,7 +276,30 @@ export interface Driver {
    * on first use; whoever asked for it closes it.
    */
   withDatabase?(name: string): Driver
+  /**
+   * One transaction on a connection of its own, for a backup (`snapshot`: read-only, all of it as
+   * of one moment) or a restore (`write`: all of it or none). PostgreSQL and PGlite.
+   */
+  session?(mode: 'snapshot' | 'write'): Promise<Session>
+  /**
+   * The URL pg_dump and pg_restore may connect with: a server's driver has one, PGlite's (a
+   * database in the host's own process) doesn't.
+   */
+  readonly pgUrl?: string
   close(): Promise<void>
+}
+
+/** A backup's or a restore's transaction. Values come back as the server's text. */
+export interface Session {
+  /** One statement, its values as $1, $2… (a Uint8Array as bytea). */
+  query(sql: string, values?: unknown[]): Promise<{ rows: (string | null)[][] }>
+  /** Commits (a restore) or rolls back (a backup), then lets the connection go. */
+  end(commit: boolean): Promise<void>
+  /**
+   * It holds the host while open: PGlite runs in the host's process, one transaction at a time.
+   * Finish quickly, without waiting on a slow download.
+   */
+  readonly exclusive: boolean
 }
 
 /** Who is asking, as the host's `authorize()` says. */
@@ -292,7 +320,7 @@ export interface AuditEvent {
   connection: string
   /** The database it ran on, when it wasn't the connection's own. */
   database?: string
-  action: 'query' | 'rows' | 'count' | 'apply' | 'export' | 'cancel'
+  action: 'query' | 'rows' | 'count' | 'apply' | 'export' | 'cancel' | 'backup' | 'restore'
   /** The SQL run, or for `rows`, the table read. */
   statement: string
   durationMs: number

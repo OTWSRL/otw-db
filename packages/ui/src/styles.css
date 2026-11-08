@@ -24,6 +24,8 @@
   --danger: #d93025;
   --danger-bg: #fdecea;
   --warning-bg: #fff6e0;
+  --success: #1a7f37;
+  --success-bg: #e6f6ea;
   --null: #a1a1a6;
   --changed: #fff1b8;
   --inserted: #dcf5e3;
@@ -57,6 +59,8 @@
     --danger: #ff6b61;
     --danger-bg: #3b1f1d;
     --warning-bg: #3a3020;
+    --success: #6ad18a;
+    --success-bg: #1d3424;
     --null: #6b6b74;
     --changed: #4b4115;
     --inserted: #183a24;
@@ -617,6 +621,14 @@ kbd {
   background: var(--warning-bg);
   color: var(--text);
 }
+.notice.success {
+  background: var(--success-bg);
+  color: var(--success);
+}
+.notice ul {
+  margin: 4px 0;
+  padding-left: 18px;
+}
 .notice .detail {
   margin-top: 4px;
   color: var(--text-dim);
@@ -1001,4 +1013,93 @@ kbd {
   margin: 0;
   color: var(--text);
   font-size: 16px;
+}
+
+/* Back up and restore */
+
+.dialog.backup {
+  width: min(560px, calc(100vw - 32px));
+}
+.backup .tabs {
+  display: flex;
+  gap: 2px;
+  padding: 8px 12px 0;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-chrome);
+}
+.backup .tabs button {
+  padding: 6px 12px;
+  border: 1px solid transparent;
+  border-bottom: 0;
+  border-radius: 6px 6px 0 0;
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+}
+.backup .tabs button[aria-selected='true'] {
+  border-color: var(--border);
+  background: var(--bg);
+  color: var(--text);
+  margin-bottom: -1px;
+}
+.backup .dialog-body {
+  display: grid;
+  gap: 10px;
+  max-height: min(60vh, 520px);
+  overflow: auto;
+}
+.backup .notice {
+  margin: 0;
+}
+.backup p {
+  margin: 0;
+}
+.muted {
+  color: var(--text-dim);
+}
+.choices {
+  display: grid;
+  gap: 4px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+.choices legend {
+  margin-bottom: 4px;
+  font-weight: 600;
+}
+.choices label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.choices label .muted {
+  margin-left: auto;
+  text-align: right;
+}
+.file-choice,
+.confirm {
+  display: grid;
+  gap: 4px;
+}
+.confirm .input {
+  height: 26px;
+  padding: 0 8px;
+  border: 1px solid var(--border-strong);
+  border-radius: 5px;
+  background: var(--bg-input);
+  font-family: var(--mono);
+}
+.replaces ul {
+  margin: 4px 0 0;
+  padding-left: 18px;
+}
+.progress {
+  display: grid;
+  gap: 4px;
+  color: var(--text-dim);
+}
+.progress progress {
+  width: 100%;
+  accent-color: var(--accent);
 }

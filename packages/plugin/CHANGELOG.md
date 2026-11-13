@@ -1,5 +1,13 @@
 # @otwdesign/plugin-db
 
+## 1.3.2
+
+### Patch Changes
+
+- 9196267: Tagged `otw-cms-plugin` on npm, so a site's Plugins › Add Plugin (OTW CMS 1.5 and later) lists it.
+- @otwdesign/db-core@1.3.2
+  - @otwdesign/db-ui@1.3.2
+
 ## 1.3.1
 
 ### Patch Changes

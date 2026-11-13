@@ -1,6 +1,6 @@
 {
   "name": "@otwdesign/db-ui",
-  "version": "1.3.1",
+  "version": "1.3.2",
   "description": "OTW DB's browser app, prebuilt: the files db-core serves, as one module.",
   "license": "Apache-2.0",
   "author": "OTW SRL",

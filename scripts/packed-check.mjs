@@ -7,8 +7,8 @@
 //   3. an OTW CMS site made by create-otw-cms from npm, with the Database plugin;
 //   4. the same site installed with pnpm, querying PostgreSQL through the plugin;
 //   5. a Next.js app set up by `otw-db-next init`, built as Vercel builds it (only the files
-//      Next's tracing finds), run away from its node_modules, signed in to and queried; with
-//      npm, then with pnpm.
+//      Next's tracing finds), run away from its node_modules, signed in to and queried, on
+//      PostgreSQL and on a SQLite file; with npm, then with pnpm.
 //
 // It catches what the workspace hides, where every package's devDependencies are installed: a
 // file, a type or a dependency the published packages forgot.
@@ -28,6 +28,7 @@ import {
 import { createServer } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
+import { DatabaseSync } from 'node:sqlite'
 import { pathToFileURL } from 'node:url'
 import { setTimeout as sleep } from 'node:timers/promises'
 import { chromium } from '@playwright/test'
@@ -418,9 +419,14 @@ if (rows[0]?.[0] !== 'from the packed packages') throw new Error('The pg driver 
     )
     const deployed = join(work, `next-${manager}-deployed`)
     renameSync(join(app, '.next/standalone'), deployed)
+    const file = join(work, `next-${manager}.db`)
+    const items = new DatabaseSync(file)
+    items.exec(`CREATE TABLE file_items (name TEXT); INSERT INTO file_items VALUES ('from a file')`)
+    items.close()
     const port = await freePort()
     serve('node', ['server.js'], deployed, {
       ...connection,
+      DB_ADMIN_FILE_URL: `sqlite:${file}`,
       DB_ADMIN_PASSWORD: password,
       PORT: String(port),
       HOSTNAME: '127.0.0.1',
@@ -447,6 +453,19 @@ if (rows[0]?.[0] !== 'from the packed packages') throw new Error('The pg driver 
       'queries PostgreSQL with the drivers that were traced into the build',
       queried.rows?.[0]?.[0] ?? queried.error?.message,
       'from the packed packages',
+    )
+    // SQLite's worker is code the driver carries as text: the build must leave it whole.
+    const fromFile = await (
+      await api(base, '/db/api/query', {
+        method: 'POST',
+        headers: { cookie },
+        body: JSON.stringify({ connection: 'file', sql: 'SELECT name FROM file_items' }),
+      })
+    ).json()
+    expect(
+      'queries a SQLite file from the built app',
+      fromFile.rows?.[0]?.[0] ?? fromFile.error?.message,
+      'from a file',
     )
   }
 

@@ -43,7 +43,7 @@ const escape = (text: string) =>
     .replaceAll('"', '&quot;')
     .replaceAll("'", '&#39;')
 
-function page(status: number, body: string, headers: Record<string, string> = {}): Response {
+function page(status: number, body: string): Response {
   return new Response(
     `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="robots" content="noindex"><title>Sign in · OTW DB</title><style>${STYLE}</style></head><body><main>${body}</main></body></html>`,
     {
@@ -54,7 +54,6 @@ function page(status: number, body: string, headers: Record<string, string> = {}
         'content-security-policy': CSP,
         'x-content-type-options': 'nosniff',
         'referrer-policy': 'same-origin',
-        ...headers,
       },
     },
   )
@@ -71,25 +70,13 @@ export interface SignInState {
   expired?: boolean
   /** The password just tried was wrong. */
   wrong?: boolean
-  /** Too many wrong passwords are waiting for their answer: this one wasn't looked at. */
-  busy?: boolean
 }
 
 /** The page that asks for the password, or says why there is none to ask for. */
-export function signInPage(
-  state: SignInState,
-  status = 200,
-  headers: Record<string, string> = {},
-): Response {
+export function signInPage(state: SignInState, status = 200): Response {
   const action = escape(`${state.basePath}/sign-in`)
   const parts = ['<h1>Sign in to the database</h1>']
-  if (state.busy) {
-    parts.push(
-      '<p class="notice" role="alert">Too many wrong passwords have just been tried here. Wait a moment, then try again.</p>',
-    )
-  } else if (state.wrong) {
-    parts.push('<p class="notice" role="alert">That isn’t the password.</p>')
-  }
+  if (state.wrong) parts.push('<p class="notice" role="alert">That isn’t the password.</p>')
   if (state.password === 'ready') {
     parts.push(
       `<form method="post" action="${action}"><label for="password">Password</label><input id="password" name="password" type="password" autocomplete="current-password" required autofocus><button type="submit">Sign in</button></form>`,
@@ -108,7 +95,7 @@ export function signInPage(
         : `<p class="muted">${state.password === 'ready' ? 'Or sign' : 'Sign'} in to the app as one of the users it lets in here, then open this page again: they need no password.</p>`,
     )
   }
-  return page(status, parts.join(''), headers)
+  return page(status, parts.join(''))
 }
 
 /** The page for someone already in: on to the database, or out again. */

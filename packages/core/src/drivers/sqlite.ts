@@ -68,10 +68,14 @@ const EXPORT_BATCH = 1_000
 
 /**
  * Where `sql`'s first statement ends, and whether anything but space and comments follows it.
- * SQLite prepares the first statement and ignores the rest, so the rest is refused here instead.
- * Self-contained: it's also copied into the worker.
+ * SQLite prepares the first statement and ignores the rest, so the rest is refused instead.
+ *
+ * The worker's own, and so written as its text. Taken from a function here with `toString()`,
+ * it was whatever the app's build had made of that function: Next.js left it without its name,
+ * and no SQLite file could be opened from a built app.
  */
-function hasMoreStatements(sql: string): boolean {
+const HAS_MORE_STATEMENTS = String.raw`
+function hasMoreStatements(sql) {
   let i = 0
   const n = sql.length
   let first = true
@@ -83,7 +87,7 @@ function hasMoreStatements(sql: string): boolean {
     } else if (c === '/' && sql[i + 1] === '*') {
       const end = sql.indexOf('*/', i + 2)
       i = end === -1 ? n : end + 2
-    } else if (c === "'" || c === '"' || c === '`' || c === '[') {
+    } else if (c === "'" || c === '"' || c === '\x60' || c === '[') {
       const close = c === '[' ? ']' : c
       let j = i + 1
       while (j < n) {
@@ -96,7 +100,7 @@ function hasMoreStatements(sql: string): boolean {
     } else if (c === ';') {
       first = false
       i++
-    } else if (/\s/.test(c!)) {
+    } else if (/\s/.test(c)) {
       i++
     } else {
       if (!first) return true
@@ -105,6 +109,7 @@ function hasMoreStatements(sql: string): boolean {
   }
   return false
 }
+`
 
 /**
  * PRAGMAs that set something for the whole process, not for the connection they're run on: with
@@ -198,7 +203,7 @@ export function processWidePragma(sql: string): string | null {
 const WORKER_BODY = `
 const { DatabaseSync, constants } = require('node:sqlite')
 const PROCESS_WIDE = ${JSON.stringify(PROCESS_WIDE)}
-${hasMoreStatements.toString()}
+${HAS_MORE_STATEMENTS}
 let reader, writer
 const cursors = new Map()
 let nextCursor = 1

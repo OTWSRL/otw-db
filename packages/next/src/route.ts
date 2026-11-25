@@ -73,13 +73,12 @@ const postgres: PostgresOptions = {
 }
 
 /**
- * How long a wrong password waits for its answer, and how many may be waiting. They're answered
- * one after another, not all at once: a guesser gets two tries a second from a server, however
- * many connections it opens. Past the few that wait, a sign-in is turned away unread, the right
- * password too: answered by whether it was right, it would be a guess with no wait at all.
+ * How long a wrong password waits for its answer. Each waits by itself, and nothing is counted:
+ * a count of those waiting is one that anyone can fill, and while it was full the owner's right
+ * password was turned away with the rest. So a guesser gets as many tries as it opens
+ * connections, and what stands against it is the password's length.
  */
 const WRONG_PASSWORD_MS = 500
-const WRONG_PASSWORDS_WAITING = 8
 /** How long a sign-in's form has to arrive, and how much of one is read. */
 const FORM_MS = 2_000
 const FORM_BYTES = 4_096
@@ -141,10 +140,6 @@ export function createDbRoute(options: DbRouteOptions = {}): DbRoute {
       authorize: appAuthorize ?? authorize,
     }))
 
-  /** The sign-ins being looked at or waiting for their answer, and the wait of the last wrong one. */
-  let waiting = 0
-  let lastRefusal: Promise<void> = Promise.resolve()
-
   async function signIn(request: Request): Promise<Response> {
     const set = password()
     const state = {
@@ -159,33 +154,19 @@ export function createDbRoute(options: DbRouteOptions = {}): DbRoute {
       return signInPage({ ...state, ...(expired ? { expired } : {}) })
     }
     if (!sameOrigin(request)) return new Response('Sign in from this site.', { status: 403 })
-    // Counted at the door, before the form is read: every one of a crowd arrives before the
-    // first of them has been found wrong.
-    if (waiting >= WRONG_PASSWORDS_WAITING) {
-      return signInPage({ ...state, busy: true }, 429, { 'retry-after': '5' })
+    const given = await passwordOf(request)
+    // No password came (a form that never arrived, or had none): nothing was guessed, so
+    // nothing waits.
+    if (given === null) return signInPage(state, 400)
+    if (!usable(set) || !samePassword(given, set)) {
+      await new Promise((resolve) => setTimeout(resolve, WRONG_PASSWORD_MS))
+      console.warn(`otw-db: a sign-in at ${basePath} was refused`)
+      return signInPage({ ...state, wrong: usable(set) }, 401)
     }
-    waiting += 1
-    try {
-      const given = await passwordOf(request)
-      // No password came (a form that never arrived, or had none): nothing was guessed, so
-      // nothing waits, and its place is free again.
-      if (given === null) return signInPage(state, 400)
-      if (!usable(set) || !samePassword(given, set)) {
-        const turn = lastRefusal.then(
-          () => new Promise<void>((resolve) => setTimeout(resolve, WRONG_PASSWORD_MS)),
-        )
-        lastRefusal = turn
-        await turn
-        console.warn(`otw-db: a sign-in at ${basePath} was refused`)
-        return signInPage({ ...state, wrong: usable(set) }, 401)
-      }
-      return redirect(
-        basePath || '/',
-        sessionCookie(await signSession(set, basePath), { basePath, secure: secure(request) }),
-      )
-    } finally {
-      waiting -= 1
-    }
+    return redirect(
+      basePath || '/',
+      sessionCookie(await signSession(set, basePath), { basePath, secure: secure(request) }),
+    )
   }
 
   async function handle(request: Request): Promise<Response> {
@@ -217,9 +198,9 @@ export function createDbRoute(options: DbRouteOptions = {}): DbRoute {
 
 /** The password a sign-in form posted, or null where there is none to read. */
 async function passwordOf(request: Request): Promise<string | null> {
-  // A form that never finishes arriving would keep its place among the sign-ins being looked
-  // at for as long as it liked; one of megabytes would be read whole and hashed. Two seconds,
-  // and a few kilobytes: a password and nothing else.
+  // A form that never finishes arriving would be waited on for as long as it liked; one of
+  // megabytes would be read whole and hashed. Two seconds, and a few kilobytes: a password and
+  // nothing else.
   if (Number(request.headers.get('content-length') ?? 0) > FORM_BYTES) return null
   const reader = request.body?.getReader()
   if (!reader) return null

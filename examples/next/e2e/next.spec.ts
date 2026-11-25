@@ -49,3 +49,19 @@ test('serves the whole tool from one route file: page, files and API, then signs
   await page.goto('/db')
   await expect(page.getByRole('heading', { name: 'Sign in to continue' })).toBeVisible()
 })
+
+test('reads a SQLite file from the built app: its tables, and a statement of one’s own', async ({
+  page,
+}) => {
+  await signIn(page)
+  await page.getByRole('button', { name: 'Notes file', exact: true }).click()
+  await expect(page.getByLabel('Connection', { exact: true })).toContainText('SQLite')
+  await page.getByRole('button', { name: /^notes/ }).click()
+  const grid = page.getByRole('grid', { name: 'notes' })
+  await expect(grid.getByRole('gridcell', { name: 'Call Ada' })).toBeVisible()
+  await page.keyboard.press(`${MOD}+e`)
+  await page.locator('.tab-body:not([hidden]) .cm-content').click()
+  await page.keyboard.insertText('SELECT count(*) AS notes FROM notes')
+  await page.keyboard.press(`${MOD}+Enter`)
+  await expect(page.getByRole('grid', { name: 'Result' }).getByRole('gridcell')).toHaveText(['2'])
+})

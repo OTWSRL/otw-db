@@ -135,82 +135,55 @@ describe('createDbRoute, with a password', () => {
     warned.mockRestore()
   })
 
-  it('lets wrong passwords through one at a time, and turns away a crowd of them', async () => {
-    // Each wrong one waited half a second by itself: forty at once took half a second in all,
-    // and a guesser could make as many tries a second as it could open connections.
+  it('keeps nobody out, however many wrong passwords are waiting for their answer', async () => {
+    // A limit on how many may wait turned every sign-in away while it was full, the right
+    // password too: eight wrong ones at a time, sent without pause, kept the owner out.
+    const warned = vi.spyOn(console, 'warn').mockImplementation(() => {})
     const { POST } = route({ DB_ADMIN_PASSWORD: PASSWORD })
-    const guess = (n: number) =>
-      POST(
-        new Request('http://localhost/db/sign-in', {
-          method: 'POST',
-          headers: { 'content-type': 'application/x-www-form-urlencoded' },
-          body: new URLSearchParams({ password: `a wrong guess, number ${n}` }),
-        }),
-      )
     const started = performance.now()
     const answers: { status: number; at: number }[] = []
-    const all = Promise.all(
+    const crowd = Promise.all(
       Array.from({ length: 40 }, (_, n) =>
-        guess(n).then((r) => answers.push({ status: r.status, at: performance.now() - started })),
+        POST(post('/db/sign-in', `a wrong guess, number ${n}`)).then((r) =>
+          answers.push({ status: r.status, at: performance.now() - started }),
+        ),
       ),
     )
-    await new Promise((resolve) => setTimeout(resolve, 1_200))
-    // Past the few that wait their turn, the rest are told at once to come back later.
-    const turnedAway = answers.filter((a) => a.status === 429)
-    expect(turnedAway.length).toBeGreaterThanOrEqual(30)
-    expect(Math.max(...turnedAway.map((a) => a.at))).toBeLessThan(300)
-    // And of those that wait, about two a second get their answer.
-    expect(answers.filter((a) => a.status === 401).length).toBeLessThanOrEqual(3)
-    // The right password isn't kept waiting behind them.
-    const right = await POST(
-      new Request('http://localhost/db/sign-in', {
-        method: 'POST',
-        headers: { 'content-type': 'application/x-www-form-urlencoded' },
-        body: new URLSearchParams({ password: PASSWORD }),
-      }),
-    )
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    const asked = performance.now()
+    const right = await POST(post('/db/sign-in', PASSWORD))
     expect(right.status).toBe(303)
-    expect(performance.now() - started).toBeLessThan(1_500)
-    await all
-    expect(answers.filter((a) => a.status === 401)).toHaveLength(40 - turnedAway.length)
+    expect(right.headers.get('set-cookie')).toContain('otw_db_session=')
+    expect(performance.now() - asked).toBeLessThan(350)
+    await crowd
+    // Every wrong one was looked at, and had its wait.
+    expect(answers.map((a) => a.status)).toEqual(Array(40).fill(401))
+    expect(Math.min(...answers.map((a) => a.at))).toBeGreaterThanOrEqual(480)
+    warned.mockRestore()
   }, 20_000)
 
-  it('gives a sign-in’s form two seconds to arrive, so slow ones can’t hold every place', async () => {
+  it('gives a sign-in’s form two seconds to arrive, and keeps nobody out meanwhile', async () => {
     const { POST } = route({ DB_ADMIN_PASSWORD: PASSWORD })
     const never = () =>
       POST(
-        new Request('http://localhost/db/sign-in', {
+        new Request(`${SITE}/db/sign-in`, {
           method: 'POST',
-          headers: { 'content-type': 'application/x-www-form-urlencoded' },
+          headers: { 'content-type': 'application/x-www-form-urlencoded', origin: SITE },
           body: new ReadableStream({ start() {} }),
           // @ts-expect-error Node's fetch wants this for a body that streams.
           duplex: 'half',
         }),
       )
     const started = performance.now()
-    const slow = Array.from({ length: 8 }, never)
-    // While they hold every place, a sign-in is turned away; once they've run out of time, not.
+    const slow = Array.from({ length: 40 }, never)
     await new Promise((resolve) => setTimeout(resolve, 100))
-    const turnedAway = await POST(
-      new Request('http://localhost/db/sign-in', {
-        method: 'POST',
-        headers: { 'content-type': 'application/x-www-form-urlencoded' },
-        body: new URLSearchParams({ password: PASSWORD }),
-      }),
-    )
-    expect(turnedAway.status).toBe(429)
-    await new Promise((resolve) => setTimeout(resolve, 2_300))
-    const right = await POST(
-      new Request('http://localhost/db/sign-in', {
-        method: 'POST',
-        headers: { 'content-type': 'application/x-www-form-urlencoded' },
-        body: new URLSearchParams({ password: PASSWORD }),
-      }),
-    )
-    expect(right.status).toBe(303)
-    // Nothing was guessed by a form that never came: answered at once, with no wait to serve.
-    expect((await Promise.all(slow)).map((r) => r.status)).toEqual(Array(8).fill(400))
-    expect(performance.now() - started).toBeLessThan(3_000)
+    expect((await POST(post('/db/sign-in', PASSWORD))).status).toBe(303)
+    // Nothing was guessed by a form that never came: answered when its time is up, with no
+    // wait after it.
+    expect((await Promise.all(slow)).map((r) => r.status)).toEqual(Array(40).fill(400))
+    const took = performance.now() - started
+    expect(took).toBeGreaterThanOrEqual(1_900)
+    expect(took).toBeLessThan(3_000)
   }, 20_000)
 
   it('reads a few kilobytes of a sign-in’s form and no more', async () => {

@@ -40,11 +40,12 @@ Set the same variables on your host (`vercel env add DB_ADMIN_PASSWORD`), and op
 
 - **The password:** `/db/sign-in` asks for it and sets a session for 12 hours. Changing the
   password ends every session; signing out forgets it in that browser. One under 16 characters
-  is refused. Wrong passwords are answered one at a time, half a second apart, and past a few
-  waiting, sign-ins are turned away for a moment: a guesser gets two tries a second, however many
-  connections it opens (and someone sending wrong passwords without pause can keep the form
-  busy; the app's own users, below, get in regardless). The session's key is made from the
-  password the slow way, so a cookie forged from a guess costs its maker as much as a sign-in.
+  is refused. A wrong password waits half a second for its answer, and nothing is counted: nobody
+  can keep you out by sending wrong ones, and a guesser gets as many tries as it opens
+  connections. What stands against it is the password, so make it long and random, and put a
+  rate limit in front of `/db/sign-in` where your host has one. The session's key is made from
+  the password the slow way, so a cookie forged from a guess costs its maker more than a
+  sign-in does.
 - **The app's own users:** those listed in `DB_ADMIN_USERS`, by email (or id), get in without the
   password once they're signed in to the app. The audit log has who it was. With the list set and
   no password, nobody else gets in.

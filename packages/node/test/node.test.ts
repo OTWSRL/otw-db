@@ -82,9 +82,13 @@ describe('toNodeHandler', () => {
     const base = await serve(createServer(toNodeHandler(admin())))
     const refused = await fetch(`${base}/db/api/connections`, { headers: { 'x-db-admin': '1' } })
     expect(refused.status).toBe(401)
-    const failed = await fetch(`${base}/db/api/query`, query('SELEC 1'))
+    const failed = await fetch(`${base}/db/api/query`, query('SELECT 1 FRO t'))
     expect(failed.status).toBe(400)
-    expect((await failed.json()).error).toMatchObject({ sqlState: '42601', position: 1 })
+    expect((await failed.json()).error).toMatchObject({ sqlState: '42601', position: 14 })
+    // A read connection's first word is read here, before the database sees the statement.
+    const mistyped = await fetch(`${base}/db/api/query`, query('SELEC 1'))
+    expect(mistyped.status).toBe(403)
+    expect((await mistyped.json()).error.message).toContain('not SELEC')
   })
 
   it('cancels the query when the browser goes away', async () => {

@@ -16,6 +16,7 @@
 //   node scripts/packed-check.mjs [--keep]
 import { execFileSync, spawn } from 'node:child_process'
 import {
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -399,12 +400,11 @@ if (rows[0]?.[0] !== 'from the packed packages') throw new Error('The pg driver 
     if (manager === 'pnpm') {
       run('pnpm', ['install', '--no-frozen-lockfile', '--config.confirmModulesPurge=false'], app)
     } else run('npm', ['install', '--no-audit', '--no-fund'], app)
-    // The package is there from the tarball; init writes the route and the password.
+    // The package is there from the tarball; init writes the route, and no password: that is
+    // the person's to choose and to set, as the environment below does.
     run(join(app, 'node_modules/.bin/otw-db-next'), ['init', '--no-install'], app)
-    const password = /^DB_ADMIN_PASSWORD=(.+)$/m.exec(
-      readFileSync(join(app, '.env.local'), 'utf8'),
-    )?.[1]
-    expect('init wrote a password of its own', password?.length, 32)
+    const password = 'a-password-of-the-packed-check'
+    expect('init wrote no .env.local', existsSync(join(app, '.env.local')), false)
     expect(
       'and one route file',
       readFileSync(join(app, 'app/db/[[...path]]/route.ts'), 'utf8').includes('createDbRoute()'),
@@ -434,7 +434,7 @@ if (rows[0]?.[0] !== 'from the packed packages') throw new Error('The pg driver 
       headers: { 'content-type': 'application/x-www-form-urlencoded', origin: base },
       body: new URLSearchParams({ password }).toString(),
     })
-    expect('signs in with the password init made', signedIn.status, 303)
+    expect('signs in with the password set in its environment', signedIn.status, 303)
     const cookie = signedIn.headers.get('set-cookie')?.split(';')[0]
     const queried = await (
       await api(base, '/db/api/query', {

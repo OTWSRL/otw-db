@@ -465,37 +465,76 @@ class PostgresDriver implements Driver {
   ): Promise<QueryResult> {
     const { client, modules } = await this.#connect()
     const started = performance.now()
-    const cancel = () => sendCancel(client)
-    options.signal?.addEventListener('abort', cancel, { once: true })
     const read = options.access === 'read'
     // A write may leave anything on its connection (SET, SET ROLE, temporary tables, session
     // locks), so the connection is closed after it rather than handed to the next query.
     let discard = !read
+    // Whether the connection is known to be outside a transaction: only then does it go back
+    // to the pool. An error in the driver's own BEGIN, COMMIT or cleanup leaves that unknown.
+    let outside = true
+    // A cancel names a connection, not a statement: one still on its way when the statement
+    // ends would stop whatever runs there next, the driver's own cleanup or someone else's
+    // query. So the request is waited for before the connection is used again: once the server
+    // has it, it stops the statement or, the statement over, is dropped. One that can't be
+    // waited for (a second at most) costs the connection instead.
+    let canceling: Promise<void> | undefined
+    const cancel = () => {
+      canceling = sendCancel(client)
+    }
+    const canceled = async () => {
+      if (!canceling) return
+      let timer: ReturnType<typeof setTimeout> | undefined
+      const late = new Promise<void>((resolve) => {
+        timer = setTimeout(() => {
+          discard = true
+          resolve()
+        }, 1_000)
+      })
+      await Promise.race([canceling, late])
+      clearTimeout(timer)
+    }
+    options.signal?.addEventListener('abort', cancel, { once: true })
     let result: CursorResult
     let durationMs: number
     try {
       if (options.signal?.aborted)
         throw new DbAdminError('The query was canceled.', 409, 'canceled')
+      outside = false
       await client.query(
         `BEGIN${read ? ' READ ONLY' : ''}; SET LOCAL statement_timeout = ${whole(options.timeoutMs)}`,
       )
       let alone = false
+      // Once the statement is over there is nothing left to cancel: a cancel sent from here on
+      // would only find the driver's cleanup, or whoever has the connection next.
+      const over = () => options.signal?.removeEventListener('abort', cancel)
       try {
         result = await readCursor(modules, client, sql, values, options.maxRows)
+        over()
       } catch (error) {
+        over()
         let rolledBack = true
+        await canceled()
         // The statement's own error is the one to report, whatever the cleanup does.
         await client.query(read ? READ_CLEANUP : 'ROLLBACK').catch(() => {
           rolledBack = false
           discard = true
         })
+        outside = rolledBack
         if (read || !rolledBack || sqlState(error) !== NOT_IN_TRANSACTION) throw error
-        // VACUUM and the like: alone, on a connection closed afterwards like every write's.
+        // VACUUM and the like: alone, on a connection closed afterwards like every write's, so
+        // a cancel may be sent again, and find nobody after it.
         await client.query(`SET statement_timeout = ${whole(options.timeoutMs)}`)
+        // Canceled meanwhile: a listener put back on a signal that has fired never hears it.
+        if (options.signal?.aborted)
+          throw new DbAdminError('The query was canceled.', 409, 'canceled')
+        options.signal?.addEventListener('abort', cancel, { once: true })
         result = await readCursor(modules, client, sql, values, options.maxRows)
+        over()
         alone = true
       }
+      await canceled()
       if (!alone) await client.query(read ? READ_CLEANUP : 'COMMIT')
+      outside = true
       durationMs = Math.round(performance.now() - started)
     } catch (error) {
       if (!(error instanceof DbAdminError) && !(error as { severity?: string }).severity) {
@@ -504,7 +543,7 @@ class PostgresDriver implements Driver {
       throw toError(error, options.signal)
     } finally {
       options.signal?.removeEventListener('abort', cancel)
-      client.release(discard)
+      client.release(discard || !outside)
     }
     // After the release: naming types may take a connection of its own.
     return {
@@ -650,20 +689,28 @@ interface Backend {
  * PgBouncer passes it on to the right server. Best effort: the statement timeout stops the query
  * when it can't get through (a proxy that takes TLS connections only, such as Neon's).
  */
-function sendCancel(client: PoolClient): void {
+/** Sends the cancel request. Done once the server has taken it and closed, or it couldn't be sent. */
+function sendCancel(client: PoolClient): Promise<void> {
   const { host, port, processID, secretKey } = client as PoolClient & Backend
-  if (processID === null || secretKey === null) return
+  if (processID === null || secretKey === null) return Promise.resolve()
   const message = Buffer.alloc(16)
   message.writeInt32BE(16, 0)
   message.writeInt32BE(80877102, 4)
   message.writeInt32BE(processID, 8)
   message.writeInt32BE(secretKey, 12)
-  const socket = host.startsWith('/')
-    ? connect(`${host}/.s.PGSQL.${port}`)
-    : connect({ host, port })
-  socket.setTimeout(5_000, () => socket.destroy())
-  socket.once('connect', () => socket.end(message))
-  socket.once('error', (error) => console.error('otw-db: could not send the cancel request', error))
+  return new Promise<void>((resolve) => {
+    const socket = host.startsWith('/')
+      ? connect(`${host}/.s.PGSQL.${port}`)
+      : connect({ host, port })
+    socket.setTimeout(5_000, () => socket.destroy())
+    socket.once('connect', () => socket.end(message))
+    socket.once('error', (error) =>
+      console.error('otw-db: could not send the cancel request', error),
+    )
+    // The server closes its end once the request is in the statement's hands.
+    socket.once('close', () => resolve())
+    socket.resume()
+  })
 }
 
 const EXPORT_BATCH = 1_000

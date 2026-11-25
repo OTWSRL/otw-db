@@ -7,8 +7,17 @@ own. In the app's directory:
 npx @otwdesign/db-next init
 ```
 
-It writes one route file, adds a password to `.env.local`, and installs this package. It never
-writes over a file; `--dry-run` says what it would do, `--path /admin/db` puts it elsewhere.
+It writes one route file and installs this package. It never writes over a file; `--dry-run`
+says what it would do, `--path /admin/db` puts it elsewhere.
+
+It makes no password and writes none: it lists the variables to set, and the password is yours to
+choose. Use one of 16 characters or more, from your password manager or `openssl rand -base64 32`,
+and set it as `DB_ADMIN_PASSWORD`: in `.env.local` on your machine (a file git must not have), and
+in your host's settings where the app runs. Until it's set, nobody signs in with a password.
+
+next.config's `basePath` is taken when it's written once, as a plain quoted path
+(`basePath: '/docs'`). Written any other way (from a variable, built from parts), `init` says so
+and leaves it to you: `createDbRoute({ basePath: '/docs/db' })`.
 
 ```ts
 // app/db/[[...path]]/route.ts
@@ -30,7 +39,12 @@ Set the same variables on your host (`vercel env add DB_ADMIN_PASSWORD`), and op
 ## Who gets in
 
 - **The password:** `/db/sign-in` asks for it and sets a session for 12 hours. Changing the
-  password ends every session. One under 16 characters is refused.
+  password ends every session; signing out forgets it in that browser. One under 16 characters
+  is refused. Wrong passwords are answered one at a time, half a second apart, and past a few
+  waiting, sign-ins are turned away for a moment: a guesser gets two tries a second, however many
+  connections it opens (and someone sending wrong passwords without pause can keep the form
+  busy; the app's own users, below, get in regardless). The session's key is made from the
+  password the slow way, so a cookie forged from a guess costs its maker as much as a sign-in.
 - **The app's own users:** those listed in `DB_ADMIN_USERS`, by email (or id), get in without the
   password once they're signed in to the app. The audit log has who it was. With the list set and
   no password, nobody else gets in.

@@ -1,4 +1,4 @@
-import { createHash, createHmac, timingSafeEqual } from 'node:crypto'
+import { createHash, createHmac, scrypt, timingSafeEqual } from 'node:crypto'
 
 /*
  * The password sign-in's session: a cookie the server can check with nothing kept on its side,
@@ -35,28 +35,63 @@ export function samePassword(given: string, password: string): boolean {
   return timingSafeEqual(digest(given), digest(password))
 }
 
-function signature(expires: number, password: string, basePath: string): string {
-  const key = createHmac('sha256', password).update(`otw-db-session:${basePath}`).digest()
-  return createHmac('sha256', key).update(String(expires)).digest('base64url')
+/**
+ * The key sessions are signed with, made from the password the slow way (scrypt: 65 ms and 32 MB
+ * a time). A cookie is checked with nothing but that key, so a cookie made from a guess at the
+ * password and sent with any request says whether the guess was right, with none of the sign-in
+ * page's waiting. Made slowly, each guess costs whoever makes it what a sign-in costs here; the
+ * server makes its own once and keeps it.
+ */
+const keys = new Map<string, Promise<Buffer>>()
+
+function keyOf(password: string, basePath: string): Promise<Buffer> {
+  const id = `${basePath}\n${password}`
+  let key = keys.get(id)
+  if (!key) {
+    key = new Promise<Buffer>((resolve, reject) =>
+      scrypt(
+        password,
+        `otw-db-session:${basePath}`,
+        32,
+        { N: 32_768, r: 8, p: 1, maxmem: 64 * 1024 * 1024 },
+        (error, derived) => (error ? reject(error) : resolve(derived)),
+      ),
+    )
+    // The password in use, and the one before it while a deploy rolls out: no more are kept.
+    if (keys.size >= 4) keys.delete(keys.keys().next().value!)
+    keys.set(id, key)
+    key.catch(() => keys.delete(id))
+  }
+  return key
+}
+
+async function signature(expires: number, password: string, basePath: string): Promise<string> {
+  return createHmac('sha256', await keyOf(password, basePath))
+    .update(String(expires))
+    .digest('base64url')
 }
 
 /** A session's cookie value: when it ends, and the signature that says this server set it. */
-export function signSession(password: string, basePath: string, now = Date.now()): string {
+export async function signSession(
+  password: string,
+  basePath: string,
+  now = Date.now(),
+): Promise<string> {
   const expires = now + SESSION_MS
-  return `${expires}.${signature(expires, password, basePath)}`
+  return `${expires}.${await signature(expires, password, basePath)}`
 }
 
 /** Whether `value` is a session this password signed for this base path, not yet over. */
-export function verifySession(
+export async function verifySession(
   value: string | undefined,
   password: string,
   basePath: string,
   now = Date.now(),
-): boolean {
+): Promise<boolean> {
   const [expires, signed, ...rest] = (value ?? '').split('.')
   if (!expires || !signed || rest.length || !/^\d{1,16}$/.test(expires)) return false
   if (Number(expires) <= now) return false
-  const expected = Buffer.from(signature(Number(expires), password, basePath))
+  const expected = Buffer.from(await signature(Number(expires), password, basePath))
   const given = Buffer.from(signed)
   return given.length === expected.length && timingSafeEqual(given, expected)
 }

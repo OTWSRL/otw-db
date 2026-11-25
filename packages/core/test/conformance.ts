@@ -182,16 +182,21 @@ export function conformance(name: string, open: () => Promise<Fixture>) {
 
     it('refuses writes with read access, schema changes too', async () => {
       await expect(f.driver.query("UPDATE conf_items SET name = 'x'", read)).rejects.toBeInstanceOf(
-        QueryError,
+        DbAdminError,
       )
       expect((await all())[0]![1]).toBe('pen')
       // MySQL commits before DDL, ending any transaction: only a read-only session stops this.
       await expect(
         f.driver.query('CREATE TABLE conf_sneaky (x INTEGER)', read),
-      ).rejects.toBeInstanceOf(QueryError)
+      ).rejects.toBeInstanceOf(DbAdminError)
       await expect(f.driver.query('DROP TABLE conf_digits', read)).rejects.toBeInstanceOf(
-        QueryError,
+        DbAdminError,
       )
+      // And a write inside a statement that reads is the database's to refuse.
+      await expect(
+        f.driver.query("WITH gone AS (SELECT 1) UPDATE conf_items SET name = 'x'", read),
+      ).rejects.toBeInstanceOf(DbAdminError)
+      expect((await all())[0]![1]).toBe('pen')
       expect(await f.driver.table(f.schema, 'conf_sneaky')).toBeNull()
       expect(await f.driver.table(f.schema, 'conf_digits')).not.toBeNull()
     })
@@ -212,6 +217,29 @@ export function conformance(name: string, open: () => Promise<Fixture>) {
           `SELECT * FROM pg_ls_dir('/etc')`,
           `SELECT pg_terminate_backend(pid) FROM pg_stat_activity`,
           `SELECT * FROM dblink('dbname=postgres', 'DROP TABLE conf_items') AS t(a int)`,
+          // An empty statement first, a bracket, a form feed: the server skips them all.
+          `;COPY (SELECT 1) TO PROGRAM 'cat > /tmp/otw_db_conformance'`,
+          ` ; ;\f/* x */;DO $$ BEGIN NULL; END $$`,
+          `LOAD 'plpgsql'`,
+          `NOTIFY conf_channel, 'from a reader'`,
+          `SET search_path = nowhere`,
+          `DEALLOCATE ALL`,
+          `CALL conf_none()`,
+          // A function that runs the SQL it's given, given the name in pieces.
+          `SELECT query_to_xml('select pg_read_' || 'file(''/etc/hostname'')', true, true, '')`,
+          `SELECT * FROM ts_stat('select pg_ter' || 'minate_backend(1)')`,
+          `SELECT pg_reload_conf()`,
+          `SELECT pg_switch_wal()`,
+          `SELECT pg_create_physical_replication_slot('conf_slot')`,
+          `SELECT pg_advisory_unlock_all()`,
+          `SELECT set_config('search_path', 'nowhere', false)`,
+          `SELECT U&'\\0041'`,
+          `SELECT setseed(0.42)`,
+          `SELECT pg_log_backend_memory_contexts(1)`,
+          `SELECT * FROM pg_hba_file_rules`,
+          `SELECT pg_read_file_old('/etc/hostname', 0, 10)`,
+          `SELECT pg_stat_statements_reset()`,
+          `SELECT * FROM crosstab('select 1, 1, pg_read_' || 'file(''/etc/hostname'')') AS t(a int, b text)`,
           'SELECT U&"lo\\005Fexport"(1, \'/tmp/otw_db_conformance\')',
         ],
         mysql: [
@@ -223,6 +251,23 @@ export function conformance(name: string, open: () => Promise<Fixture>) {
           `/*!50000 SET PERSIST max_connections = 151 */`,
           `KILL 999999`,
           `# a note\nFLUSH PRIVILEGES`,
+          // A comment before the word, of every kind the server takes.
+          `/* x */ KILL 999999`,
+          `/**/SET GLOBAL max_connections = 151`,
+          `/**/ /* y */ FLUSH STATUS`,
+          `--\u0001 x\nKILL 999999`,
+          `(/* x */ KILL 999999)`,
+          `SELECT 'x' INTO/**/OUTFILE '/var/lib/mysql-files/otw_db_conformance'`,
+          `SELECT 'x' INTO -- x\nDUMPFILE '/var/lib/mysql-files/otw_db_conformance'`,
+          `SELECT LOAD_FILE/**/('/etc/hostname')`,
+          "SELECT `LOAD_FILE`('/etc/hostname')",
+          `EXECUTE IMMEDIATE CONCAT('SET GLO', 'BAL max_connections = 151')`,
+          `BEGIN NOT ATOMIC SET GLOBAL max_connections = 151; END`,
+          `PREPARE s FROM 'KILL 999999'`,
+          `DO SLEEP(0)`,
+          `HANDLER conf_items OPEN`,
+          `SELECT innodb_set_open_files_limit(4001)`,
+          `SELECT asynchronous_connection_failover_add_source('c', '127.0.0.1', 3306, '', 50)`,
         ],
       }
       const kind = name === 'PGlite' ? 'postgres' : name === 'MariaDB' ? 'mysql' : f.driver.kind
@@ -237,6 +282,26 @@ export function conformance(name: string, open: () => Promise<Fixture>) {
         `SELECT name FROM conf_items WHERE name = 'copy to do kill set global'`,
         `SELECT 'copy' AS a, 'kill' AS b FROM conf_items LIMIT 1`,
         `-- copy\nSELECT name FROM conf_items WHERE name <> 'do'`,
+        `WITH n AS (SELECT name FROM conf_items) SELECT count(*) FROM n`,
+        `EXPLAIN SELECT name FROM conf_items`,
+        // Names that only begin like one refused, and an apostrophe after "you &".
+        ...(kind === 'postgres'
+          ? [
+              `SELECT count(*) FROM pg_replication_slots`,
+              `SELECT count(*) FROM pg_stat_replication_slots`,
+              `SELECT count(*) FROM pg_replication_origin_status`,
+              `SELECT count(*) FROM pg_stat_activity`,
+              `SELECT 'you&''me'`,
+            ]
+          : []),
+        ...(kind === 'postgres'
+          ? [
+              `/* a note */ (SELECT name FROM conf_items) ORDER BY 1`,
+              `VALUES (1), (2)`,
+              `TABLE conf_items`,
+            ]
+          : []),
+        ...(kind === 'sqlite' ? [] : [`SHOW ${kind === 'mysql' ? 'TABLES' : 'server_version'}`]),
       ]
       for (const sql of fine) await expect(f.driver.query(sql, read), sql).resolves.toBeDefined()
       // And the grid opens a table whatever it's called: its statements are the driver's own.

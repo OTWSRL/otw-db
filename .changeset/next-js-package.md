@@ -5,10 +5,10 @@
 `@otwdesign/db-next`: OTW DB in a Next.js app, on Vercel or anywhere, with one command.
 
 - `npx @otwdesign/db-next init`, in the app's directory, writes one route file
-  (`app/db/[[...path]]/route.ts`), adds a password to `.env.local` and installs the package. It
-  finds `src/app`, a Pages Router app, JavaScript or TypeScript, npm, pnpm, yarn or bun, a
-  monorepo's lockfile and next.config's `basePath`; it never writes over a file, and won't write
-  a password where git would pick it up.
+  (`app/db/[[...path]]/route.ts`) and installs the package. It finds `src/app`, a Pages Router
+  app, JavaScript or TypeScript, npm, pnpm, yarn or bun, a monorepo's lockfile and next.config's
+  `basePath`, and never writes over a file. It makes no password and writes none: it lists the
+  variables to set, and the password is yours to choose and to keep out of git.
 - `createDbRoute()` signs people in itself: anyone with `DB_ADMIN_PASSWORD` (16 characters at
   least), on a page of its own, with a signed session that needs nothing kept on the server.
 - `DB_ADMIN_USERS`, emails separated by commas: the app's own signed-in users who get in with no
@@ -19,3 +19,8 @@
   first.
 - It brings `pg` and `pg-cursor` where Next's file tracing finds them. Mounted by hand as the
   guide showed, a Vercel function had no driver.
+- Wrong passwords are answered one at a time, half a second apart; past a few waiting, sign-ins
+  are turned away for a moment. The session's key is made from the password with scrypt, so a
+  cookie forged from a guess can't be tried faster than a sign-in. `init` takes no `--path` that
+  climbs out of the app, and when the install fails says so and what's left to do, and can be
+  run again.

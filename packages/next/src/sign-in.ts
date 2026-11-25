@@ -71,13 +71,23 @@ export interface SignInState {
   expired?: boolean
   /** The password just tried was wrong. */
   wrong?: boolean
+  /** Too many wrong passwords are waiting for their answer: this one wasn't looked at. */
+  busy?: boolean
 }
 
 /** The page that asks for the password, or says why there is none to ask for. */
-export function signInPage(state: SignInState, status = 200): Response {
+export function signInPage(
+  state: SignInState,
+  status = 200,
+  headers: Record<string, string> = {},
+): Response {
   const action = escape(`${state.basePath}/sign-in`)
   const parts = ['<h1>Sign in to the database</h1>']
-  if (state.wrong) {
+  if (state.busy) {
+    parts.push(
+      '<p class="notice" role="alert">Too many wrong passwords have just been tried here. Wait a moment, then try again.</p>',
+    )
+  } else if (state.wrong) {
     parts.push('<p class="notice" role="alert">That isn’t the password.</p>')
   }
   if (state.password === 'ready') {
@@ -98,7 +108,7 @@ export function signInPage(state: SignInState, status = 200): Response {
         : `<p class="muted">${state.password === 'ready' ? 'Or sign' : 'Sign'} in to the app as one of the users it lets in here, then open this page again: they need no password.</p>`,
     )
   }
-  return page(status, parts.join(''))
+  return page(status, parts.join(''), headers)
 }
 
 /** The page for someone already in: on to the database, or out again. */

@@ -1,3 +1,4 @@
+import { jsonObject } from '../src/format.ts'
 import { describe, expect, it, vi } from 'vitest'
 import {
   exportStream,
@@ -162,5 +163,13 @@ describe('exportStream', () => {
     await reader.read()
     await reader.cancel()
     expect(stopped).toHaveBeenCalled()
+  })
+
+  it('keeps a column named as something every object has, __proto__ among them', () => {
+    const row = jsonObject(['id', '__proto__', 'constructor', 'toString'], ['1', 'a', 'b', null])
+    expect(JSON.parse(JSON.stringify(row))).toEqual(
+      JSON.parse('{"id":"1","__proto__":"a","constructor":"b","toString":null}'),
+    )
+    expect(Object.keys(row)).toEqual(['id', '__proto__', 'constructor', 'toString'])
   })
 })

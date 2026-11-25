@@ -137,9 +137,14 @@ export function TableTab({ schema, table, summary, active }: Props) {
   const shown = [
     ...loaded.map((row, i) => {
       const update = ids[i] && staged.updates[ids[i]!.id]
-      return update ? names.map((c, j) => (c in update.values ? update.values[c]! : row[j]!)) : row
+      // Object.hasOwn: a column may be named as something every object has (constructor).
+      return update
+        ? names.map((c, j) => (Object.hasOwn(update.values, c) ? update.values[c]! : row[j]!))
+        : row
     }),
-    ...staged.inserts.map((insert) => names.map((c) => insert.values[c] ?? null)),
+    ...staged.inserts.map((insert) =>
+      names.map((c) => (Object.hasOwn(insert.values, c) ? (insert.values[c] ?? null) : null)),
+    ),
   ]
   const locked = new Set(
     names.flatMap((c, i) => {
@@ -347,12 +352,12 @@ export function TableTab({ schema, table, summary, active }: Props) {
                 cellState: (row: number, col: number) => {
                   const column = names[col]!
                   if (row >= loaded.length) {
-                    return column in (staged.inserts[row - loaded.length]?.values ?? {})
+                    return Object.hasOwn(staged.inserts[row - loaded.length]?.values ?? {}, column)
                       ? 'changed'
                       : 'default'
                   }
                   const update = ids[row] && staged.updates[ids[row]!.id]
-                  return update && column in update.values ? 'changed' : null
+                  return update && Object.hasOwn(update.values, column) ? 'changed' : null
                 },
               }
             : {})}

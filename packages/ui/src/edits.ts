@@ -53,9 +53,19 @@ export function rowId(
   for (const column of primaryKey) {
     const value = values[columns.indexOf(column)]
     if (value === undefined || value === null) return null
-    key[column] = value
+    cell(key, column, value)
   }
   return { id: JSON.stringify(primaryKey.map((c) => key[c])), key }
+}
+
+/** Sets a cell by its column's name, whatever the name: `row.__proto__ = …` would set no cell. */
+function cell<V extends string | null>(row: Record<string, V>, column: string, value: V): void {
+  Object.defineProperty(row, column, {
+    value,
+    enumerable: true,
+    writable: true,
+    configurable: true,
+  })
 }
 
 export function stagedReducer(state: Staged, action: StagedAction): Staged {
@@ -65,15 +75,19 @@ export function stagedReducer(state: Staged, action: StagedAction): Staged {
       const values: Record<string, string | null> = { ...current?.values }
       const original: Record<string, string | null> = { ...current?.original }
       // What the person saw when they first edited the cell. The page may have been read again
-      // since, under the staged edit, where they can't see what it brought.
-      const first = action.column in original ? original[action.column]! : action.original
+      // since, under the staged edit, where they can't see what it brought. A column may be
+      // named as something every object has (constructor, __proto__): only the cells put here
+      // count, and they're put so that such a name is a cell like any other.
+      const first = Object.hasOwn(original, action.column)
+        ? original[action.column]!
+        : action.original
       // Typed back to what it was: not a change any more.
       if (action.value === first) {
         delete values[action.column]
         delete original[action.column]
       } else {
-        values[action.column] = action.value
-        original[action.column] = first
+        cell(values, action.column, action.value)
+        cell(original, action.column, first)
       }
       const updates = { ...state.updates }
       if (Object.keys(values).length) updates[action.id] = { key: action.key, values, original }

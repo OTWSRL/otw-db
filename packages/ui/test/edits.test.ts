@@ -5,6 +5,7 @@ import {
   stagedCount,
   stagedReducer,
   toChanges,
+  type Staged,
   type StagedAction,
 } from '../src/edits.ts'
 
@@ -82,6 +83,35 @@ describe('stagedReducer', () => {
       original: { body: null },
     })
   })
+
+  it.each(['constructor', 'toString', 'valueOf', 'hasOwnProperty', '__proto__'])(
+    'remembers it for a column named %s too, which every object seems to have already',
+    (column) => {
+      const edit = (value: string | null, original: string | null, from: Staged) =>
+        stagedReducer(from, {
+          type: 'edit',
+          id: '["1"]',
+          key: { id: '1' },
+          column,
+          value,
+          original,
+        })
+      const once = edit('new', 'old', NOTHING_STAGED)
+      // The cell as the person read it goes to the server with the edit: without it, the edit
+      // is saved over whatever the cell holds by then.
+      expect(JSON.parse(JSON.stringify(once.updates['["1"]']))).toEqual({
+        key: { id: '1' },
+        values: { [column]: 'new' },
+        original: { [column]: 'old' },
+      })
+      const twice = edit('newer', 'reloaded', once)
+      expect(JSON.parse(JSON.stringify(twice.updates['["1"]']!.original))).toEqual({
+        [column]: 'old',
+      })
+      // Typed back to what it was: no change left.
+      expect(edit('old', 'reloaded', twice).updates).toEqual({})
+    },
+  )
 
   it('adds new rows, fills them in, and removes them', () => {
     const state = run(

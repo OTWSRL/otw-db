@@ -1,9 +1,11 @@
+import { spawn, spawnSync } from 'node:child_process'
 import { existsSync } from 'node:fs'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { SQLITE_PROCESS_WORKER } from '../src/drivers/sqlite.ts'
 import { sqliteDriver, type Driver } from '../src/index.ts'
 
 /*
@@ -143,6 +145,7 @@ describe('a SQLite connection, one statement after another', () => {
     'EXPLAIN QUERY PLAN PRAGMA `soft_heap_limit`=1',
     "PRAGMA temp_store_directory = '/tmp/elsewhere'",
     "PRAGMA data_store_directory = '/tmp/elsewhere'",
+    "PRAGMA lock_proxy_file = '/tmp/elsewhere/made-by-a-reader'",
   ])(
     'refuses a PRAGMA that sets something for every SQLite file in the server: %s',
     async (sql) => {
@@ -152,7 +155,7 @@ describe('a SQLite connection, one statement after another', () => {
       for (const options of [READ, WRITE]) {
         await expect(driver.query(sql, options)).rejects.toMatchObject({
           code: 'not-allowed',
-          message: expect.stringContaining('for every SQLite database this server has open'),
+          message: expect.stringContaining('reaches past this database'),
         })
       }
       expect(await names()).toEqual([['Ada']])
@@ -211,6 +214,233 @@ describe('a SQLite connection, one statement after another', () => {
     await expect(running).rejects.toMatchObject({ code: 'canceled' })
     await new Promise((resolve) => setTimeout(resolve, 300))
     expect((await driver.query(`UPDATE users SET name = 'Lovelace'`, WRITE)).affectedRows).toBe(1)
+  })
+
+  it('undoes a write stopped part-way, so the grid’s next read finds the file whole', async () => {
+    // Killed while it wrote, a statement leaves its journal beside the file. A handle that may
+    // write undoes it when it next reads; the grid's, which may only read, couldn't, and failed.
+    host.exec('CREATE TABLE filling (n INTEGER)')
+    await expect(
+      driver.query(
+        'WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c) INSERT INTO filling SELECT x FROM c',
+        { ...WRITE, timeoutMs: 400 },
+      ),
+    ).rejects.toThrow('ran past its 400 ms limit')
+    const grid = await driver.rows(
+      { schema: 'main', table: 'users', limit: 10, offset: 0, order: [{ column: 'id' }] },
+      { timeoutMs: 5_000 },
+    )
+    expect(grid.rows).toEqual([['1', 'Ada']])
+    expect((await driver.query('SELECT count(*) FROM filling', READ)).rows).toEqual([['0']])
+    expect(existsSync(`${file}-journal`)).toBe(false)
+  })
+
+  it('stops someone’s statement when the driver is closed, and doesn’t wait for it', async () => {
+    const closing = sqliteDriver(`sqlite:${file}`)
+    const running = closing.query(ENDLESS, { ...READ, timeoutMs: 60_000 })
+    const failed = running.then(
+      () => null,
+      (error: Error) => error,
+    )
+    await new Promise((resolve) => setTimeout(resolve, 300))
+    const started = performance.now()
+    await closing.close()
+    expect(performance.now() - started).toBeLessThan(2_000)
+    expect((await failed)?.message).toBe('The SQLite worker stopped.')
+  })
+
+  it.skipIf(process.platform === 'win32')(
+    'goes on a thread where a process starts and stops at once, and says nothing of it',
+    async () => {
+      const node = process.execPath
+      Object.defineProperty(process, 'execPath', { value: '/usr/bin/false', configurable: true })
+      const threaded = sqliteDriver(`sqlite:${file}`)
+      try {
+        expect((await threaded.query('SELECT name FROM users', READ)).rows).toEqual([['Ada']])
+        expect((await threaded.query('SELECT name FROM users', READ)).rows).toEqual([['Ada']])
+      } finally {
+        Object.defineProperty(process, 'execPath', { value: node, configurable: true })
+        await threaded.close()
+      }
+    },
+  )
+
+  it('runs a statement once, however long the server was too busy to hear the process start', async () => {
+    // The process has five seconds to say it's up. A server that reads nothing for longer than
+    // that found the timer due first, took the process for one that never started, and ran the
+    // statement again on a thread: a write, twice.
+    const busy = sqliteDriver(`sqlite:${file}`)
+    try {
+      const inserted = busy.query(`INSERT INTO users VALUES (7, 'Once')`, {
+        ...WRITE,
+        timeoutMs: 20_000,
+      })
+      await new Promise((resolve) => setImmediate(resolve))
+      const until = Date.now() + 5_600
+      while (Date.now() < until) {
+        // Nothing of the server's runs meanwhile: not a timer, not a message read.
+      }
+      expect((await inserted).affectedRows).toBe(1)
+      expect(host.prepare('SELECT count(*) AS n FROM users WHERE id = 7').get()).toEqual({ n: 1 })
+      // And its statements are still stopped at their limit: it's still a process's.
+      host.exec('PRAGMA busy_timeout = 0')
+      await expect(
+        busy.query(`UPDATE users SET name = (${ENDLESS})`, { ...WRITE, timeoutMs: 300 }),
+      ).rejects.toThrow('ran past its 300 ms limit')
+      await new Promise((resolve) => setTimeout(resolve, 300))
+      host.exec(`INSERT INTO users VALUES (8, 'Free')`)
+    } finally {
+      await busy.close()
+    }
+  }, 20_000)
+
+  it('closes at once with statements still to run, runs none of them, and leaves the file whole', async () => {
+    host.exec('CREATE TABLE filling (n INTEGER)')
+    const closing = sqliteDriver(`sqlite:${file}`)
+    const settled = (query: Promise<unknown>) =>
+      query.then(
+        () => 'ran',
+        () => 'failed',
+      )
+    const writing = settled(
+      closing.query(
+        'WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c) INSERT INTO filling SELECT x FROM c',
+        { ...WRITE, timeoutMs: 60_000 },
+      ),
+    )
+    const behind = [1, 2, 3].map((n) =>
+      settled(
+        closing.query(`INSERT INTO users VALUES (${10 + n}, 'Late')`, {
+          ...WRITE,
+          timeoutMs: 5_000,
+        }),
+      ),
+    )
+    await new Promise((resolve) => setTimeout(resolve, 500))
+    const started = performance.now()
+    await closing.close()
+    expect(performance.now() - started).toBeLessThan(3_000)
+    expect(await Promise.all([writing, ...behind])).toEqual([
+      'failed',
+      'failed',
+      'failed',
+      'failed',
+    ])
+    // Nothing of them was written, and no journal is left for the next reader to trip on.
+    expect(existsSync(`${file}-journal`)).toBe(false)
+    expect(await names()).toEqual([['Ada']])
+    expect((await driver.query('SELECT count(*) FROM filling', READ)).rows).toEqual([['0']])
+  })
+
+  it('reads a file a writer was killed over, undoing what the writer left', async () => {
+    // Not this driver's own statement: the app's, or the server's, stopped mid-write. Its
+    // journal is beside the file, and a handle that may only read can't undo it.
+    const crashed = spawnSync(
+      process.execPath,
+      [
+        '--disable-warning=ExperimentalWarning',
+        '-e',
+        `const { DatabaseSync } = require('node:sqlite')
+         const db = new DatabaseSync(process.env.FILE)
+         db.exec('PRAGMA cache_size = 5; CREATE TABLE IF NOT EXISTS crashing (t TEXT); BEGIN')
+         const insert = db.prepare('INSERT INTO crashing VALUES (?)')
+         for (let i = 0; i < 4000; i++) insert.run('x'.repeat(500))
+         process.kill(process.pid, 'SIGKILL')`,
+      ],
+      { env: { ...process.env, FILE: file } },
+    )
+    expect(crashed.signal).toBe('SIGKILL')
+    expect(existsSync(`${file}-journal`)).toBe(true)
+    const fresh = sqliteDriver(`sqlite:${file}`)
+    try {
+      const grid = await fresh.rows(
+        { schema: 'main', table: 'users', limit: 10, offset: 0, order: [{ column: 'id' }] },
+        { timeoutMs: 5_000 },
+      )
+      expect(grid.rows).toEqual([['1', 'Ada']])
+      expect((await fresh.query('SELECT name FROM users', READ)).rows).toEqual([['Ada']])
+    } finally {
+      await fresh.close()
+    }
+  })
+
+  it('reads a statement’s first word in no time, however many comments stand before it', async () => {
+    // A pattern for "any number of comments" tried every way to split them when no word came
+    // after: 28 of them held the server for seconds, on its own thread, before any time limit.
+    const started = performance.now()
+    await expect(
+      driver.query('/**/'.repeat(4_000) + '!', { ...READ, timeoutMs: 500 }),
+    ).rejects.toThrow()
+    expect(
+      (await driver.query('/**/'.repeat(4_000) + 'SELECT name FROM users', READ)).rows,
+    ).toEqual([['Ada']])
+    expect(performance.now() - started).toBeLessThan(1_500)
+  })
+
+  it('answers nothing once it’s closed, and starts nothing', async () => {
+    const closed = sqliteDriver(`sqlite:${file}`)
+    expect(await closed.tables()).not.toEqual([])
+    await closed.close()
+    await expect(closed.tables()).rejects.toThrow('The SQLite connection was closed.')
+    await expect(closed.query('SELECT 1', READ)).rejects.toThrow(
+      'The SQLite connection was closed.',
+    )
+  })
+
+  it('ends a statement with no end when the server that asked for it is gone', async () => {
+    // A server standing in for the host: it starts the process as the driver does, sends it a
+    // statement that never finishes, says which process that is, and waits to be killed.
+    const server = spawn(
+      process.execPath,
+      [
+        '--disable-warning=ExperimentalWarning',
+        '-e',
+        `const { spawn } = require('node:child_process')
+         const child = spawn(process.execPath, ['--disable-warning=ExperimentalWarning', '-e', process.env.WORKER], {
+           stdio: ['ignore', 'ignore', 'inherit', 'ipc'],
+           serialization: 'advanced',
+           env: { ...process.env, OTW_DB_SQLITE_WORKER: JSON.stringify({ path: process.env.FILE }) },
+         })
+         child.on('message', (message) => console.log('answer ' + JSON.stringify(message)))
+         child.send({ id: 1, type: 'run', sql: 'SELECT name FROM users', params: [], maxRows: 10, write: false, transaction: false, own: true })
+         setTimeout(() => {
+           child.send({ id: 2, type: 'run', sql: process.env.ENDLESS, params: [], maxRows: 10, write: false, transaction: false, own: true })
+           console.log('pid ' + child.pid)
+         }, 300)
+         setInterval(() => {}, 1000)`,
+      ],
+      {
+        env: { ...process.env, WORKER: SQLITE_PROCESS_WORKER, FILE: file, ENDLESS },
+        stdio: ['ignore', 'pipe', 'inherit'],
+      },
+    )
+    let said = ''
+    server.stdout.on('data', (chunk: Buffer) => (said += chunk.toString()))
+    const alive = (pid: number) => {
+      try {
+        process.kill(pid, 0)
+        return true
+      } catch {
+        return false
+      }
+    }
+    try {
+      await vi.waitFor(() => expect(said).toMatch(/pid \d+/), { timeout: 5_000 })
+      // It answers as the thread does: the first statement came back before the endless one.
+      expect(said).toContain(
+        'answer {"id":1,"result":{"columns":[{"name":"name","type":"text"}],"rows":[["Ada"]]',
+      )
+      const child = Number(/pid (\d+)/.exec(said)![1])
+      await new Promise((resolve) => setTimeout(resolve, 300))
+      expect(alive(child)).toBe(true)
+      // Killed, not stopped: nothing of the server's runs to tell the process to go.
+      server.kill('SIGKILL')
+      await vi.waitFor(() => expect(alive(child)).toBe(false), { timeout: 5_000 })
+    } finally {
+      server.kill('SIGKILL')
+      const child = Number(/pid (\d+)/.exec(said)?.[1])
+      if (child && alive(child)) process.kill(child, 'SIGKILL')
+    }
   })
 
   it('runs someone’s SQL on a thread, as it used to, where the server can’t start a process', async () => {

@@ -68,7 +68,7 @@ test('runs SQL on it, with the warning in view, and read-only', async ({ page })
     .fill("UPDATE cms_users SET name = 'x'")
   await page.keyboard.press(process.platform === 'darwin' ? 'Meta+Enter' : 'Control+Enter')
   await expect(app(page).getByRole('alert')).toContainText(
-    'cannot execute UPDATE in a read-only transaction',
+    'This connection is read-only: Read access runs SELECT, WITH, VALUES, TABLE, SHOW and EXPLAIN, not UPDATE.',
   )
 })
 

@@ -1,4 +1,5 @@
 import { DbAdminError, QueryError } from '../errors.ts'
+import { leadingWord } from '../words.ts'
 import { refuseBeyondReadingPostgres } from './read-only.ts'
 import type {
   ApplyResult,
@@ -82,7 +83,7 @@ const CURSOR = 'otw_db_cursor'
 const FIX = 'otw_db_fix'
 
 /** The statements a cursor can read from, past the comments and brackets before them. */
-const READS_ROWS = /^(?:\s+|--[^\n]*(?:\n|$)|\/\*[\s\S]*?\*\/|\()*(?:SELECT|WITH|VALUES|TABLE)\b/i
+const READS_ROWS = new Set(['SELECT', 'WITH', 'VALUES', 'TABLE'])
 
 /**
  * What a statement can leave on a session past its own transaction. The host shares the one
@@ -102,9 +103,10 @@ interface SessionState {
    * Settings no catalog lists, a plugin's or an app's own (`app.tenant`), by the names a
    * statement's text gives; null for one that was never set.
    */
-  custom: Record<string, string | null> | null
+  custom?: Record<string, string | null> | null
 }
 
+/** What a session holds, with a place (CUSTOM) for one more thing to ask. */
 const STATE_SQL = `SELECT json_build_object(
   'settings', (SELECT json_object_agg(s.name, s.setting) FROM (
                  SELECT name, setting FROM pg_catalog.pg_settings WHERE source = 'session'
@@ -122,8 +124,14 @@ const STATE_SQL = `SELECT json_build_object(
   'channels', (SELECT coalesce(json_agg(c), '[]') FROM pg_catalog.pg_listening_channels() c),
   'locks', (SELECT coalesce(json_agg(json_build_array(classid::bigint, objid::bigint, objsubid, mode)), '[]')
               FROM pg_catalog.pg_locks
-             WHERE locktype = 'advisory' AND pid = pg_catalog.pg_backend_pid() AND granted),
-  'custom', (SELECT json_object_agg(n, pg_catalog.current_setting(n, true)) FROM unnest($1::text[]) n))::text`
+             WHERE locktype = 'advisory' AND pid = pg_catalog.pg_backend_pid() AND granted)CUSTOM)::text`
+
+/** The same, with the settings named in $1 beside it: asked only of a statement that names some. */
+const STATE_AND_CUSTOM_SQL = STATE_SQL.replace(
+  'CUSTOM',
+  `, 'custom', (SELECT json_object_agg(n, pg_catalog.current_setting(n, true)) FROM unnest($1::text[]) n)`,
+)
+const STATE_ONLY_SQL = STATE_SQL.replace('CUSTOM', '')
 
 /** A setting's name, as RESET takes it: `search_path`, or an extension's `app.tenant`. */
 const SETTING = /^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_$]*)*$/
@@ -132,7 +140,9 @@ async function sessionState(
   on: PGliteQueryable,
   custom: readonly string[] = [],
 ): Promise<SessionState> {
-  const { rows } = await on.query(STATE_SQL, [custom], { rowMode: 'array', parsers: {} })
+  const { rows } = custom.length
+    ? await on.query(STATE_AND_CUSTOM_SQL, [custom], { rowMode: 'array', parsers: {} })
+    : await on.query(STATE_ONLY_SQL, [], { rowMode: 'array', parsers: {} })
   return JSON.parse((rows as [string][])[0]![0]) as SessionState
 }
 
@@ -143,8 +153,10 @@ async function sessionState(
  */
 function customSettings(sql: string): string[] {
   const names = new Set<string>()
+  // From a word's first letter only: tried from every letter of a word of megabytes, a
+  // pattern that then finds no dot would read the rest of the word each time.
   for (const [name] of sql.matchAll(
-    /[A-Za-z_][A-Za-z0-9_]*(?:"?\s*\.\s*"?[A-Za-z_][A-Za-z0-9_$]*)+/g,
+    /(?<![A-Za-z0-9_$])[A-Za-z_][A-Za-z0-9_]*(?:"?\s*\.\s*"?[A-Za-z_][A-Za-z0-9_$]*)+/g,
   )) {
     const plain = name.replace(/["\s]/g, '').toLowerCase()
     if (SETTING.test(plain)) names.add(plain)
@@ -153,16 +165,20 @@ function customSettings(sql: string): string[] {
   return [...names]
 }
 
+/** One statement that puts something of a session back. */
+interface Fix {
+  sql: string
+  values?: unknown[]
+  /** It undoes what a rollback doesn't: a prepared statement, a session's lock. */
+  outlasts?: boolean
+}
+
 /**
  * The statements that put a session back as `before` has it, from how it is `now`. `listens`:
  * inside a transaction about to commit, where a LISTEN it ran doesn't show yet.
  */
-function repairs(
-  before: SessionState,
-  now: SessionState,
-  listens: boolean,
-): { sql: string; values?: unknown[] }[] {
-  const fixes: { sql: string; values?: unknown[] }[] = []
+function repairs(before: SessionState, now: SessionState, listens: boolean): Fix[] {
+  const fixes: Fix[] = []
   // Who the session runs as comes first: the rest may need the host's own privileges.
   const first = ['session_authorization', 'role']
   const names = [...new Set([...Object.keys(before.settings), ...Object.keys(now.settings)])].sort(
@@ -185,7 +201,8 @@ function repairs(
   const added = (list: (s: SessionState) => string[]) =>
     list(now).filter((name) => !list(before).includes(name))
   for (const name of added((s) => s.cursors)) fixes.push({ sql: `CLOSE ${quote(name)}` })
-  for (const name of added((s) => s.prepared)) fixes.push({ sql: `DEALLOCATE ${quote(name)}` })
+  for (const name of added((s) => s.prepared))
+    fixes.push({ sql: `DEALLOCATE ${quote(name)}`, outlasts: true })
   if (listens) {
     // What the transaction listened to isn't listed until it commits: all of it goes, and the
     // host's own channels are listened to again, in the same commit.
@@ -193,10 +210,15 @@ function repairs(
     for (const name of before.channels) fixes.push({ sql: `LISTEN ${quote(name)}` })
   } else {
     for (const name of added((s) => s.channels)) fixes.push({ sql: `UNLISTEN ${quote(name)}` })
+    // And those it stopped listening to (UNLISTEN, DISCARD ALL) are listened to again.
+    for (const name of before.channels) {
+      if (!now.channels.includes(name)) fixes.push({ sql: `LISTEN ${quote(name)}` })
+    }
   }
   const held = new Set(before.locks.map((l) => l.join(' ')))
   const taken = now.locks.filter((l) => !held.has(l.join(' ')))
-  if (taken.length && !before.locks.length) fixes.push({ sql: 'SELECT pg_advisory_unlock_all()' })
+  if (taken.length && !before.locks.length)
+    fixes.push({ sql: 'SELECT pg_advisory_unlock_all()', outlasts: true })
   else {
     for (const [classid, objid, objsubid, mode] of taken) {
       const shared = mode === 'ShareLock' ? '_shared' : ''
@@ -209,6 +231,7 @@ function repairs(
       fixes.push({
         sql: `SELECT count(*) FROM generate_series(1, 1000) WHERE pg_advisory_unlock${shared}(${key})`,
         values: [classid, objid],
+        outlasts: true,
       })
     }
   }
@@ -226,10 +249,12 @@ async function restoreSession(
   on: PGliteQueryable,
   before: SessionState,
   savepoints: boolean,
-  listens = false,
+  /** `listens`: see repairs. `outlasting`: only what the rollback about to come won't undo. */
+  { listens = false, outlasting = false }: { listens?: boolean; outlasting?: boolean } = {},
 ): Promise<void> {
   const now = await sessionState(on, Object.keys(before.custom ?? {}))
   for (const fix of repairs(before, now, listens)) {
+    if (outlasting && !fix.outlasts) continue
     try {
       if (savepoints) await on.query(`SAVEPOINT ${FIX}`)
       await on.query(fix.sql, fix.values)
@@ -352,7 +377,7 @@ class PGliteDriver implements Driver {
    */
   async #limited(tx: PGliteQueryable, sql: string, maxRows: number) {
     const options = { rowMode: 'array' as const, parsers: this.#text }
-    if (!READS_ROWS.test(sql)) return tx.query(sql, [], options)
+    if (!READS_ROWS.has(leadingWord(sql))) return tx.query(sql, [], options)
     await tx.query(`SAVEPOINT ${CURSOR}`)
     try {
       await tx.query(`DECLARE ${CURSOR} NO SCROLL CURSOR FOR ${sql}`)
@@ -445,29 +470,39 @@ class PGliteDriver implements Driver {
         } catch (error) {
           failure = error
         }
-        if (write && failure === undefined) {
-          // Committed with the statement, so the host's next query already finds its own.
-          await restoreSession(tx, before, true, /listen/i.test(sql))
+        if (failure === undefined) {
+          if (write) {
+            // Committed with the statement, so the host's next query already finds its own.
+            await restoreSession(tx, before, true, { listens: /listen/i.test(sql) })
+          } else {
+            // A read is rolled back, which undoes all but a prepared statement and a session's
+            // lock: those go first, in here, while the host's queries still wait.
+            await restoreSession(tx, before, true, { outlasting: true })
+            await tx.rollback()
+          }
           return answer!
         }
-        // A read, or a statement that failed: undone here by hand, and then what a rollback
-        // doesn't undo (a prepared statement, a session's lock) is put back, still in the
-        // host's way. PGlite ends its transaction after this, and finds none: that's all.
+        // A statement that failed leaves a transaction that takes no more: undone here by
+        // hand, and then what that doesn't undo is put back, still in the host's way. PGlite
+        // rolls back after this, and finds nothing to: that's all.
+        const repair = () =>
+          restoreSession(tx, before, false).catch((error: unknown) =>
+            console.error('otw-db: could not reset the PGlite session', error),
+          )
         await undo(tx)
-        await restoreSession(tx, before, false).catch((error: unknown) =>
-          console.error('otw-db: could not reset the PGlite session', error),
-        )
-        if (failure !== undefined) throw failure
-        return answer!
+        await repair()
+        if (!write || (failure as { code?: string }).code !== NOT_IN_TRANSACTION) throw failure
+        // What refuses a transaction (VACUUM, DISCARD ALL) runs alone, here, where no
+        // transaction is open any more and the host still waits: DISCARD ALL resets what the
+        // host set, which is then put back before its next query.
+        try {
+          return await tx.query(sql, [], { rowMode: 'array', parsers: this.#text })
+        } finally {
+          await repair()
+        }
       })
     } catch (error) {
-      if (!write || (error as { code?: string }).code !== NOT_IN_TRANSACTION) throw toError(error)
-      try {
-        // What refuses to run in a transaction (VACUUM, CREATE DATABASE) sets nothing on a session.
-        result = await this.#client.query(sql, [], { rowMode: 'array', parsers: this.#text })
-      } catch (alone) {
-        throw toError(alone)
-      }
+      throw toError(error)
     }
     const rows = result.rows as (string | null)[][]
     const truncated = rows.length > options.maxRows
@@ -475,9 +510,7 @@ class PGliteDriver implements Driver {
       columns: await this.#named(result.fields),
       rows: truncated ? rows.slice(0, options.maxRows) : rows,
       truncated,
-      command: (
-        /^\s*(?:--[^\n]*\n\s*|\/\*[\s\S]*?\*\/\s*)*(\w+)/.exec(sql)?.[1] ?? ''
-      ).toUpperCase(),
+      command: leadingWord(sql),
       affectedRows: result.fields.length
         ? truncated
           ? null
@@ -659,7 +692,7 @@ class PGliteDriver implements Driver {
         }
         // As after every write: what the session set (a restore's SETs, its locks, a LISTEN) is
         // undone inside the transaction, so the host's queries waiting for it find their own.
-        if (before) await restoreSession(tx, before, true, true)
+        if (before) await restoreSession(tx, before, true, { listens: true })
       })
       done.catch((error: unknown) => {
         if (!opened) reject(toError(error))

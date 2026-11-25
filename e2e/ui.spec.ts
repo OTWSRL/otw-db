@@ -193,7 +193,7 @@ test('a read-only connection refuses writes', async ({ page }) => {
   await sql(page, "UPDATE users SET name = 'x' WHERE id = 1")
   await page.keyboard.press(`${MOD}+Enter`)
   await expect(page.getByRole('alert')).toContainText(
-    'cannot execute UPDATE in a read-only transaction',
+    'This connection is read-only: Read access runs SELECT, WITH, VALUES, TABLE, SHOW and EXPLAIN, not UPDATE.',
   )
 })
 

@@ -1,7 +1,18 @@
 import { execFileSync } from 'node:child_process'
-import { randomBytes } from 'node:crypto'
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
-import { dirname, join, relative, resolve } from 'node:path'
+import {
+  accessSync,
+  constants,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  realpathSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs'
+import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
+import { MIN_PASSWORD } from './session.ts'
 
 /*
  * `otw-db-next init`: OTW DB added to a Next.js app that's already there. What it finds
@@ -23,18 +34,28 @@ export interface Detected {
   manager: PackageManager
   /** `basePath` from next.config, such as `/docs`; empty without one. */
   nextBasePath: string
+  /** next.config sets a `basePath` that isn't a plain path, so it wasn't taken. */
+  basePathUnread: boolean
   /** Its middleware (or proxy, as Next 16 calls it), relative to the app; null without one. */
   middleware: string | null
-  /** `.gitignore` keeps `.env.local` out of git. */
-  envIgnored: boolean
+  /**
+   * Files that are there and weren't read: not a file, or larger than any such file is. What
+   * they'd have said isn't known, which isn't the same as their saying nothing.
+   */
+  unread: string[]
+  /** DB_ADMIN_PASSWORD is set in `.env`, a file apps usually keep in git. */
+  passwordInDotEnv: boolean
   /** The names already set in `.env.local` and `.env`. */
   envNames: ReadonlySet<string>
   /** The tool's own names those files mention at all, set or in a comment an earlier run left. */
   envMentions: ReadonlySet<string>
   /** The app uses Supabase: its packages, or its address in the env. */
   supabase: boolean
-  /** `engines.node` in package.json, if it says. */
-  nodeEngine: string | null
+  /**
+   * The Node major package.json holds the app to (`20`, `20.x`, `^18.17`), when it holds it to
+   * one: the number, never the text, which is someone's and gets printed.
+   */
+  nodeMajor: number | null
   /** `@otwdesign/db-next` is a dependency already. */
   installed: boolean
 }
@@ -44,17 +65,19 @@ export interface InitFlags {
   path?: string
   /** Install nothing: the files only. */
   install?: boolean
-  /** For a test: the password to write, where one is made at random. */
-  password?: string
 }
 
-/** What `init` would do: files to write, lines for `.env.local`, a command, and what to say. */
+/** What `init` would do: files to write, a command, and what to say and leave to the person. */
 export interface InitPlan {
   /** Why nothing can be done; when set, the rest is empty. */
   refused: string | null
   files: { path: string; content: string }[]
-  /** Lines to add to `.env.local`, and the file; null when there's nothing to add. */
-  env: { path: string; lines: string[] } | null
+  /**
+   * The variables still to set, as lines for the person to add to their environment: `init`
+   * writes none of them. The password is theirs to choose and to place, and a file in a folder
+   * someone else may have prepared is no place for a tool to put a secret.
+   */
+  env: string[]
   /** The command that installs the package; null with `--no-install`, or when it's there. */
   install: { command: string; args: string[] } | null
   /** What the person should know, or do next. */
@@ -67,9 +90,25 @@ const PATH = /^(?:\/[A-Za-z0-9._~-]+)+$/
 /** The app's own PostgreSQL, by the names `appConnections()` reads. */
 const OWN = ['DATABASE_URL_UNPOOLED', 'POSTGRES_URL_NON_POOLING', 'DATABASE_URL', 'POSTGRES_URL']
 
+/** Whether `path` is `root` or inside it. */
+function within(root: string, path: string): boolean {
+  const from = relative(root, path)
+  return from === '' || (!from.startsWith('..') && !isAbsolute(from))
+}
+
+/** More than any file read here holds: a package.json, a next.config, an env file. */
+const MOST = 1024 * 1024
+
+/**
+ * A file's text, without a byte-order mark; null when it isn't there, isn't a file (a pipe of
+ * that name would be waited on for ever) or is larger than such files are (read whole, it is a
+ * wait as long as its author likes).
+ */
 function read(path: string): string | null {
   try {
-    return readFileSync(path, 'utf8')
+    const file = statSync(path)
+    if (!file.isFile() || file.size > MOST) return null
+    return readFileSync(path, 'utf8').replace(/^\uFEFF/, '')
   } catch {
     return null
   }
@@ -100,21 +139,108 @@ function envNames(text: string | null): string[] {
     .filter((name): name is string => !!name)
 }
 
-/** Whether `.gitignore` keeps `.env.local` out: by name, or by the patterns Next's own starter has. */
-function ignoresEnvLocal(gitignore: string | null): boolean {
-  const patterns = (gitignore ?? '')
-    .split('\n')
-    .map((line) => line.trim().replace(/^\//, ''))
-    .filter((line) => line && !line.startsWith('#'))
-  return patterns.some((p) =>
-    ['.env.local', '.env*', '.env*.local', '.env.*', '*.local'].includes(p),
-  )
+/** Whether `path` is a folder, or leads to one. */
+function isDirectory(path: string): boolean {
+  try {
+    return statSync(path).isDirectory()
+  } catch {
+    return false
+  }
 }
+
+/** Whether files can be made in the folder `path`. */
+function writable(path: string): boolean {
+  try {
+    accessSync(path, constants.W_OK | constants.X_OK)
+    return true
+  } catch {
+    return false
+  }
+}
+
+/** The names in the folder `path`; null when it can't be listed. */
+function namesIn(path: string): string[] | null {
+  try {
+    return readdirSync(path)
+  } catch {
+    return null
+  }
+}
+
+/** Whether there is anything at `path`, a link that leads nowhere included. */
+function entry(path: string): boolean {
+  try {
+    lstatSync(path)
+    return true
+  } catch {
+    return false
+  }
+}
+
+/** What a file of JSON holds, when it holds an object: nothing else has anything to read. */
+function objectIn(text: string | null): Record<string, unknown> {
+  try {
+    const value: unknown = JSON.parse(text ?? '{}')
+    return typeof value === 'object' && value !== null ? (value as Record<string, unknown>) : {}
+  } catch {
+    return {}
+  }
+}
+
+/** A path as `--path` and a route take it: short, segments of plain characters, none of them dots alone. */
+function plainPath(path: string): boolean {
+  // Of a length paths have: it's written into a file and printed, as often as it's long.
+  if (path.length > 200) return false
+  return PATH.test(path) && !path.split('/').some((segment) => /^\.+$/.test(segment))
+}
+
+/**
+ * `basePath` as next.config sets it: the path, an empty string when it sets none, null when what
+ * the file says of it can't be taken for one plain path. It is taken only in the one shape that
+ * needs no reading of JavaScript: the word once in the file, as a key with a short quoted value,
+ * on a line with no comment before it and nothing joined on after it. Anything else (a variable, two mentions, a value built
+ * from parts) gets a note and no guess: a wrong address is worse than one to fill in. A block
+ * comment over several lines isn't seen for what it is; the note says where the address goes.
+ */
+function basePathIn(config: string): string | null {
+  const first = config.indexOf('basePath')
+  if (first < 0) return ''
+  if (config.indexOf('basePath', first + 1) >= 0) return null
+  const before = config.slice(config.lastIndexOf('\n', first) + 1, first)
+  const set = /^basePath\s*:\s*(['"`])([^'"`\n\\$]{0,201})\1(?=[ \t]*(?:[,}\r\n]|$))/.exec(
+    config.slice(first, first + 300),
+  )
+  if (!set || /\/\/|\/\*|^\s*\*/.test(before)) return null
+  const value = set[2]!.replace(/\/$/, '')
+  return value === '' || plainPath(value) ? value : null
+}
+
+/**
+ * The Node major `engines.node` holds an app to, when it names one version line: `20`, `20.x`,
+ * `^18.17`. A range open upwards (`>=18`) names none.
+ */
+function pinnedMajor(range: unknown): number | null {
+  // Text only: package.json is someone's file.
+  if (typeof range !== 'string') return null
+  const pinned = /^[\^~=v]?\s*(\d{1,4})(?:\.(?:x|\*|\d+))*$/.exec(range.trim())
+  return pinned ? Number(pinned[1]) : null
+}
+
+const CONFIGS = ['next.config.ts', 'next.config.mjs', 'next.config.js', 'next.config.cjs']
+/** The env files Next.js reads, on a machine and in a build. */
+const ENV_FILES = [
+  '.env.local',
+  '.env',
+  '.env.development.local',
+  '.env.development',
+  '.env.production.local',
+  '.env.production',
+]
 
 /** Looks at the app in `dir`. */
 export function detect(dir: string): Detected {
   const root = resolve(dir)
-  const manifest = JSON.parse(read(join(root, 'package.json')) ?? '{}') as {
+  const manifest = objectIn(read(join(root, 'package.json'))) as {
     dependencies?: Record<string, string>
     devDependencies?: Record<string, string>
     engines?: { node?: string }
@@ -123,14 +249,16 @@ export function detect(dir: string): Detected {
   const dependencies = { ...manifest.dependencies, ...manifest.devDependencies }
   const has = (path: string) => existsSync(join(root, path))
   const src = has('src/app') || has('src/pages') ? 'src' : ''
-  const config = ['next.config.ts', 'next.config.mjs', 'next.config.js', 'next.config.cjs']
-    .map((file) => read(join(root, file)))
-    .find((text) => text !== null)
+  const config = CONFIGS.map((file) => read(join(root, file))).find((text) => text !== null)
   const middleware =
     ['middleware.ts', 'middleware.js', 'proxy.ts', 'proxy.js']
       .flatMap((file) => [file, join('src', file)])
       .find(has) ?? null
-  const envFiles = [read(join(root, '.env.local')), read(join(root, '.env'))]
+  const basePath = basePathIn(config ?? '')
+  const envFiles = ENV_FILES.map((file) => read(join(root, file)))
+  const unread = ['package.json', ...CONFIGS, ...ENV_FILES].filter(
+    (file) => entry(join(root, file)) && read(join(root, file)) === null,
+  )
   const names = new Set(envFiles.flatMap(envNames))
   const mentions = new Set(envFiles.flatMap((text) => text?.match(/DB_ADMIN_[A-Z0-9_]+/g) ?? []))
   return {
@@ -139,9 +267,11 @@ export function detect(dir: string): Detected {
     src,
     typescript: has('tsconfig.json'),
     manager: managerOf(root, manifest.packageManager),
-    nextBasePath: /\bbasePath\s*:\s*['"`](\/[^'"`]*)['"`]/.exec(config ?? '')?.[1] ?? '',
+    nextBasePath: basePath ?? '',
+    basePathUnread: basePath === null,
+    unread,
     middleware,
-    envIgnored: ignoresEnvLocal(read(join(root, '.gitignore'))),
+    passwordInDotEnv: envNames(read(join(root, '.env'))).includes('DB_ADMIN_PASSWORD'),
     envNames: names,
     envMentions: mentions,
     supabase:
@@ -149,7 +279,7 @@ export function detect(dir: string): Detected {
       '@supabase/ssr' in dependencies ||
       names.has('NEXT_PUBLIC_SUPABASE_URL') ||
       names.has('SUPABASE_URL'),
-    nodeEngine: manifest.engines?.node ?? null,
+    nodeMajor: pinnedMajor(manifest.engines?.node),
     installed: '@otwdesign/db-next' in dependencies,
   }
 }
@@ -173,18 +303,15 @@ export const { GET, POST } = createDbRoute(${options})
 `
 }
 
-/**
- * Whether `engines.node` holds the app to a Node before 22, which the tool can't run on: `20`,
- * `20.x`, `^18.17`. A range open upwards (`>=18`) doesn't.
- */
-function nodeTooOld(range: string | null): boolean {
-  const pinned = /^\s*[\^~=v]?\s*(\d+)(?:\.(?:x|\*|\d+))*\s*$/.exec(range ?? '')
-  return pinned !== null && Number(pinned[1]) < 22
-}
-
 /** What to do in the app `detect` found. Writes nothing. */
 export function plan(detected: Detected, flags: InitFlags = {}): InitPlan {
-  const nothing = { files: [], env: null, install: null, notes: [], url: '' }
+  const nothing = { files: [], env: [], install: null, notes: [], url: '' }
+  if (detected.unread.includes('package.json')) {
+    return {
+      ...nothing,
+      refused: 'package.json couldn’t be read: it isn’t a file, or is larger than such a file is.',
+    }
+  }
   if (!detected.next) {
     return {
       ...nothing,
@@ -193,7 +320,8 @@ export function plan(detected: Detected, flags: InitFlags = {}): InitPlan {
     }
   }
   const path = (flags.path ?? '/db').replace(/\/+$/, '')
-  if (!PATH.test(path)) {
+  // A segment of dots alone is this folder, or the one above it: out of the app, by two of them.
+  if (!plainPath(path)) {
     return {
       ...nothing,
       refused: `--path is a path such as /db or /admin/db: segments of letters, digits, . _ ~ and -, not "${flags.path}".`,
@@ -202,28 +330,70 @@ export function plan(detected: Detected, flags: InitFlags = {}): InitPlan {
   const app = join(detected.src, 'app')
   const route = join(app, ...path.split('/').filter(Boolean))
   const pages = join(detected.src, 'pages', ...path.split('/').filter(Boolean))
-  const taken = [
-    route,
-    pages,
-    ...['tsx', 'ts', 'jsx', 'js'].map((extension) => `${pages}.${extension}`),
-  ].find((candidate) => existsSync(join(detected.dir, candidate)))
+  // As the browser has it: next.config's basePath comes before every route of the app.
+  const basePath = `${detected.nextBasePath.replace(/\/+$/, '')}${path}`
+  const file = join(route, '[[...path]]', detected.typescript ? 'route.ts' : 'route.js')
+  // An earlier run's own route, as it wrote it: this one goes on from there (an install that
+  // failed, a password still to set) and writes over nothing.
+  const written =
+    read(join(detected.dir, file)) === routeFile(basePath) &&
+    namesIn(join(detected.dir, route))?.length === 1
+  const taken = written
+    ? undefined
+    : [
+        route,
+        pages,
+        ...['tsx', 'ts', 'jsx', 'js'].map((extension) => `${pages}.${extension}`),
+      ].find((candidate) => existsSync(join(detected.dir, candidate)))
+  // Through a link, the route would be written outside the app, where the link leads.
+  let inside = detected.dir
+  for (const segment of file.split(sep).slice(0, -1)) {
+    const next = join(inside, segment)
+    if (!entry(next)) break
+    inside = next
+  }
+  if (inside !== detected.dir && !isDirectory(inside)) {
+    return {
+      ...nothing,
+      refused: `${relative(detected.dir, inside)} isn’t a folder: the route can’t be written under it.`,
+    }
+  }
+  let leadsOut: boolean
+  try {
+    leadsOut = !within(realpathSync(detected.dir), realpathSync(inside))
+  } catch {
+    // A link that leads nowhere: nothing can be made in it either.
+    leadsOut = true
+  }
+  if (leadsOut) {
+    return {
+      ...nothing,
+      refused: `${relative(detected.dir, inside)} is a link to somewhere outside this app: the route would be written there. Run it in the app the link leads to.`,
+    }
+  }
+  if (!written && !taken && !writable(inside)) {
+    // Said now, as a dry run would have to: the run itself would stop here.
+    return {
+      ...nothing,
+      refused: `${relative(detected.dir, inside) || 'This folder'} can’t be written in: the route can’t be made there. Check its permissions.`,
+    }
+  }
   if (taken) {
     return {
       ...nothing,
       refused: `${taken} is there already: the app has something at ${path}. Choose another place with --path, such as --path /admin/db.`,
     }
   }
-  // As the browser has it: next.config's basePath comes before every route of the app.
-  const basePath = `${detected.nextBasePath.replace(/\/+$/, '')}${path}`
-  const file = join(route, '[[...path]]', detected.typescript ? 'route.ts' : 'route.js')
   const notes: string[] = []
 
   const lines: string[] = []
-  const password = flags.password ?? randomBytes(24).toString('base64url')
   if (!detected.envNames.has('DB_ADMIN_PASSWORD')) {
     lines.push(
-      `# OTW DB (${basePath}). Whoever has this password can open the database.`,
-      `DB_ADMIN_PASSWORD=${password}`,
+      `# OTW DB (${basePath}). A password of your own, ${MIN_PASSWORD} characters at least: whoever has it can open the database.`,
+      'DB_ADMIN_PASSWORD=',
+    )
+    notes.push(
+      `Choose a strong password of your own and set it as DB_ADMIN_PASSWORD: ${MIN_PASSWORD} characters at least, from your password manager or a command such as openssl rand -base64 32. It’s set in none of the app’s env files; until it’s set somewhere, nobody signs in with a password. Keep it out of git: in .env.local on your machine (git check-ignore .env.local names the file when git leaves it alone), in your host’s settings where the app runs.`,
     )
   }
   if (!detected.envMentions.has('DB_ADMIN_USERS')) {
@@ -248,17 +418,18 @@ export function plan(detected: Detected, flags: InitFlags = {}): InitPlan {
       '# DB_ADMIN_MAIN_ACCESS=write   # read, unless you say so',
     )
   }
-  let env: InitPlan['env'] = lines.length ? { path: '.env.local', lines } : null
-  if (env && !detected.envIgnored) {
-    // A password written where git would pick it up is a password published.
-    notes.push(
-      `.gitignore doesn’t keep .env.local out of git, so nothing was written there. Add these to your environment yourself:\n${lines
-        .map((line) => `    ${line}`)
-        .join('\n')}`,
-    )
-    env = null
-  }
 
+  const unread = detected.unread.filter((file) => file !== 'package.json')
+  if (unread.length) {
+    notes.push(
+      `Not read, so what ${unread.length > 1 ? 'they set' : 'it sets'} isn’t counted above: ${unread.join(', ')} (not a file, or larger than such a file is). Check there for DB_ADMIN_PASSWORD and the database’s address yourself.`,
+    )
+  }
+  if (detected.passwordInDotEnv) {
+    notes.push(
+      'DB_ADMIN_PASSWORD is set in .env, a file apps usually keep in git. If git has it, whoever can read the repository has the password: move it to .env.local (or your host’s settings) and choose a new one.',
+    )
+  }
   if (!named && !own) {
     notes.push(
       detected.supabase
@@ -280,9 +451,14 @@ export function plan(detected: Detected, flags: InitFlags = {}): InitPlan {
       'To let your own signed-in users in without the password, list their emails in DB_ADMIN_USERS and tell the route who is signed in: createDbRoute({ user: async () => (await auth())?.user?.email }).',
     )
   }
-  if (nodeTooOld(detected.nodeEngine)) {
+  if (detected.nodeMajor !== null && detected.nodeMajor < 22) {
     notes.push(
-      `package.json asks for Node ${detected.nodeEngine}; OTW DB needs 22.18 or newer. On Vercel, set the project’s Node.js version to 22 or 24.`,
+      `package.json asks for Node ${detected.nodeMajor}; OTW DB needs 22.18 or newer. On Vercel, set the project’s Node.js version to 22 or 24.`,
+    )
+  }
+  if (detected.basePathUnread) {
+    notes.push(
+      `next.config mentions basePath in a way this couldn’t read as one plain path, so the route was written without it. If the app is served under one, name the whole address in the route file: createDbRoute({ basePath: '<your basePath>${path}' }).`,
     )
   }
   notes.push(
@@ -292,8 +468,8 @@ export function plan(detected: Detected, flags: InitFlags = {}): InitPlan {
   const add = { npm: 'install', pnpm: 'add', yarn: 'add', bun: 'add' }[detected.manager]
   return {
     refused: null,
-    files: [{ path: file, content: routeFile(basePath) }],
-    env,
+    files: written ? [] : [{ path: file, content: routeFile(basePath) }],
+    env: lines,
     install:
       flags.install === false || detected.installed
         ? null
@@ -303,13 +479,29 @@ export function plan(detected: Detected, flags: InitFlags = {}): InitPlan {
   }
 }
 
-/** Does what the plan says, in the app's directory. `run` installs; a test stands in for it. */
+/** How `apply` went. */
+export interface InitOutcome {
+  /** Why the package wasn't installed, when installing it was tried and failed. */
+  installFailed: string | null
+}
+
+/**
+ * Does what the plan says, in the app's directory. `run` installs; a test stands in for it. An
+ * install that fails (no network, a registry that says no) is reported, not thrown: the files
+ * are written by then, and what's left to do must still be said.
+ */
 export function apply(
   detected: Detected,
   planned: InitPlan,
   run: (command: string, args: string[], cwd: string) => void = (command, args, cwd) =>
-    void execFileSync(command, args, { cwd, stdio: 'inherit' }),
-): void {
+    // On Windows the package managers are .cmd files, which only a shell runs. The command and
+    // its arguments are this file's own words, never what someone typed.
+    void execFileSync(command, args, {
+      cwd,
+      stdio: 'inherit',
+      shell: process.platform === 'win32',
+    }),
+): InitOutcome {
   if (planned.refused) throw new Error(planned.refused)
   for (const file of planned.files) {
     const target = join(detected.dir, file.path)
@@ -317,38 +509,48 @@ export function apply(
     // Never over what's there: `plan` refused if it was, and this holds if it appeared since.
     writeFileSync(target, file.content, { flag: 'wx' })
   }
-  if (planned.env) {
-    const target = join(detected.dir, planned.env.path)
-    const before = read(target) ?? ''
-    // After what's there, a blank line between.
-    const joint = !before ? '' : before.endsWith('\n') ? '\n' : '\n\n'
-    writeFileSync(target, `${before}${joint}${planned.env.lines.join('\n')}\n`)
+  if (planned.install) {
+    try {
+      run(planned.install.command, planned.install.args, detected.dir)
+    } catch (error) {
+      return { installFailed: (error as Error).message.split('\n')[0] ?? 'it failed' }
+    }
   }
-  if (planned.install) run(planned.install.command, planned.install.args, detected.dir)
+  return { installFailed: null }
 }
 
 /** What was done, or would be, for the terminal. */
-export function report(detected: Detected, planned: InitPlan, dryRun: boolean): string {
+export function report(
+  detected: Detected,
+  planned: InitPlan,
+  dryRun: boolean,
+  outcome: InitOutcome = { installFailed: null },
+): string {
   if (planned.refused) return `${planned.refused}\n`
   const did = dryRun ? 'Would' : 'Did'
   const out = [`OTW DB for this Next.js app, at ${planned.url}:`, '']
   for (const file of planned.files) out.push(`  ${did} write ${file.path}`)
-  if (planned.env) {
-    out.push(`  ${did} add to ${relative(detected.dir, join(detected.dir, planned.env.path))}:`)
-    for (const line of planned.env.lines.filter((l) => !l.startsWith('#'))) {
-      out.push(
-        `      ${line.replace(/^(DB_ADMIN_PASSWORD=).+$/, '$1(a new password, 32 characters)')}`,
-      )
-    }
-  }
   if (planned.install) {
-    out.push(`  ${did} run ${planned.install.command} ${planned.install.args.join(' ')}`)
+    const command = `${planned.install.command} ${planned.install.args.join(' ')}`
+    out.push(
+      outcome.installFailed
+        ? `  Couldn’t run ${command} (${outcome.installFailed}). Run it yourself, in this directory.`
+        : `  ${did} run ${command}`,
+    )
+  }
+  if (planned.env.length) {
+    out.push(
+      '',
+      '  Yours to add to the app’s environment (.env.local on your machine, your host’s settings):',
+      ...planned.env.map((line) => `      ${line}`),
+    )
   }
   out.push('', ...planned.notes.flatMap((note) => [`- ${note}`, '']))
   out.push(
     dryRun
       ? 'Nothing was changed: run it again without --dry-run.'
-      : `Start the app and open ${planned.url}.`,
+      : `${planned.env.includes('DB_ADMIN_PASSWORD=') ? 'Set DB_ADMIN_PASSWORD, start' : 'Start'} the app and open ${planned.url}.`,
   )
-  return `${out.join('\n')}\n`
+  // Text and line ends only. Nothing above quotes the app's files; this holds if a later line does.
+  return `${out.join('\n')}\n`.replace(/[^\n\P{Cc}]/gu, '')
 }

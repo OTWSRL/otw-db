@@ -59,11 +59,30 @@ DB_ADMIN_MAIN_DATABASES=one      # or all, the default
 `read` runs every query in a read-only transaction. The database role is still the real boundary:
 give read connections a role that may only `SELECT`.
 
+A read-only transaction stops changes to rows, and nothing else: a login that may write the
+server's files, run programs on it or change its settings (a PostgreSQL superuser, MySQL's
+`root`) still could through a connection marked `read`. So of someone's own SQL, read access
+runs only the statements that read, by their first word: `SELECT`, `WITH`, `VALUES`, `TABLE`,
+`SHOW` and `EXPLAIN` (and `DESCRIBE` on MySQL). Anything else is refused before it reaches the
+database, `COPY`, `DO`, `SET`, `CALL` and `KILL` among it. Within those, the functions known to
+reach past the database's rows are refused by name (`pg_read_file`, `lo_export`,
+`pg_terminate_backend`, `set_config`, `dblink`, `query_to_xml` and the like; `LOAD_FILE` and
+`INTO OUTFILE` on MySQL), and so is a statement that only mentions one. It's a guard, not a
+wall: no list has every function, and one the database's owner wrote can do what its owner
+may. A read connection is safe with a login that may only read.
+
 SQLite has no roles: there the file is the boundary, and the tool keeps to it. Each statement runs
 on a handle of its own, closed after it, so nothing it sets up (a transaction left open, a TEMP
 view named as a table is, a PRAGMA) reaches the next person's statement, the grid's edits or the
 app the file belongs to. `ATTACH` and `VACUUM INTO`, which reach other files on the server, are
-refused, and so is a `BEGIN` that nothing would ever commit.
+refused, and so is a `BEGIN` that nothing would ever commit. So are the PRAGMAs that set a limit
+for every SQLite file the server has open (`hard_heap_limit`, `soft_heap_limit`,
+`temp_store_directory`, `data_store_directory`); reading them, and every other PRAGMA, is as it
+was. Someone's own SQL runs in a process of its own (about 40 MB), started with the first
+statement and let go of after a minute's rest: a statement past its time limit is killed with
+it, where a thread could only be asked to stop, and so is one still running when the server
+itself goes. A write killed that way is undone before the grid's next read. Where the server
+can't start a process, it runs on a thread, as before.
 
 A PostgreSQL connection opens one database at a time, the URL's first. Its login may connect to
 others on the same server, as a superuser can to all, and the tool lists those: every database
@@ -160,7 +179,8 @@ export const dbAdmin = createDbAdmin({
 npx @otwdesign/db-next init
 ```
 
-It writes one route file, adds a password to `.env.local`, and installs `@otwdesign/db-next`.
+It writes one route file and installs `@otwdesign/db-next`. The password is yours to choose: set
+`DB_ADMIN_PASSWORD` (16 characters or more) in `.env.local` and in your host's settings.
 [examples/next](examples/next) is the app it leaves, with its tests.
 
 ```ts

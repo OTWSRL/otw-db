@@ -445,13 +445,25 @@ describe('the PostgreSQL driver', () => {
       await expect(
         db.query("INSERT INTO shop.products (name, price) VALUES ('x', 1)", read),
       ).rejects.toMatchObject({
+        code: 'not-allowed',
+        message: expect.stringContaining('not INSERT'),
+      })
+      // Inside a statement that reads, a write is the database's to refuse.
+      await expect(
+        db.query(
+          "WITH x AS (INSERT INTO shop.products (name, price) VALUES ('x', 1) RETURNING 1) SELECT * FROM x",
+          read,
+        ),
+      ).rejects.toMatchObject({
         sqlState: '25006',
-        message: 'cannot execute INSERT in a read-only transaction',
       })
     })
 
     it('runs one statement only, so COMMIT can’t end the read-only transaction for the next', async () => {
       await expect(db.query('COMMIT; DROP TABLE shop.orders', read)).rejects.toMatchObject({
+        code: 'not-allowed',
+      })
+      await expect(db.query('SELECT 1; DROP TABLE shop.orders', read)).rejects.toMatchObject({
         sqlState: '42601',
         message: 'cannot insert multiple commands into a prepared statement',
       })
@@ -459,13 +471,56 @@ describe('the PostgreSQL driver', () => {
     })
 
     it('leaves nothing on the connection for the next query: settings, roles, session locks', async () => {
-      await db.query("SELECT set_config('application_name', 'leaked', false)", read)
-      await db.query('SELECT pg_advisory_lock(4242)', read)
+      // Read access takes neither: a setting for the session and a session's lock aren't reads.
+      for (const sql of [
+        "SELECT set_config('application_name', 'leaked', false)",
+        'SELECT pg_advisory_lock(4242)',
+        "SET application_name = 'leaked'",
+      ]) {
+        await expect(db.query(sql, read), sql).rejects.toMatchObject({ code: 'not-allowed' })
+      }
       const [name] = (await db.query('SHOW application_name', read)).rows[0]!
       expect(name).toBe('otw-db')
-      const [free] = (await other.query('SELECT pg_try_advisory_lock(4242)', read)).rows[0]!
+      const [free] = (await other.query('SELECT pg_try_advisory_lock(4242)', write)).rows[0]!
       expect(free).toBe('t')
     })
+  })
+
+  describe('a statement canceled as it ends', () => {
+    it('leaves no connection in the pool inside a failed transaction, and stops nobody else’s', async () => {
+      // A cancel names a connection, not a statement. Sent as a read finishes, it lands on the
+      // driver's own BEGIN or cleanup, or on the next statement to use the connection.
+      const racing = postgresDriver(inject('postgresUrl'))
+      try {
+        const until = Date.now() + 2_500
+        let others = 0
+        const bystander = (async () => {
+          while (Date.now() < until) {
+            await racing.query('SELECT 1 AS one', read)
+            others += 1
+          }
+        })()
+        while (Date.now() < until) {
+          const controller = new AbortController()
+          const running = racing.query('SELECT pg_sleep(0.005)', {
+            ...read,
+            signal: controller.signal,
+          })
+          setTimeout(() => controller.abort(), 5 + Math.random() * 3)
+          await running.catch(() => {})
+        }
+        // Nobody else's statement was stopped by a cancel meant for another.
+        await bystander
+        expect(others).toBeGreaterThan(10)
+        // And every connection the pool hands out now takes a query.
+        for (let i = 0; i < 12; i++) {
+          expect((await racing.query('SELECT 1 AS one', read)).rows).toEqual([['1']])
+          expect(await racing.tables()).toBeDefined()
+        }
+      } finally {
+        await racing.close()
+      }
+    }, 20_000)
   })
 
   describe('with write access', () => {
@@ -502,12 +557,37 @@ describe('the PostgreSQL driver', () => {
       ).toEqual([['0']])
     })
 
+    it('doesn’t run a statement on its own once it was canceled, between its two tries', async () => {
+      // A signal that fires in the stretch when nobody is listening: after the first try (in a
+      // transaction, which VACUUM refuses) and before the second (alone).
+      const real = new AbortController()
+      const signal = Object.create(real.signal) as AbortSignal
+      Object.defineProperties(signal, {
+        aborted: { get: () => real.signal.aborted },
+        addEventListener: { value: real.signal.addEventListener.bind(real.signal) },
+        removeEventListener: {
+          value: (...args: Parameters<AbortSignal['removeEventListener']>) => {
+            real.signal.removeEventListener(...args)
+            real.abort()
+          },
+        },
+      })
+      await db.query('CREATE TABLE shop.vacuumed (id int)', write)
+      try {
+        await expect(
+          db.query('VACUUM (VERBOSE) shop.vacuumed', { ...write, signal }),
+        ).rejects.toMatchObject({ code: 'canceled' })
+      } finally {
+        await db.query('DROP TABLE shop.vacuumed', write)
+      }
+    })
+
     it('runs what can’t run in a transaction, such as VACUUM, on its own', async () => {
       await expect(db.query('VACUUM shop.products', write)).resolves.toMatchObject({
         command: 'VACUUM',
       })
       await expect(db.query('VACUUM shop.products', read)).rejects.toMatchObject({
-        sqlState: '25001',
+        code: 'not-allowed',
       })
     })
 

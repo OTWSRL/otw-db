@@ -28,7 +28,15 @@ export function jsonObject(
   values: readonly (string | null)[],
 ): Record<string, string | null> {
   const object: Record<string, string | null> = {}
-  names.forEach((name, i) => (object[name] = values[i] ?? null))
+  // Defined, not assigned: a column named __proto__ is a column, and assigning it sets none.
+  names.forEach((name, i) =>
+    Object.defineProperty(object, name, {
+      value: values[i] ?? null,
+      enumerable: true,
+      writable: true,
+      configurable: true,
+    }),
+  )
   return object
 }
 

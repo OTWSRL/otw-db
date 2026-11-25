@@ -129,9 +129,123 @@ describe('createDbRoute, with a password', () => {
     expect(refused.status).toBe(401)
     expect(refused.headers.get('set-cookie')).toBeNull()
     expect(await refused.text()).toContain('That isn’t the password.')
-    expect((await POST(post('/db/sign-in', null))).status).toBe(401)
+    // A form with no password in it guessed nothing: told so at once.
+    expect((await POST(post('/db/sign-in', null))).status).toBe(400)
     expect(warned).toHaveBeenCalledWith('otw-db: a sign-in at /db was refused')
     warned.mockRestore()
+  })
+
+  it('lets wrong passwords through one at a time, and turns away a crowd of them', async () => {
+    // Each wrong one waited half a second by itself: forty at once took half a second in all,
+    // and a guesser could make as many tries a second as it could open connections.
+    const { POST } = route({ DB_ADMIN_PASSWORD: PASSWORD })
+    const guess = (n: number) =>
+      POST(
+        new Request('http://localhost/db/sign-in', {
+          method: 'POST',
+          headers: { 'content-type': 'application/x-www-form-urlencoded' },
+          body: new URLSearchParams({ password: `a wrong guess, number ${n}` }),
+        }),
+      )
+    const started = performance.now()
+    const answers: { status: number; at: number }[] = []
+    const all = Promise.all(
+      Array.from({ length: 40 }, (_, n) =>
+        guess(n).then((r) => answers.push({ status: r.status, at: performance.now() - started })),
+      ),
+    )
+    await new Promise((resolve) => setTimeout(resolve, 1_200))
+    // Past the few that wait their turn, the rest are told at once to come back later.
+    const turnedAway = answers.filter((a) => a.status === 429)
+    expect(turnedAway.length).toBeGreaterThanOrEqual(30)
+    expect(Math.max(...turnedAway.map((a) => a.at))).toBeLessThan(300)
+    // And of those that wait, about two a second get their answer.
+    expect(answers.filter((a) => a.status === 401).length).toBeLessThanOrEqual(3)
+    // The right password isn't kept waiting behind them.
+    const right = await POST(
+      new Request('http://localhost/db/sign-in', {
+        method: 'POST',
+        headers: { 'content-type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({ password: PASSWORD }),
+      }),
+    )
+    expect(right.status).toBe(303)
+    expect(performance.now() - started).toBeLessThan(1_500)
+    await all
+    expect(answers.filter((a) => a.status === 401)).toHaveLength(40 - turnedAway.length)
+  }, 20_000)
+
+  it('gives a sign-in’s form two seconds to arrive, so slow ones can’t hold every place', async () => {
+    const { POST } = route({ DB_ADMIN_PASSWORD: PASSWORD })
+    const never = () =>
+      POST(
+        new Request('http://localhost/db/sign-in', {
+          method: 'POST',
+          headers: { 'content-type': 'application/x-www-form-urlencoded' },
+          body: new ReadableStream({ start() {} }),
+          // @ts-expect-error Node's fetch wants this for a body that streams.
+          duplex: 'half',
+        }),
+      )
+    const started = performance.now()
+    const slow = Array.from({ length: 8 }, never)
+    // While they hold every place, a sign-in is turned away; once they've run out of time, not.
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    const turnedAway = await POST(
+      new Request('http://localhost/db/sign-in', {
+        method: 'POST',
+        headers: { 'content-type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({ password: PASSWORD }),
+      }),
+    )
+    expect(turnedAway.status).toBe(429)
+    await new Promise((resolve) => setTimeout(resolve, 2_300))
+    const right = await POST(
+      new Request('http://localhost/db/sign-in', {
+        method: 'POST',
+        headers: { 'content-type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({ password: PASSWORD }),
+      }),
+    )
+    expect(right.status).toBe(303)
+    // Nothing was guessed by a form that never came: answered at once, with no wait to serve.
+    expect((await Promise.all(slow)).map((r) => r.status)).toEqual(Array(8).fill(400))
+    expect(performance.now() - started).toBeLessThan(3_000)
+  }, 20_000)
+
+  it('reads a few kilobytes of a sign-in’s form and no more', async () => {
+    // Megabytes sent as a password were read whole and hashed: half a gigabyte held for a guess.
+    const { POST } = route({ DB_ADMIN_PASSWORD: PASSWORD })
+    const huge = 'x'.repeat(8 * 1024 * 1024)
+    const before = process.memoryUsage().rss
+    const started = performance.now()
+    const declared = await POST(post('/db/sign-in', huge))
+    expect(declared.status).toBe(400)
+    // Nor one that doesn't say how long it is, and keeps coming.
+    let sent = 0
+    const streamed = await POST(
+      new Request('http://localhost/db/sign-in', {
+        method: 'POST',
+        headers: { 'content-type': 'application/x-www-form-urlencoded' },
+        body: new ReadableStream({
+          pull(controller) {
+            sent += 1
+            controller.enqueue(
+              new TextEncoder().encode(sent === 1 ? 'password=' : 'x'.repeat(65_536)),
+            )
+            if (sent > 200) controller.close()
+          },
+        }),
+        // @ts-expect-error Node's fetch wants this for a body that streams.
+        duplex: 'half',
+      }),
+    )
+    expect(streamed.status).toBe(400)
+    expect(sent).toBeLessThan(10)
+    expect(performance.now() - started).toBeLessThan(1_000)
+    expect(process.memoryUsage().rss - before).toBeLessThan(64 * 1024 * 1024)
+    // The right password, as a browser's form sends it, still signs in.
+    expect((await POST(post('/db/sign-in', PASSWORD))).status).toBe(303)
   })
 
   it('takes no password that isn’t set, or is too short to be safe, and says which', async () => {
@@ -140,7 +254,8 @@ describe('createDbRoute, with a password', () => {
     expect(await (await unset.GET(get('/db/sign-in'))).text()).toContain(
       'No password is set. Set <code>DB_ADMIN_PASSWORD</code>',
     )
-    expect((await unset.POST(post('/db/sign-in', ''))).status).toBe(401)
+    expect((await unset.POST(post('/db/sign-in', ''))).status).toBe(400)
+    expect((await unset.POST(post('/db/sign-in', 'any password at all here'))).status).toBe(401)
     const short = route({ DB_ADMIN_PASSWORD: 'short' })
     const page = await (await short.GET(get('/db/sign-in'))).text()
     expect(page).toContain('needs 16 characters or more')
@@ -319,6 +434,14 @@ describe('createDbRoute, in an app', () => {
     } finally {
       process.env = before
     }
+  })
+
+  it('finds the end of an address in no time, however many slashes stand in it', async () => {
+    const { GET } = route({ DB_ADMIN_PASSWORD: PASSWORD })
+    const started = performance.now()
+    const response = await GET(get(`/db/${'/'.repeat(100_000)}x/`))
+    expect(response.status).toBeGreaterThanOrEqual(200)
+    expect(performance.now() - started).toBeLessThan(500)
   })
 
   it('answers at the same place with a slash after it, as trailingSlash sends requests', async () => {

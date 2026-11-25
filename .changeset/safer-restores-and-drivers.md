@@ -94,3 +94,37 @@ Fixes from a review of the restore, the SQLite and PGlite drivers, edits and exp
   a connection the server drops while the tool holds it no longer ends the process.
 - MySQL and MariaDB: a statement past its limit whose `KILL QUERY` can't reach it has its
   connection closed two seconds later, instead of running on.
+
+**From a second review**
+
+- A restore can't be made to leave its transaction: a `--` comment ends at a carriage return, as
+  the server ends it (`COMMIT` after one ran, and the restore said nothing was restored), and
+  `PREPARE TRANSACTION` is found past comments. Behind that, the session is asked after every
+  statement whether its transaction is still open (`Session.inTransaction`, optional), and a
+  mark only that transaction has is checked before it commits.
+- A restore isn't started on a `pg` older than 8.12, which sends two statements given as one:
+  it says to update `pg`. Backups, and everything else, are as before there.
+- A table or schema whose name holds a line end no longer puts a line of SQL into a backup
+  through the file's comments.
+- The tables a restore leaves where they are keep their privileges, and a partition of a table
+  outside the schemas keeps the sequence it owns.
+- One long statement (a row of megabytes) is read in time that grows with its length, not its
+  square.
+- A restore that finished is audited once, as restored, when the browser leaves as it ends.
+- Read access runs, of someone's own SQL, only the statements that read (`SELECT`, `WITH`,
+  `VALUES`, `TABLE`, `SHOW`, `EXPLAIN`, and `DESCRIBE` on MySQL), and refuses by name the
+  functions known to reach past the database's rows. A read-only transaction doesn't hold a
+  privileged login back: with a superuser's, `COPY … TO PROGRAM` ran a command on the database's
+  server; with `root`, `INTO OUTFILE` wrote a file and `SET GLOBAL` changed the server. A write
+  typed on a read connection is now refused with that message (403, `not-allowed`) before it
+  reaches the database, where it was the database's own error (400).
+- SQLite: someone's own SQL runs in a process of its own, killed at its time limit (a thread
+  kept running, and kept the file locked), and when the server goes; a write killed part-way is
+  undone before the next read. PRAGMAs that set a limit for the whole process
+  (`hard_heap_limit`…) are refused. The first statement after a rest takes about 60 ms longer,
+  the process starting; each one after, about 0.05 ms.
+- PGlite: the site's session is put back while its queries still wait for the statement, never
+  after, when what they had just set was taken for the statement's; and a setting of the site's
+  own (`app.tenant`) that a statement set is put back too.
+- An edit to a column named `constructor`, `__proto__` and the like is checked like any other,
+  shown as it is in the grid, and kept in a JSON export.

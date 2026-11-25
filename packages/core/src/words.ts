@@ -49,3 +49,19 @@ export function firstWords(statement: string): string {
   }
   return words.join(' ')
 }
+
+/**
+ * The statement's first word in capitals, past spaces, comments, brackets and empty statements
+ * (`;COPY …` is COPY to the server). Read a character at a time: a pattern for "any number of
+ * comments" tries every way to split them when no word follows, and a statement of a hundred
+ * characters can hold the thread for hours.
+ */
+export function leadingWord(sql: string): string {
+  let at = 0
+  for (;;) {
+    at = pastComments(sql, at)
+    if (sql[at] === ';' || sql[at] === '(') at += 1
+    else break
+  }
+  return (/^[A-Za-z_]+/.exec(sql.slice(at, at + 64))?.[0] ?? '').toUpperCase()
+}

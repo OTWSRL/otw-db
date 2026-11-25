@@ -272,9 +272,16 @@ describe('PGlite shared with its host', () => {
   it('leaves the host’s connection as it was after a read, and after statements that fail', async () => {
     const client = await host()
     const driver = pgliteDriver(client)
-    await driver.query('SELECT pg_advisory_lock(9)', read)
+    // Read access doesn't take a session's lock at all; a prepared statement and a setting are
+    // what a read can leave, by a function of the host's own that does it.
+    await expect(driver.query('SELECT pg_advisory_lock(9)', read)).rejects.toMatchObject({
+      code: 'not-allowed',
+    })
+    await client.exec(`CREATE FUNCTION app.leaves() RETURNS integer LANGUAGE plpgsql AS $$
+      BEGIN PERFORM pg_advisory_lock(9); PREPARE read_left AS SELECT 3; RETURN 1; END $$`)
+    await driver.query('SELECT app.leaves()', read)
     expect(await hostState(client)).toEqual(HOST)
-    await expect(driver.query('SELECT pg_advisory_lock(10), 1 / 0', read)).rejects.toThrow(
+    await expect(driver.query('SELECT app.leaves(), 1 / 0', read)).rejects.toThrow(
       'division by zero',
     )
     await expect(driver.query('SELECT pg_advisory_lock(11), 1 / 0', write)).rejects.toThrow(
@@ -303,10 +310,9 @@ describe('PGlite shared with its host', () => {
         hosts = waits()
         await session.end(false)
       } else {
-        const sql =
-          kind === 'a statement that fails'
-            ? 'SELECT pg_advisory_lock(21), pg_sleep(0.05), 1 / 0'
-            : 'SELECT pg_advisory_lock(21), pg_sleep(0.05)'
+        // The lock is for the session to have something to put back; read access takes none.
+        const lock = kind === 'read' ? '' : 'pg_advisory_lock(21), '
+        const sql = `SELECT ${lock}pg_sleep(0.05)${kind === 'a statement that fails' ? ', 1 / 0' : ''}`
         const tools = driver.query(sql, kind === 'read' ? read : write).catch(() => {})
         hosts = waits()
         await tools
@@ -350,6 +356,46 @@ describe('PGlite shared with its host', () => {
       expect(await tenant(), sql).toBe('1')
     }
     expect(await hostState(client)).toEqual(HOST)
+    await client.close()
+  })
+
+  it('reads a statement’s first word in no time, however many comments stand before it', async () => {
+    const client = await host()
+    const driver = pgliteDriver(client)
+    const started = performance.now()
+    const shown = await driver.query('/**/'.repeat(4_000) + 'SHOW server_version', read)
+    expect(shown.command).toBe('SHOW')
+    expect((await driver.query(' '.repeat(40_000) + '(SELECT 1 AS one)', read)).rows).toEqual([
+      ['1'],
+    ])
+    expect(performance.now() - started).toBeLessThan(1_500)
+    await client.close()
+  })
+
+  it('reads a long statement’s names in no time: megabytes of one word are one word', async () => {
+    const client = await host()
+    const driver = pgliteDriver(client)
+    const started = performance.now()
+    const { rows } = await driver.query(`SELECT length('${'a'.repeat(400_000)}') AS n`, read)
+    expect(rows).toEqual([['400000']])
+    expect(performance.now() - started).toBeLessThan(1_000)
+    await client.close()
+  })
+
+  it('puts back what a statement that runs outside any transaction took from the host', async () => {
+    // DISCARD ALL refuses a transaction, so it runs alone, and resets everything the host set.
+    const client = await host()
+    const driver = pgliteDriver(client)
+    await driver.query('DISCARD ALL', write)
+    const state = await hostState(client)
+    expect({ search_path: state?.search_path, application_name: state?.application_name }).toEqual({
+      search_path: HOST.search_path,
+      application_name: HOST.application_name,
+    })
+    // What it stopped listening to is listened to again; what it dropped can't be made again.
+    expect(state?.channels).toEqual(HOST.channels)
+    // And one that fails there fails as itself.
+    await expect(driver.query('VACUUM no_such_table', write)).rejects.toThrow('no_such_table')
     await client.close()
   })
 

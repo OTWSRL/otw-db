@@ -72,8 +72,17 @@ const postgres: PostgresOptions = {
   modules: () => Promise.all([import('pg'), import('pg-cursor')]),
 }
 
-/** How long a wrong password waits for its answer: a guess costs time, a mistake little. */
+/**
+ * How long a wrong password waits for its answer, and how many may be waiting. They're answered
+ * one after another, not all at once: a guesser gets two tries a second from a server, however
+ * many connections it opens. Past the few that wait, a sign-in is turned away unread, the right
+ * password too: answered by whether it was right, it would be a guess with no wait at all.
+ */
 const WRONG_PASSWORD_MS = 500
+const WRONG_PASSWORDS_WAITING = 8
+/** How long a sign-in's form has to arrive, and how much of one is read. */
+const FORM_MS = 2_000
+const FORM_BYTES = 4_096
 
 /**
  * OTW DB as a Next.js route: `export const { GET, POST } = createDbRoute()` in
@@ -109,16 +118,16 @@ export function createDbRoute(options: DbRouteOptions = {}): DbRoute {
     return { who: user ? listedAs(list, [user.email, user.id]) : undefined }
   }
 
-  function hasSession(request: Request): boolean {
+  async function hasSession(request: Request): Promise<boolean> {
     const set = password()
-    return usable(set) && verifySession(cookieOf(request, SESSION_COOKIE), set, basePath)
+    return usable(set) && (await verifySession(cookieOf(request, SESSION_COOKIE), set, basePath))
   }
 
   /** Listed users first, so the audit log has who it was, not only that they knew the password. */
   async function authorize(request: Request): Promise<Viewer | null> {
     const { who } = await listedUser(request)
     if (who) return { id: who }
-    return hasSession(request) ? { id: 'password' } : null
+    return (await hasSession(request)) ? { id: 'password' } : null
   }
 
   let admin: DbAdmin | undefined
@@ -132,6 +141,10 @@ export function createDbRoute(options: DbRouteOptions = {}): DbRoute {
       authorize: appAuthorize ?? authorize,
     }))
 
+  /** The sign-ins being looked at or waiting for their answer, and the wait of the last wrong one. */
+  let waiting = 0
+  let lastRefusal: Promise<void> = Promise.resolve()
+
   async function signIn(request: Request): Promise<Response> {
     const set = password()
     const state = {
@@ -142,27 +155,48 @@ export function createDbRoute(options: DbRouteOptions = {}): DbRoute {
     const { who, expired } = await listedUser(request)
     if (request.method === 'GET') {
       if (who) return signedInPage(basePath, who)
-      if (hasSession(request)) return signedInPage(basePath, null)
+      if (await hasSession(request)) return signedInPage(basePath, null)
       return signInPage({ ...state, ...(expired ? { expired } : {}) })
     }
     if (!sameOrigin(request)) return new Response('Sign in from this site.', { status: 403 })
-    const given = await passwordOf(request)
-    if (!usable(set) || given === null || !samePassword(given, set)) {
-      await new Promise((resolve) => setTimeout(resolve, WRONG_PASSWORD_MS))
-      console.warn(`otw-db: a sign-in at ${basePath} was refused`)
-      return signInPage({ ...state, wrong: usable(set) }, 401)
+    // Counted at the door, before the form is read: every one of a crowd arrives before the
+    // first of them has been found wrong.
+    if (waiting >= WRONG_PASSWORDS_WAITING) {
+      return signInPage({ ...state, busy: true }, 429, { 'retry-after': '5' })
     }
-    return redirect(
-      basePath || '/',
-      sessionCookie(signSession(set, basePath), { basePath, secure: secure(request) }),
-    )
+    waiting += 1
+    try {
+      const given = await passwordOf(request)
+      // No password came (a form that never arrived, or had none): nothing was guessed, so
+      // nothing waits, and its place is free again.
+      if (given === null) return signInPage(state, 400)
+      if (!usable(set) || !samePassword(given, set)) {
+        const turn = lastRefusal.then(
+          () => new Promise<void>((resolve) => setTimeout(resolve, WRONG_PASSWORD_MS)),
+        )
+        lastRefusal = turn
+        await turn
+        console.warn(`otw-db: a sign-in at ${basePath} was refused`)
+        return signInPage({ ...state, wrong: usable(set) }, 401)
+      }
+      return redirect(
+        basePath || '/',
+        sessionCookie(await signSession(set, basePath), { basePath, secure: secure(request) }),
+      )
+    } finally {
+      waiting -= 1
+    }
   }
 
   async function handle(request: Request): Promise<Response> {
     const url = new URL(request.url)
     // Next's trailingSlash sends /db/api/rows to /db/api/rows/, which is the same place.
     if (url.pathname.length > 1 && url.pathname.endsWith('/')) {
-      url.pathname = url.pathname.replace(/\/+$/, '')
+      // Counted from the end: a pattern for "slashes at the end" is tried from every slash of
+      // a long run of them that doesn't reach it.
+      let end = url.pathname.length
+      while (end > 1 && url.pathname.charCodeAt(end - 1) === 47) end -= 1
+      url.pathname = url.pathname.slice(0, end)
       request = new Request(url, request)
     }
     if (!appAuthorize) {
@@ -183,11 +217,34 @@ export function createDbRoute(options: DbRouteOptions = {}): DbRoute {
 
 /** The password a sign-in form posted, or null where there is none to read. */
 async function passwordOf(request: Request): Promise<string | null> {
+  // A form that never finishes arriving would keep its place among the sign-ins being looked
+  // at for as long as it liked; one of megabytes would be read whole and hashed. Two seconds,
+  // and a few kilobytes: a password and nothing else.
+  if (Number(request.headers.get('content-length') ?? 0) > FORM_BYTES) return null
+  const reader = request.body?.getReader()
+  if (!reader) return null
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const late = new Promise<null>((resolve) => {
+    timer = setTimeout(() => resolve(null), FORM_MS)
+  })
+  const chunks: Uint8Array[] = []
+  let read = 0
   try {
-    const given = (await request.formData()).get('password')
-    return typeof given === 'string' && given ? given : null
+    for (;;) {
+      const next = await Promise.race([reader.read(), late])
+      if (!next) return null
+      if (next.done) break
+      read += next.value.byteLength
+      if (read > FORM_BYTES) return null
+      chunks.push(next.value)
+    }
+    const given = new URLSearchParams(Buffer.concat(chunks).toString('utf8')).get('password')
+    return given ? given : null
   } catch {
     return null
+  } finally {
+    clearTimeout(timer)
+    void reader.cancel().catch(() => {})
   }
 }
 

@@ -1,6 +1,6 @@
 {
   "name": "@otwdesign/db-next",
-  "version": "1.4.0",
+  "version": "1.4.1",
   "description": "OTW DB in a Next.js app: one route file, a password sign-in or your app's own users, and the drivers Vercel needs. npx @otwdesign/db-next init sets it up.",
   "license": "Apache-2.0",
   "author": "OTW SRL",

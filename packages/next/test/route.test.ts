@@ -30,9 +30,21 @@ afterAll(async () => {
   await rm(dir, { recursive: true, force: true })
 })
 
+/**
+ * The browser app's page, standing in for the built one: the tests run before anything is built
+ * (CI, a fresh clone), and what they check of the page is the settings the server writes into it.
+ */
+const ui = async () => ({
+  index: '<!doctype html><meta name="otw-db" content="%OTW_DB_CONFIG%"><div id="root"></div>',
+  files: {},
+})
+
 function route(env: Record<string, string | undefined>, options: DbRouteOptions = {}) {
   const audit = vi.fn<(event: AuditEvent) => void>()
-  return { ...createDbRoute({ env: { DB_ADMIN_MAIN_URL: url, ...env }, audit, ...options }), audit }
+  return {
+    ...createDbRoute({ env: { DB_ADMIN_MAIN_URL: url, ...env }, audit, ui, ...options }),
+    audit,
+  }
 }
 
 const get = (path: string, cookie?: string) =>

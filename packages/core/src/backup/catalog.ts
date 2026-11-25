@@ -53,6 +53,18 @@ const collation = (coll: string, type: string) => `CASE WHEN ${coll} <> 0
 const inSchemas = (namespace: string) =>
   `${namespace} IN (SELECT oid FROM pg_namespace WHERE nspname = ANY($1))`
 
+/**
+ * Whether the relation `c` is one a backup can't hold: a foreign table, a typed table, a table
+ * that inherits another, or a partition whose parent is outside the schemas. Nothing of such a
+ * table is in a backup either (its keys, indexes, triggers, rules, policies, statistics, the
+ * sequences its columns own): a backup that named one would name a table it doesn't make.
+ */
+export const unheld = (c: string) => `(${c}.relkind = 'f' OR ${c}.reloftype <> 0
+    OR (${c}.relkind IN ('r', 'p') AND NOT ${c}.relispartition
+        AND EXISTS (SELECT 1 FROM pg_inherits ui WHERE ui.inhrelid = ${c}.oid))
+    OR (${c}.relispartition AND NOT EXISTS (SELECT 1 FROM pg_inherits ui JOIN pg_class up ON up.oid = ui.inhparent
+          WHERE ui.inhrelid = ${c}.oid AND ${inSchemas('up.relnamespace')})))`
+
 /** The session's settings: names printed qualified, values printed so they read back the same. */
 export const SESSION_SQL = [
   `SELECT set_config('search_path', '', true)`,
@@ -121,11 +133,18 @@ export const NOT_INCLUDED_SQL = `SELECT coalesce(json_agg(json_build_object('sch
    WHERE ${inSchemas('o.connamespace')} AND ${notMember(2607, 'o.oid')}
   UNION ALL SELECT ${schemaOf('c.relnamespace')}, pg_describe_object(${PG_CLASS}, c.oid, 0) FROM pg_class c
    WHERE ${inSchemas('c.relnamespace')} AND ${notMember(PG_CLASS, 'c.oid')}
-     AND (c.relkind = 'f' OR c.reloftype <> 0
-          OR (c.relkind IN ('r','p') AND NOT c.relispartition
-              AND EXISTS (SELECT 1 FROM pg_inherits i WHERE i.inhrelid = c.oid))
-          OR (c.relispartition AND NOT EXISTS (SELECT 1 FROM pg_inherits i JOIN pg_class pc ON pc.oid = i.inhparent
-                WHERE i.inhrelid = c.oid AND ${inSchemas('pc.relnamespace')})))
+     AND c.relkind IN ('r', 'p', 'f') AND ${unheld('c')}
+  UNION ALL SELECT ${schemaOf('c.relnamespace')}, pg_describe_object(${PG_CONSTRAINT}, co.oid, 0)
+           || ' (it refers to ' || co.confrelid::regclass || ', which a backup can’t hold)'
+    FROM pg_constraint co JOIN pg_class c ON c.oid = co.conrelid JOIN pg_class rc ON rc.oid = co.confrelid
+   WHERE co.contype = 'f' AND ${inSchemas('c.relnamespace')} AND NOT ${unheld('c')}
+     AND ${inSchemas('rc.relnamespace')} AND ${unheld('rc')} AND ${notMember(PG_CLASS, 'c.oid')}
+  UNION ALL SELECT ${schemaOf('c.relnamespace')}, 'where ' || pg_describe_object(${PG_CLASS}, c.oid, 0)
+           || ' has got to (this login may not read it)'
+    FROM pg_class c
+   WHERE ${inSchemas('c.relnamespace')} AND ${notMember(PG_CLASS, 'c.oid')}
+     -- In a CASE, so the privilege is only ever asked of a sequence: asked of a table, it fails.
+     AND CASE WHEN c.relkind = 'S' THEN NOT has_sequence_privilege(c.oid, 'SELECT') ELSE false END
   UNION ALL SELECT NULL, pg_describe_object('pg_cast'::regclass, k.oid, 0) FROM pg_cast k
    WHERE k.oid >= 16384 AND ${notMember(2605, 'k.oid')} AND ${notInternal(2605, 'k.oid')}
   UNION ALL SELECT NULL, pg_describe_object('pg_event_trigger'::regclass, v.oid, 0) FROM pg_event_trigger v
@@ -220,8 +239,7 @@ const sequenceSettings = (c: string, s: string) => `json_build_object(
     'type', format_type(${s}.seqtypid, NULL), 'start', ${s}.seqstart::text,
     'increment', ${s}.seqincrement::text, 'min', ${s}.seqmin::text, 'max', ${s}.seqmax::text,
     'cache', ${s}.seqcache::text, 'cycle', ${s}.seqcycle,
-    'last', (SELECT ps.last_value::text FROM pg_sequences ps WHERE ps.schemaname = sn.nspname
-               AND ps.sequencename = ${c}.relname))`
+    'readable', has_sequence_privilege(${c}.oid, 'SELECT'))`
 
 /** Sequences of their own; an identity column's comes with its table. */
 export const SEQUENCES_SQL = `SELECT coalesce(json_agg(json_build_object(
@@ -234,7 +252,10 @@ export const SEQUENCES_SQL = `SELECT coalesce(json_agg(json_build_object(
     ORDER BY sn.nspname, c.relname), '[]')
   FROM pg_class c JOIN pg_sequence s ON s.seqrelid = c.oid JOIN pg_namespace sn ON sn.oid = c.relnamespace
   WHERE c.relkind = 'S' AND sn.nspname = ANY($1) AND ${notMember(PG_CLASS, 'c.oid')}
-    AND NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid = ${PG_CLASS} AND d.objid = c.oid AND d.deptype = 'i')`
+    AND NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid = ${PG_CLASS} AND d.objid = c.oid AND d.deptype = 'i')
+    AND NOT EXISTS (SELECT 1 FROM pg_depend d JOIN pg_class oc ON oc.oid = d.refobjid
+                     WHERE d.classid = ${PG_CLASS} AND d.objid = c.oid AND d.refclassid = ${PG_CLASS}
+                       AND d.deptype = 'a' AND ${unheld('oc')})`
 
 /** A relation's columns: types, defaults, identity and generation, collations, comments, grants. */
 const columns = (c: string) => `(SELECT coalesce(json_agg(json_build_object(
@@ -277,10 +298,7 @@ export const TABLES_SQL = `SELECT coalesce(json_agg(json_build_object(
     ORDER BY n.nspname, c.relname), '[]')
   FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
   WHERE c.relkind IN ('r', 'p') AND n.nspname = ANY($1) AND ${notMember(PG_CLASS, 'c.oid')}
-    AND c.reloftype = 0
-    AND (c.relispartition OR NOT EXISTS (SELECT 1 FROM pg_inherits i WHERE i.inhrelid = c.oid))
-    AND (NOT c.relispartition OR EXISTS (SELECT 1 FROM pg_inherits i JOIN pg_class pc ON pc.oid = i.inhparent
-           WHERE i.inhrelid = c.oid AND ${inSchemas('pc.relnamespace')}))`
+    AND NOT ${unheld('c')}`
 
 export const VIEWS_SQL = `SELECT coalesce(json_agg(json_build_object(
     'oid', c.oid, 'schema', n.nspname, 'name', c.relname, 'kind', c.relkind,
@@ -299,7 +317,10 @@ export const CONSTRAINTS_SQL = `SELECT coalesce(json_agg(json_build_object(
     ORDER BY n.nspname, c.relname, co.conname), '[]')
   FROM pg_constraint co JOIN pg_class c ON c.oid = co.conrelid JOIN pg_namespace n ON n.oid = c.relnamespace
   WHERE co.contype IN ('p', 'u', 'x', 'f') AND n.nspname = ANY($1) AND c.relkind IN ('r', 'p')
-    AND ${notMember(PG_CLASS, 'c.oid')}`
+    AND ${notMember(PG_CLASS, 'c.oid')} AND NOT ${unheld('c')}
+    -- A foreign key to a table the backup can't hold would refer to a table it doesn't make.
+    AND NOT EXISTS (SELECT 1 FROM pg_class rc WHERE rc.oid = co.confrelid
+                      AND ${inSchemas('rc.relnamespace')} AND ${unheld('rc')})`
 
 export const INDEXES_SQL = `SELECT coalesce(json_agg(json_build_object(
     'oid', x.indexrelid, 'schema', n.nspname, 'name', ic.relname, 'table', x.indrelid,
@@ -311,7 +332,8 @@ export const INDEXES_SQL = `SELECT coalesce(json_agg(json_build_object(
     ORDER BY n.nspname, ic.relname), '[]')
   FROM pg_index x JOIN pg_class ic ON ic.oid = x.indexrelid JOIN pg_class tc ON tc.oid = x.indrelid
   JOIN pg_namespace n ON n.oid = tc.relnamespace
-  WHERE n.nspname = ANY($1) AND tc.relkind IN ('r', 'p', 'm') AND ${notMember(PG_CLASS, 'tc.oid')}`
+  WHERE n.nspname = ANY($1) AND tc.relkind IN ('r', 'p', 'm') AND ${notMember(PG_CLASS, 'tc.oid')}
+    AND NOT ${unheld('tc')}`
 
 export const TRIGGERS_SQL = `SELECT coalesce(json_agg(json_build_object(
     'name', t.tgname, 'table', t.tgrelid, 'def', pg_get_triggerdef(t.oid), 'enabled', t.tgenabled,
@@ -319,14 +341,15 @@ export const TRIGGERS_SQL = `SELECT coalesce(json_agg(json_build_object(
     ORDER BY n.nspname, c.relname, t.tgname), '[]')
   FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid JOIN pg_namespace n ON n.oid = c.relnamespace
   WHERE NOT t.tgisinternal AND t.tgparentid = 0 AND n.nspname = ANY($1)
-    AND ${notMember(PG_CLASS, 'c.oid')}`
+    AND ${notMember(PG_CLASS, 'c.oid')} AND NOT ${unheld('c')}`
 
 /** Rules besides a view's own. */
 export const RULES_SQL = `SELECT coalesce(json_agg(json_build_object('name', r.rulename, 'table', r.ev_class,
     'def', pg_get_ruledef(r.oid), 'comment', obj_description(r.oid, 'pg_rewrite'))
     ORDER BY n.nspname, c.relname, r.rulename), '[]')
   FROM pg_rewrite r JOIN pg_class c ON c.oid = r.ev_class JOIN pg_namespace n ON n.oid = c.relnamespace
-  WHERE r.rulename <> '_RETURN' AND n.nspname = ANY($1) AND ${notMember(PG_CLASS, 'c.oid')}`
+  WHERE r.rulename <> '_RETURN' AND n.nspname = ANY($1) AND ${notMember(PG_CLASS, 'c.oid')}
+    AND NOT ${unheld('c')}`
 
 export const POLICIES_SQL = `SELECT coalesce(json_agg(json_build_object(
     'name', p.polname, 'table', p.polrelid, 'command', p.polcmd, 'permissive', p.polpermissive,
@@ -335,13 +358,15 @@ export const POLICIES_SQL = `SELECT coalesce(json_agg(json_build_object(
     'comment', obj_description(p.oid, 'pg_policy'))
     ORDER BY n.nspname, c.relname, p.polname), '[]')
   FROM pg_policy p JOIN pg_class c ON c.oid = p.polrelid JOIN pg_namespace n ON n.oid = c.relnamespace
-  WHERE n.nspname = ANY($1)`
+  WHERE n.nspname = ANY($1) AND NOT ${unheld('c')}`
 
 export const STATISTICS_SQL = `SELECT coalesce(json_agg(json_build_object(
     'name', quote_ident(n.nspname) || '.' || quote_ident(s.stxname),
     'def', pg_get_statisticsobjdef(s.oid), 'comment', obj_description(s.oid, 'pg_statistic_ext'))
     ORDER BY n.nspname, s.stxname), '[]')
-  FROM pg_statistic_ext s JOIN pg_namespace n ON n.oid = s.stxnamespace WHERE n.nspname = ANY($1)`
+  FROM pg_statistic_ext s JOIN pg_namespace n ON n.oid = s.stxnamespace
+  JOIN pg_class c ON c.oid = s.stxrelid
+  WHERE n.nspname = ANY($1) AND NOT ${unheld('c')}`
 
 /**
  * What depends on what, among the objects a backup creates before its data: [catalog, oid,

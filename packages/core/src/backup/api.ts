@@ -23,7 +23,13 @@ import {
   type BackupHeader,
 } from './format.ts'
 import { pgTool, runDump, runRestore, type PgTool } from './pg-tools.ts'
-import { refuseBlocked, restorePlan, restoreSql, type RestorePlan } from './restore.ts'
+import {
+  LOCK_NOT_AVAILABLE,
+  refuseBlocked,
+  restorePlan,
+  restoreSql,
+  type RestorePlan,
+} from './restore.ts'
 import * as staging from './staging.ts'
 
 /*
@@ -264,27 +270,49 @@ export async function run(ctx: BackupContext, body: Record<string, unknown>): Pr
   try {
     upload = await staging.findUpload(session, id, ctx.viewer.id)
     staging.complete(upload)
+    await confirmed(session, body.confirm)
   } catch (error) {
     await session.end(false)
     throw error
   }
   let header: BackupHeader | null = null
-  const audit = (result: { statements?: number; rows?: number }, error?: Error) =>
+  // Which file ran, and how much of it: the schemas alone are only what its first line says.
+  const audit = (result: { statements?: number; rows?: number; sha256?: string }, error?: Error) =>
     void ctx.record({
       viewer: ctx.viewer.id,
       connection: ctx.connection.name,
       ...(ctx.database ? { database: ctx.database } : {}),
       action: 'restore',
-      statement: `restore of ${header ? header.schemas.join(', ') : 'a backup'} (${upload.kind}, ${upload.size} bytes)`,
+      statement: `restore of ${header ? header.schemas.join(', ') : 'a backup'} (${[
+        upload.kind,
+        `${upload.size} bytes`,
+        ...(result.sha256 ? [`${result.statements} statements`, `sha256 ${result.sha256}`] : []),
+      ].join(', ')})`,
       durationMs: Math.round(performance.now() - started),
       ...(result.rows === undefined ? {} : { rows: result.rows }),
       ...(error ? { error: error.message } : {}),
     })
   const encoder = new TextEncoder()
+  /** The browser stopped reading: there's nobody to tell, and nobody watching what a restore does. */
+  let gone = false
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
-      const send = (line: unknown) =>
-        controller.enqueue(encoder.encode(`${JSON.stringify(line)}\n`))
+      const send = (line: unknown) => {
+        if (!gone) {
+          try {
+            controller.enqueue(encoder.encode(`${JSON.stringify(line)}\n`))
+            return
+          } catch {
+            gone = true
+          }
+        }
+        // Thrown into the restore as it reports its progress, which rolls it back.
+        throw new DbAdminError(
+          'The browser stopped listening before the restore was done, so it was stopped: nothing was restored.',
+          499,
+          'client-gone',
+        )
+      }
       try {
         const result =
           upload.kind === 'sql'
@@ -298,7 +326,14 @@ export async function run(ctx: BackupContext, body: Record<string, unknown>): Pr
                 send({ type: 'progress', statements: 0, bytes: upload.size }),
               )
         audit(result)
-        send({ type: 'done', ...result, durationMs: Math.round(performance.now() - started) })
+        const { statements, tables, rows } = result
+        send({
+          type: 'done',
+          statements,
+          tables,
+          rows,
+          durationMs: Math.round(performance.now() - started),
+        })
       } catch (error) {
         const failure =
           error instanceof DbAdminError
@@ -309,14 +344,26 @@ export async function run(ctx: BackupContext, body: Record<string, unknown>): Pr
                 'restore-failed',
               )
         audit({}, failure)
-        send({ type: 'error', error: { code: failure.code, message: failure.message } })
-        // A failed restore's upload goes too: it would only fail again.
-        await write(ctx, (s) => staging.discard(s, id)).catch((e: unknown) =>
-          console.error('otw-db: could not remove a restore’s upload', e),
-        )
+        if (!gone) {
+          try {
+            send({ type: 'error', error: { code: failure.code, message: failure.message } })
+          } catch {
+            // Gone meanwhile: the audit log has it.
+          }
+        }
+        // A failed restore's upload goes too: it would only fail again. Unless the database was
+        // busy, which passes: the upload waits for another try (a day at most).
+        if (failure.code !== 'busy') {
+          await write(ctx, (s) => staging.discard(s, id)).catch((e: unknown) =>
+            console.error('otw-db: could not remove a restore’s upload', e),
+          )
+        }
       } finally {
-        controller.close()
+        if (!gone) controller.close()
       }
+    },
+    cancel() {
+      gone = true
     },
   })
   return new Response(stream, {
@@ -347,7 +394,7 @@ async function restoreInSession(
   upload: staging.Upload,
   onHeader: (header: BackupHeader) => void,
   onProgress: (progress: { statements: number; bytes: number }) => void,
-): Promise<{ statements: number; tables: number; rows: number }> {
+): Promise<{ statements: number; tables: number; rows: number; sha256: string }> {
   try {
     // A table the site is using makes DROP wait; better to fail soon and say why.
     if (!session.exclusive) await session.query(`SET LOCAL lock_timeout = '10s'`)
@@ -363,7 +410,7 @@ async function restoreInSession(
     return result
   } catch (error) {
     await session.end(false).catch(() => {})
-    if (error instanceof QueryError && error.sqlState === '55P03') {
+    if (error instanceof QueryError && error.sqlState === LOCK_NOT_AVAILABLE) {
       throw new DbAdminError(
         'The database is busy: something is using a table the restore replaces. Nothing changed; try again in a moment.',
         409,
@@ -410,6 +457,22 @@ async function restoreTool(ctx: BackupContext): Promise<void> {
   }
   const tool = await pgTool('pg_restore', version)
   if (!tool.available) throw bad(tool.reason!)
+}
+
+/**
+ * Refuses a restore that doesn't come with the database's name, as the person typed it. The
+ * dialog asks for it; checked here, a request that skips the dialog is asked too.
+ */
+async function confirmed(session: Session, confirm: unknown): Promise<void> {
+  const { rows } = await session.query('SELECT current_database()')
+  const database = rows[0]![0]!
+  if (confirm !== database) {
+    throw new DbAdminError(
+      `To restore, send the database’s name, "${database}", as "confirm".`,
+      400,
+      'unconfirmed',
+    )
+  }
 }
 
 function mayRestore(ctx: BackupContext): void {

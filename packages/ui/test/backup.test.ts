@@ -51,13 +51,17 @@ describe('api.restore', () => {
   afterEach(() => vi.unstubAllGlobals())
 
   it('sends the file in the pieces the server asks for, retrying a failed one, then runs it', async () => {
-    const calls: { url: string; size?: number }[] = []
+    const calls: { url: string; size?: number; sent?: unknown }[] = []
     let failures = 1
     vi.stubGlobal(
       'fetch',
       vi.fn(async (url: string, init: RequestInit) => {
         const body = init.body
-        calls.push({ url, ...(body instanceof Blob ? { size: body.size } : {}) })
+        calls.push({
+          url,
+          ...(body instanceof Blob ? { size: body.size } : {}),
+          ...(typeof body === 'string' ? { sent: JSON.parse(body) } : {}),
+        })
         if (url.endsWith('/restore-start')) {
           return Response.json({ upload: 'u1', chunkBytes: 4 })
         }
@@ -80,6 +84,7 @@ describe('api.restore', () => {
       'main',
       new Blob(['0123456789']),
       'sql',
+      'archive',
       (n) => sent.push(n),
       (line) => lines.push(line.type),
     )
@@ -95,6 +100,53 @@ describe('api.restore', () => {
       '/db/api/restore-run',
     ])
     expect(calls.filter((c) => c.size !== undefined).map((c) => c.size)).toEqual([4, 4, 4, 2])
+    // The name the person typed goes with the run: the server restores nothing without it.
+    expect(calls.at(-1)?.sent).toEqual({
+      connection: 'main',
+      upload: 'u1',
+      confirm: 'archive',
+      database: 'archive',
+    })
+  })
+
+  it('runs an upload that is already there again, without sending the file a second time', async () => {
+    const calls: { url: string; sent?: unknown }[] = []
+    let runs = 0
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string, init: RequestInit) => {
+        calls.push({
+          url,
+          ...(typeof init.body === 'string' ? { sent: JSON.parse(init.body) } : {}),
+        })
+        if (url.endsWith('/restore-start')) return Response.json({ upload: 'u1', chunkBytes: 100 })
+        if (url.includes('/restore-chunk')) return Response.json({ received: 10 })
+        if (url.endsWith('/restore-discard')) return Response.json({ discarded: true })
+        runs += 1
+        return new Response(
+          runs === 1
+            ? '{"type":"error","error":{"code":"busy","message":"The database is busy"}}\n'
+            : '{"type":"done","statements":2,"tables":1,"rows":3,"durationMs":5}\n',
+        )
+      }),
+    )
+    const api = createApi({ api: '/db/api' }, () => {})
+    const upload = await api.restoreUpload('main', new Blob(['0123456789']), 'sql', () => {})
+    expect(upload).toBe('u1')
+    const busy = await api.restoreRun('main', upload, 'shop', () => {})
+    expect(busy).toMatchObject({ type: 'error', error: { code: 'busy' } })
+    const done = await api.restoreRun('main', upload, 'shop', () => {})
+    expect(done.type).toBe('done')
+    await api.restoreDiscard('main', 'u2')
+    expect(calls.map((c) => c.url)).toEqual([
+      '/db/api/restore-start',
+      '/db/api/restore-chunk?connection=main&upload=u1&seq=0',
+      '/db/api/restore-run',
+      '/db/api/restore-run',
+      '/db/api/restore-discard',
+    ])
+    expect(calls[3]!.sent).toEqual({ connection: 'main', upload: 'u1', confirm: 'shop' })
+    expect(calls[4]!.sent).toEqual({ connection: 'main', upload: 'u2' })
   })
 
   it('drops the upload when a piece can’t be sent', async () => {
@@ -119,6 +171,7 @@ describe('api.restore', () => {
         'main',
         new Blob(['0123456789']),
         'sql',
+        'main',
         () => {},
         () => {},
       ),

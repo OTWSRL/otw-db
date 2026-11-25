@@ -1,8 +1,13 @@
 export { connectionsFromEnv, driverKind } from './connections.ts'
 export { openDriver, type DriverOptions } from './drivers/index.ts'
 export { backtick, mysqlDriver, mysqlLiteral } from './drivers/mysql.ts'
-export { sqliteDriver, sqliteLiteral, sqlitePath } from './drivers/sqlite.ts'
-export { pgliteDriver, type PGliteLike, type PGliteQueryable } from './drivers/pglite.ts'
+export { sqliteDriver, sqliteLiteral, sqlitePath, type SqliteOptions } from './drivers/sqlite.ts'
+export {
+  pgliteDriver,
+  type PGliteLike,
+  type PGliteOptions,
+  type PGliteQueryable,
+} from './drivers/pglite.ts'
 export { postgresDriver, type PostgresModules, type PostgresOptions } from './drivers/postgres.ts'
 export { literal as literalPostgres, quote as quotePostgres } from './drivers/postgres-catalog.ts'
 export { ConnectionError, DbAdminError, QueryError } from './errors.ts'

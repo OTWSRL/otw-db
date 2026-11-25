@@ -405,6 +405,30 @@ describe('createDbAdmin', () => {
       )
     })
 
+    it('hands the driver what each edited cell held, so it can refuse a stale edit', async () => {
+      const fake = fakeDriver()
+      const apply = vi.spyOn(fake.driver, 'apply')
+      const { admin } = setup({}, fake)
+      const edit = {
+        type: 'update',
+        key: { id: '1' },
+        values: { title: 'Changed', body: 'x' },
+        original: { title: 'Old', body: null },
+      }
+      const { status } = await json(
+        await admin.fetch(
+          call('/db/api/apply', { body: body({ changes: [edit, changes[1], changes[2]] }) }),
+        ),
+      )
+      expect(status).toBe(200)
+      expect(apply).toHaveBeenCalledWith(
+        { schema: 'public', table: 'posts' },
+        // An edit that says nothing of what its cell held goes by its key alone, as before.
+        [edit, { type: 'update', key: { id: '1' }, values: { title: 'Changed' } }, changes[2]],
+        expect.objectContaining({ dryRun: false }),
+      )
+    })
+
     it('shows the statements of a dry run without applying them or auditing', async () => {
       const { admin, audit } = setup()
       const { body: answer } = await json(
@@ -433,6 +457,14 @@ describe('createDbAdmin', () => {
       [
         [{ type: 'update', key: { id: '1' }, values: {} }],
         '"changes[0].values" names 1 to 1000 columns.',
+      ],
+      [
+        [{ type: 'update', key: { id: '1' }, values: { a: 'b' }, original: { a: 5 } }],
+        '"changes[0].original.a" is text or null.',
+      ],
+      [
+        [{ type: 'update', key: { id: '1' }, values: { a: 'b' }, original: ['b'] }],
+        '"changes[0].original" maps column names to values.',
       ],
       [[{ type: 'delete', key: { id: null } }], '"changes[0].key.id" is text.'],
       [[{ type: 'delete', key: { id: 1 } }], '"changes[0].key.id" is text.'],
@@ -974,8 +1006,32 @@ describe('a connection’s other databases', () => {
     expect([status, body.error.code]).toEqual([404, 'unknown-connection'])
   })
 
+  it('opens no database the server doesn’t list, so made-up names can’t push real ones out', async () => {
+    const names = ['archive', 'shop']
+    const { base, opened } = server(names)
+    const { admin } = setup({}, base)
+    const tables = (database: string) =>
+      admin.fetch(call(`/db/api/tables?connection=main&database=${database}`))
+    expect(await json(await tables('nope'))).toEqual({
+      status: 404,
+      body: {
+        error: {
+          code: 'unknown-database',
+          message:
+            'There’s no database "nope" on the server of connection "main", or its login may not open it.',
+        },
+      },
+    })
+    expect(opened).toEqual([])
+    expect((await tables('archive')).status).toBe(200)
+    // One made since the list was last read is found: a name not in it has the list read again.
+    names.push('fresh')
+    expect((await tables('fresh')).status).toBe(200)
+    expect(opened.map((d) => d.name)).toEqual(['archive', 'fresh'])
+  })
+
   it('keeps the 8 databases used last open, closing the one used longest ago', async () => {
-    const { base, opened } = server()
+    const { base, opened } = server(['shop', 'd1', 'd2', 'd3', 'd4', 'd5', 'd6', 'd7', 'd8', 'd9'])
     const { admin } = setup({}, base)
     const use = (database: string) =>
       admin.fetch(call(`/db/api/tables?connection=main&database=${database}`))

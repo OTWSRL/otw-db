@@ -182,7 +182,10 @@ interface SequenceSettings {
   max: string
   cache: string
   cycle: boolean
-  last: string | null
+  /** Whether the backing-up login may read where it has got to. */
+  readable: boolean
+  /** Where it has got to: its last value, and whether that one was handed out. */
+  state?: { last: string; called: boolean }
 }
 
 interface SequenceRow extends Owned {
@@ -292,7 +295,7 @@ interface Catalog {
 async function readCatalog(session: Session, schemas: readonly string[]): Promise<Catalog> {
   const read = <T>(sql: string) => json<T>(session, sql, [schemas])
   // One after another: a session runs one statement at a time.
-  return {
+  const catalog: Catalog = {
     schemas: await read(Q.SCHEMA_DETAILS_SQL),
     extensions: await json(session, Q.EXTENSIONS_SQL),
     needed: await read(Q.NEEDED_EXTENSIONS_SQL),
@@ -310,6 +313,34 @@ async function readCatalog(session: Session, schemas: readonly string[]): Promis
     dependencies: await json(session, Q.DEPENDENCIES_SQL),
     notIncluded: (await notIncluded(session, schemas)).map((x) => x.what),
     user: (await json<Server>(session, Q.SERVER_SQL)).user,
+  }
+  await readSequences(session, [
+    ...catalog.sequences.map((s) => s.settings),
+    ...catalog.tables.flatMap((t) =>
+      t.columns.flatMap((c) => (c.identity ? [c.identity.sequence] : [])),
+    ),
+  ])
+  return catalog
+}
+
+/**
+ * Where each sequence has got to, read from the sequence itself: its last value, and whether
+ * that one was handed out. pg_sequences shows no value for a sequence nobody has called, which
+ * is also what one looks like after ALTER SEQUENCE … RESTART: restored from that, it would start
+ * over from its first value. Many at a time, each a relation of its own.
+ */
+async function readSequences(session: Session, sequences: SequenceSettings[]): Promise<void> {
+  const readable = sequences.filter((s) => s.readable)
+  for (let at = 0; at < readable.length; at += 200) {
+    const some = readable.slice(at, at + 200)
+    const { rows } = await session.query(
+      some
+        .map((s, i) => `SELECT ${i}, last_value::text, is_called FROM ${s.name}`)
+        .join(' UNION ALL '),
+    )
+    for (const [i, last, called] of rows) {
+      some[Number(i)]!.state = { last: last!, called: called === 't' || called === 'true' }
+    }
   }
 }
 
@@ -615,9 +646,11 @@ class Plan {
         t.columns.flatMap((c) => (c.identity ? [c.identity.sequence] : [])),
       ),
     ]
-    return settings
-      .filter((s) => s.last !== null)
-      .map((s) => `SELECT pg_catalog.setval(${literal(s.name)}, ${s.last}, true);`)
+    return settings.flatMap((s) =>
+      s.state
+        ? [`SELECT pg_catalog.setval(${literal(s.name)}, ${s.state.last}, ${s.state.called});`]
+        : [],
+    )
   }
 
   postData(): string[] {
@@ -680,11 +713,14 @@ class Plan {
       if (t.forceRls) out.push(`ALTER TABLE ${name} FORCE ROW LEVEL SECURITY;`)
     }
     for (const p of c.policies) {
-      const roles = (p.roles ?? [null]).map((r) => (r === null ? 'PUBLIC' : quote(r)))
-      const statement = `CREATE POLICY ${quote(p.name)} ON ${this.#name(p.table)} AS ${p.permissive ? 'PERMISSIVE' : 'RESTRICTIVE'} FOR ${POLICY_COMMANDS[p.command] ?? 'ALL'} TO ${roles.join(', ')}${p.using ? ` USING (${p.using})` : ''}${p.check ? ` WITH CHECK (${p.check})` : ''}`
-      // A policy for a role the server lacks can't be made: without it, that role has less access,
-      // never more.
-      out.push(p.roles?.some((r) => r !== null) ? guarded(statement) : `${statement};`)
+      const head = `CREATE POLICY ${quote(p.name)} ON ${this.#name(p.table)} AS ${p.permissive ? 'PERMISSIVE' : 'RESTRICTIVE'} FOR ${POLICY_COMMANDS[p.command] ?? 'ALL'} TO `
+      const tail = `${p.using ? ` USING (${p.using})` : ''}${p.check ? ` WITH CHECK (${p.check})` : ''}`
+      const named = (p.roles ?? []).filter((r): r is string => r !== null)
+      out.push(
+        named.length && named.length === p.roles?.length
+          ? policyForRoles(p.name, head, named, tail)
+          : `${head}PUBLIC${tail};`,
+      )
     }
     for (const s of c.statistics) out.push(`${s.def};`)
     for (const s of c.sequences) {
@@ -764,10 +800,16 @@ class Plan {
     for (const t of c.triggers)
       comment(`TRIGGER ${quote(t.name)} ON ${this.#name(t.table)}`, t.comment)
     for (const r of c.rules) comment(`RULE ${quote(r.name)} ON ${this.#name(r.table)}`, r.comment)
-    for (const p of c.policies)
-      comment(`POLICY ${quote(p.name)} ON ${this.#name(p.table)}`, p.comment)
+    for (const p of c.policies) {
+      if (p.comment === null) continue
+      const on = `COMMENT ON POLICY ${quote(p.name)} ON ${this.#name(p.table)} IS ${literal(p.comment)}`
+      // A policy for roles this server has none of isn't made, so there's nothing to comment on.
+      comments.push(p.roles?.some((r) => r !== null) ? guarded(on) : `${on};`)
+    }
     for (const s of c.statistics) comment(`STATISTICS ${s.name}`, s.comment)
-    return [...comments, ...owners, ...grants]
+    const made = c.types.length + c.functions.length + c.sequences.length + c.tables.length
+    const fresh = made + c.views.length ? [freshPrivileges(c.schemas.map((s) => s.name))] : []
+    return [...comments, ...owners, ...fresh, ...grants]
   }
 }
 
@@ -928,10 +970,119 @@ export function guarded(statement: string): string {
 }
 
 /**
+ * A policy for named roles, made for those of them the restoring server has. Skipping it whole
+ * when one is missing would cost the others what it gave them, and a RESTRICTIVE policy gives a
+ * limit: without it, the roles that are there would see every row. With none of its roles there,
+ * nobody is left for it to apply to, and it's skipped with a notice.
+ */
+function policyForRoles(name: string, head: string, roles: string[], tail: string): string {
+  const body = `
+DECLARE
+  roles text;
+BEGIN
+  SELECT pg_catalog.string_agg(pg_catalog.quote_ident(r.name), ', ' ORDER BY r.at) INTO roles
+    FROM pg_catalog.unnest(ARRAY[${roles.map(literal).join(', ')}]::text[]) WITH ORDINALITY AS r(name, at)
+   WHERE EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = r.name);
+  IF roles IS NULL THEN
+    RAISE NOTICE 'otw-db skipped: policy % is for roles this server has none of', ${literal(name)};
+    RETURN;
+  END IF;
+  EXECUTE ${literal(head)} || roles || ${literal(tail)};
+EXCEPTION WHEN insufficient_privilege THEN
+  RAISE NOTICE 'otw-db skipped: %', SQLERRM;
+END
+`
+  const tag = dollarTag(body)
+  return `DO ${tag}${body}${tag};`
+}
+
+/**
+ * Puts the privileges of what the restore just made in `schemas` (the kinds emptySchema drops, and
+ * no others: what stays through a restore keeps its own) back to a new object's own,
+ * before the backup's grants and revokes, which are written as changes from exactly that. A
+ * server's default privileges (ALTER DEFAULT PRIVILEGES, as hosted servers set for their API
+ * roles) give each new object more than that, or less: left alone, a function the backup had
+ * revoked from everyone would come back callable by those roles.
+ */
+function freshPrivileges(schemas: string[]): string {
+  const notMember = (catalog: number, oid: string) =>
+    `NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depend e WHERE e.classid = ${catalog} AND e.objid = ${oid} AND e.deptype = 'e')`
+  const entries = (acl: string) =>
+    `SELECT a.grantee, a.privilege_type, a.is_grantable FROM pg_catalog.aclexplode(${acl}) a`
+  const body = `
+DECLARE
+  fix text;
+BEGIN
+  FOREACH fix IN ARRAY ARRAY(
+    WITH made AS (
+      SELECT CASE c.relkind WHEN 'S' THEN 'SEQUENCE' ELSE 'TABLE' END AS kind,
+             pg_catalog.format('%I.%I', n.nspname, c.relname) AS name, c.relacl AS acl,
+             pg_catalog.acldefault(CASE c.relkind WHEN 'S' THEN 's' ELSE 'r' END::"char", c.relowner) AS fresh
+        FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+       WHERE n.nspname = ANY (ARRAY[${schemas.map(literal).join(', ')}]::text[]) AND c.relacl IS NOT NULL
+         AND c.relkind IN ('r', 'p', 'v', 'm', 'f', 'S') AND ${notMember(Q.PG_CLASS, 'c.oid')}
+      UNION ALL
+      SELECT 'ROUTINE', p.oid::pg_catalog.regprocedure::text, p.proacl, pg_catalog.acldefault('f', p.proowner)
+        FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+        JOIN pg_catalog.pg_language l ON l.oid = p.prolang
+       WHERE n.nspname = ANY (ARRAY[${schemas.map(literal).join(', ')}]::text[]) AND p.proacl IS NOT NULL
+         -- Those a restore makes, as emptySchema drops them: an aggregate or a C function stays
+         -- through a restore, and its privileges are its own.
+         AND p.prokind IN ('f', 'p', 'w') AND l.lanname NOT IN ('c', 'internal')
+         AND ${notMember(Q.PG_PROC, 'p.oid')}
+      UNION ALL
+      SELECT 'TYPE', pg_catalog.format('%I.%I', n.nspname, t.typname), t.typacl, pg_catalog.acldefault('T', t.typowner)
+        FROM pg_catalog.pg_type t JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace
+       WHERE n.nspname = ANY (ARRAY[${schemas.map(literal).join(', ')}]::text[]) AND t.typacl IS NOT NULL
+         AND ${notMember(Q.PG_TYPE, 't.oid')}
+         AND (t.typtype IN ('d', 'e', 'r') OR (t.typtype = 'c' AND EXISTS (
+               SELECT 1 FROM pg_catalog.pg_class r WHERE r.oid = t.typrelid AND r.relkind = 'c')))
+    ),
+    changes AS (
+      SELECT m.kind, m.name, true AS more, x.grantee, x.privilege_type
+        FROM made m CROSS JOIN LATERAL (${entries('m.acl')} EXCEPT ${entries('m.fresh')}) x
+      UNION ALL
+      SELECT m.kind, m.name, false, x.grantee, x.privilege_type
+        FROM made m CROSS JOIN LATERAL (${entries('m.fresh')} EXCEPT ${entries('m.acl')}) x
+    )
+    -- What a default added is revoked before what it took away is granted: a privilege that came
+    -- with a grant option is both.
+    SELECT pg_catalog.format(
+             CASE WHEN c.more THEN 'REVOKE %s ON %s %s FROM %s' ELSE 'GRANT %s ON %s %s TO %s' END,
+             c.privilege_type, c.kind, c.name,
+             CASE WHEN c.grantee = 0 THEN 'PUBLIC' ELSE pg_catalog.quote_ident(pg_catalog.pg_get_userbyid(c.grantee)) END)
+      FROM changes c ORDER BY c.more DESC, c.kind, c.name, c.grantee, c.privilege_type
+  ) LOOP
+    BEGIN
+      EXECUTE fix;
+    EXCEPTION WHEN insufficient_privilege THEN
+      RAISE NOTICE 'otw-db skipped: %', SQLERRM;
+    END;
+  END LOOP;
+END
+`
+  const tag = dollarTag(body)
+  return `DO ${tag}${body}${tag};`
+}
+
+/**
+ * Whether the table `c` is one a backup can't hold, and so one a restore leaves where it is: a
+ * typed table, or one that inherits another. (Foreign tables are their own kind, and a partition
+ * goes or stays with its parent.)
+ */
+const KEPT_TABLE = (
+  c: string,
+) => `(${c}.reloftype <> 0 OR (${c}.relkind IN ('r', 'p') AND NOT ${c}.relispartition
+           AND EXISTS (SELECT 1 FROM pg_catalog.pg_inherits ki WHERE ki.inhrelid = ${c}.oid)))`
+
+/**
  * A schema emptied of what a backup makes again, or made, with `made` run after, when the server
  * hasn't got it. Emptying keeps the schema itself, its owner and its privileges as they are. It
- * drops extensions, tables, views, sequences, functions and types; operators, aggregates and the
- * like, which a backup can't hold, stay.
+ * drops extensions, tables, views, sequences, functions and types. What a backup can't hold
+ * stays: operators, aggregates and the like, and the tables it can't hold (foreign tables, typed
+ * tables, tables that inherit another) with the sequences their columns own. One of those that
+ * needs something dropped here would go with it, by CASCADE: the restore's plan looks for that
+ * first, and refuses.
  */
 export function emptySchema(schema: string, made: string[]): string {
   const target = literal(schema)
@@ -962,11 +1113,15 @@ ${then}
       UNION ALL
       SELECT CASE WHEN c.relkind IN ('v', 'm') THEN 2 ELSE 3 END, c.relname,
              pg_catalog.format('DROP %s IF EXISTS %I.%I CASCADE', CASE c.relkind WHEN 'v' THEN 'VIEW'
-               WHEN 'm' THEN 'MATERIALIZED VIEW' WHEN 'S' THEN 'SEQUENCE' WHEN 'f' THEN 'FOREIGN TABLE'
-               ELSE 'TABLE' END, target, c.relname)
+               WHEN 'm' THEN 'MATERIALIZED VIEW' WHEN 'S' THEN 'SEQUENCE' ELSE 'TABLE' END, target, c.relname)
         FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-       WHERE n.nspname = target AND c.relkind IN ('v', 'm', 'r', 'p', 'f', 'S') AND NOT c.relispartition
+       WHERE n.nspname = target AND c.relkind IN ('v', 'm', 'r', 'p', 'S') AND NOT c.relispartition
          AND ${notMember(Q.PG_CLASS, 'c.oid')}
+         AND NOT ${KEPT_TABLE('c')}
+         AND NOT (c.relkind = 'S' AND EXISTS (SELECT 1 FROM pg_catalog.pg_depend o
+               JOIN pg_catalog.pg_class oc ON oc.oid = o.refobjid
+              WHERE o.classid = ${Q.PG_CLASS} AND o.objid = c.oid AND o.refclassid = ${Q.PG_CLASS}
+                AND o.deptype IN ('a', 'i') AND (oc.relkind = 'f' OR ${KEPT_TABLE('oc')})))
       UNION ALL
       SELECT 4, p.proname, pg_catalog.format('DROP ROUTINE IF EXISTS %s CASCADE', p.oid::pg_catalog.regprocedure)
         FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace

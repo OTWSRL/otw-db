@@ -237,7 +237,13 @@ function schemaOf(database: string, schemas: string[]): string {
   const out = pgDump(args, env)
   return out
     .split('\n')
-    .filter((line) => !/^\\(un)?restrict /.test(line) && !line.startsWith('-- Dumped'))
+    .filter(
+      (line) =>
+        !/^\\(un)?restrict /.test(line) &&
+        !line.startsWith('-- Dumped') &&
+        // A stamp some server builds give each column as it's made: never the same twice.
+        !/ SET \(pg_attver=\d+\);$/.test(line),
+    )
     .join('\n')
 }
 
@@ -404,7 +410,7 @@ describe('a PostgreSQL backup', () => {
         tables: 10,
       })
       await expect(restore(target, file)).rejects.toThrow(
-        /Restoring would also drop what's outside the backup's schemas \(public, odd "schema"\):\nrule _RETURN on view reporting.names needs table public.people/,
+        /Restoring would also drop what the backup can't hold, or what's outside its schemas \(public, odd "schema"\):\nrule _RETURN on view reporting.names needs table public.people/,
       )
     } finally {
       await run(TARGET, 'DROP SCHEMA reporting CASCADE')

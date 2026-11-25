@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import { DbAdminError, QueryError, type Driver } from '../src/index.ts'
+import { DbAdminError, exportStream, QueryError, type Driver } from '../src/index.ts'
 
 /** A database for the suite: its driver, where its tables live, and what's slow there. */
 export interface Fixture {
@@ -9,6 +9,15 @@ export interface Fixture {
   product: string
   /** A statement that runs for several seconds, to time out and cancel. */
   slow: string
+  /** A column type that holds bytes, fit for a primary key: `BYTEA`, `VARBINARY(8)`, `BLOB`. */
+  bytes: string
+  /** Bytes as a literal in this database's SQL, from their hex. */
+  hex(hex: string): string
+  /**
+   * CREATE TABLE conf_made: `id`, a key the database numbers itself (always, where it can be
+   * told so); `a`, an integer; and `b`, generated as `a * 2`.
+   */
+  made: string
   /** Closes what the fixture opened beside the driver. */
   close?(): Promise<void>
 }
@@ -67,7 +76,15 @@ export function conformance(name: string, open: () => Promise<Fixture>) {
 
     afterAll(async () => {
       if (!f) return
-      for (const table of ['conf_items', 'conf_big', 'conf_digits', 'conf_tmp', 'conf_sneaky']) {
+      for (const table of [
+        'conf_items',
+        'conf_big',
+        'conf_digits',
+        'conf_tmp',
+        'conf_sneaky',
+        'conf_bytes',
+        'conf_made',
+      ]) {
         await f.driver.query(`DROP TABLE IF EXISTS ${table}`, write)
       }
       await f.driver.close()
@@ -290,6 +307,198 @@ export function conformance(name: string, open: () => Promise<Fixture>) {
         LIMITS,
       )
       expect(result.applied).toBe(true)
+    })
+
+    it('saves nothing when a cell was changed after the person read it', async () => {
+      // Someone else changes lamp's note and price while an edit of that note waits to be saved.
+      await f.driver.query(`UPDATE conf_items SET note = 'theirs', price = 99 WHERE id = 3`, write)
+      const before = await all()
+      const refused = f.driver.apply(
+        items(),
+        [
+          {
+            type: 'update',
+            key: { id: '2' },
+            values: { name: 'tome' },
+            original: { name: 'book' },
+          },
+          { type: 'update', key: { id: '3' }, values: { note: 'mine' }, original: { note: null } },
+        ],
+        LIMITS,
+      )
+      await expect(refused).rejects.toMatchObject({ code: 'conflict', status: 409 })
+      await expect(refused).rejects.toThrow(
+        /^Nothing was saved: note was changed by someone else meanwhile, from NULL to 'theirs'\.\nUPDATE .*SET .*note.* = 'mine' WHERE .*id.* = '3'$/,
+      )
+      // All or nothing: the first edit, which nobody was in the way of, isn't saved either.
+      expect(await all()).toEqual(before)
+      // An edit of a cell nobody changed is saved, whatever else in its row changed.
+      await f.driver.apply(
+        items(),
+        [
+          {
+            type: 'update',
+            key: { id: '3' },
+            values: { name: 'light' },
+            original: { name: 'lamp' },
+          },
+        ],
+        LIMITS,
+      )
+      // Every type's value compares as the grid showed it: a decimal, a big integer, a NULL.
+      const page = await f.driver.rows(
+        { ...items(), limit: 1, offset: 0, filters: [{ column: 'id', operator: '=', value: '1' }] },
+        LIMITS,
+      )
+      const shown = Object.fromEntries(page.columns.map((c, i) => [c.name, page.rows[0]![i]!]))
+      const { id, ...original } = shown
+      expect(original.note).toBeNull()
+      await f.driver.apply(
+        items(),
+        [{ type: 'update', key: { id: id! }, values: { ...original, note: 'new' }, original }],
+        LIMITS,
+      )
+      // The row gone, an edit of it with its cells as they were is refused as before.
+      await expect(
+        f.driver.apply(
+          items(),
+          [{ type: 'update', key: { id: '999' }, values: { name: 'x' }, original: { name: 'y' } }],
+          LIMITS,
+        ),
+      ).rejects.toThrow('Nothing was saved: its row is gone or its key changed.')
+      await f.driver.query(
+        `UPDATE conf_items SET name = 'lamp', note = NULL, price = 30.25 WHERE id = 3`,
+        write,
+      )
+      await f.driver.query(`UPDATE conf_items SET note = NULL WHERE id = 1`, write)
+    })
+
+    /** A table's rows as an SQL export, whole. */
+    async function exported(table: string): Promise<string> {
+      const target = { schema: f.schema, table }
+      const stream = exportStream(
+        'sql',
+        f.driver.export({ ...target, order: [{ column: 'id' }] }, LIMITS),
+        target,
+        f.driver.sql,
+        () => {},
+      )
+      return await new Response(stream).text()
+    }
+
+    /** The export's statements, one a line as it writes them. */
+    const statements = (file: string) =>
+      file
+        .split(';\n')
+        .map((s) => s.trim())
+        .filter(Boolean)
+
+    it('finds, edits and deletes rows whose key is bytes, and writes bytes as bytes', async () => {
+      await f.driver.query('DROP TABLE IF EXISTS conf_bytes', write)
+      await f.driver.query(
+        `CREATE TABLE conf_bytes (id ${f.bytes} PRIMARY KEY, data ${f.bytes}, label VARCHAR(40))`,
+        write,
+      )
+      await f.driver.query(
+        `INSERT INTO conf_bytes (id, data, label) VALUES
+           (${f.hex('00FF10AA')}, ${f.hex('DEADBEEF')}, 'first'),
+           (${f.hex('0A0B')}, NULL, 'it''s a \\ and a "quote"')`,
+        write,
+      )
+      const target = { schema: f.schema, table: 'conf_bytes' }
+      const read = async (filters?: Parameters<Driver['rows']>[0]['filters']) =>
+        (
+          await f.driver.rows(
+            { ...target, limit: 10, offset: 0, order: [{ column: 'label' }], filters },
+            LIMITS,
+          )
+        ).rows
+      const [first, second] = await read()
+      const [firstId, firstData] = first as [string, string, string]
+      const secondId = second![0]!
+      // A filter takes a key as the grid shows it.
+      expect(await read([{ column: 'id', operator: '=', value: firstId }])).toEqual([first])
+      expect(
+        await read([{ column: 'id', operator: 'in', value: [secondId, firstId] }]),
+      ).toHaveLength(2)
+      // Edits name their row by its key as shown, and compare bytes as shown.
+      await f.driver.apply(
+        target,
+        [
+          {
+            type: 'update',
+            key: { id: firstId },
+            values: { label: 'renamed' },
+            original: { label: 'first' },
+          },
+          // Bytes typed in as the grid shows them are stored as bytes, not as those letters.
+          {
+            type: 'update',
+            key: { id: secondId },
+            values: { data: firstData },
+            original: { data: null },
+          },
+        ],
+        LIMITS,
+      )
+      const after = await read()
+      expect(after.find((r) => r[0] === firstId)).toEqual([firstId, firstData, 'renamed'])
+      expect(after.find((r) => r[0] === secondId)![1]).toBe(firstData)
+      await expect(
+        f.driver.apply(
+          target,
+          [
+            {
+              type: 'update',
+              key: { id: secondId },
+              values: { label: 'x' },
+              original: { data: null },
+            },
+          ],
+          LIMITS,
+        ),
+      ).rejects.toMatchObject({ code: 'conflict' })
+      // The SQL export puts the same rows back: bytes, a backslash and quotes as they were.
+      const before = await read()
+      const file = await exported('conf_bytes')
+      await f.driver.apply(
+        target,
+        [
+          { type: 'delete', key: { id: firstId } },
+          { type: 'delete', key: { id: secondId } },
+        ],
+        LIMITS,
+      )
+      expect(await read()).toEqual([])
+      for (const statement of statements(file)) {
+        if (statement.startsWith('INSERT')) await f.driver.query(statement, write)
+      }
+      expect(await read()).toEqual(before)
+    })
+
+    it('exports SQL that puts back a table with generated columns', async () => {
+      await f.driver.query('DROP TABLE IF EXISTS conf_made', write)
+      await f.driver.query(f.made, write)
+      await f.driver.query('INSERT INTO conf_made (a) VALUES (1), (5), (7)', write)
+      await f.driver.query('DELETE FROM conf_made WHERE a = 1', write)
+      const rows = async () =>
+        (await f.driver.query('SELECT id, a, b FROM conf_made ORDER BY id', read)).rows
+      const before = await rows()
+      expect(before).toEqual([
+        ['2', '5', '10'],
+        ['3', '7', '14'],
+      ])
+      const file = await exported('conf_made')
+      await f.driver.query('DELETE FROM conf_made', write)
+      for (const statement of statements(file)) {
+        if (statement.startsWith('INSERT')) await f.driver.query(statement, write)
+      }
+      // The keys it had, not new ones; what's generated, generated again.
+      expect(await rows()).toEqual(before)
+      // CSV and JSON still hold every column.
+      for await (const batch of f.driver.export({ schema: f.schema, table: 'conf_made' }, LIMITS)) {
+        expect(batch.columns.map((c) => c.name)).toEqual(['id', 'a', 'b'])
+      }
     })
 
     it('exports every row in batches, filtered and in order', async () => {

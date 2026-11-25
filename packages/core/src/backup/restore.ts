@@ -1,4 +1,5 @@
-import { Readable } from 'node:stream'
+import { createHash } from 'node:crypto'
+import { pipeline, Readable } from 'node:stream'
 import { createGunzip } from 'node:zlib'
 import { DbAdminError, QueryError } from '../errors.ts'
 import type { Session } from '../types.ts'
@@ -30,7 +31,11 @@ export interface RestorePlan {
     /** PostgreSQL's estimate. */
     rows: number
   }[]
-  /** Objects outside the backup's schemas that depend on what's in them: restoring would drop them. */
+  /**
+   * What restoring would drop that the backup can't make again: objects outside its schemas that
+   * depend on what's in them, and objects in them that it can't hold but that need what it
+   * replaces.
+   */
   blocked: string[]
   /** Roles the backup's owners, grants and policies name that this server lacks: those are skipped. */
   missingRoles: string[]
@@ -46,7 +51,58 @@ export interface RestoreProgress {
 /** What a restore put back: the backup's tables and rows, and the statements it ran. */
 export interface RestoreResult extends BackupSummary {
   statements: number
+  /** The SHA-256 of the file as it was sent, in hex: which file ran, for the audit log. */
+  sha256: string
 }
+
+/**
+ * What a statement of a backup never starts with. All but COPY would end the restore's one
+ * transaction, or start another, and what came after would stay whatever failed later; COPY
+ * waits for rows the file can't send, or hands them to a program. A backup holds its rows as
+ * INSERTs. A file someone edited is refused at the first of these, before it runs.
+ */
+const NEVER_IN_A_BACKUP =
+  /^(BEGIN|START|COMMIT|END|ROLLBACK|ABORT|SAVEPOINT|RELEASE|PREPARE(?=\s+TRANSACTION\b)|COPY)\b/i
+
+/** The statement's first word, past the comments and spaces before it. */
+function firstWord(statement: string): string {
+  let at = 0
+  for (;;) {
+    while (/\s/.test(statement[at] ?? '')) at += 1
+    if (statement.startsWith('--', at)) {
+      const end = statement.indexOf('\n', at)
+      if (end === -1) return ''
+      at = end + 1
+    } else if (statement.startsWith('/*', at)) {
+      // Block comments nest in PostgreSQL.
+      let depth = 0
+      do {
+        if (statement.startsWith('/*', at)) {
+          depth += 1
+          at += 2
+        } else if (statement.startsWith('*/', at)) {
+          depth -= 1
+          at += 2
+        } else at += 1
+      } while (depth > 0 && at < statement.length)
+    } else break
+  }
+  return /^[A-Za-z_]+(?:\s+[A-Za-z_]+)?/.exec(statement.slice(at))?.[0] ?? ''
+}
+
+/** Refuses a statement that would step out of the restore's transaction. */
+function refuseOutside(n: number, statement: string): void {
+  const word = NEVER_IN_A_BACKUP.exec(firstWord(statement))?.[1]
+  if (!word) return
+  throw new DbAdminError(
+    `Statement ${n.toLocaleString('en')} of the backup is ${word.toUpperCase()}, which a backup never holds: a restore is one transaction from its first statement to its last, and its rows are INSERTs. The file was changed after it was made, so nothing was restored.`,
+    400,
+    'bad-backup',
+  )
+}
+
+/** "canceling statement due to lock timeout": something else holds what a statement needs. */
+export const LOCK_NOT_AVAILABLE = '55P03'
 
 const SERVER_SQL = `SELECT json_build_object('version', current_setting('server_version_num')::int,
   'server', split_part(version(), ' ', 1) || ' ' || current_setting('server_version'))`
@@ -61,17 +117,47 @@ const SCHEMAS_SQL = `SELECT coalesce(json_agg(json_build_object('schema', s.name
   FROM unnest($1::text[]) AS s(name) LEFT JOIN pg_namespace n ON n.nspname = s.name`
 
 /**
- * What outside the schemas depends on what's in them. A column default, a view's rule, a trigger
- * or a policy belongs to its table's schema, an operator family's member to the family's; a cast,
- * a publication's table or an event trigger to none, so it's outside. The common catalogs are
+ * What a restore of the schemas would drop that the backup can't make again. First, what outside
+ * the schemas depends on what's in them. A column default, a view's rule, a trigger or a policy
+ * belongs to its table's schema, an operator family's member to the family's; a cast, a
+ * publication's table or an event trigger to none, so it's outside. The common catalogs are
  * looked up directly; pg_identify_object, slower, answers for the rest.
+ *
+ * Then, inside the schemas, what a backup can't hold and a restore leaves where it is (a foreign
+ * table, a typed table, a table that inherits another, an aggregate, an operator) but which
+ * needs something the restore replaces: dropping that, by CASCADE, would take it too. And a
+ * foreign key from a table the restore replaces to one it leaves, which the backup doesn't hold.
  */
 const BLOCKED_SQL = `WITH ns AS (SELECT oid FROM pg_namespace WHERE nspname = ANY($1)),
+  kept_table AS (
+    SELECT c.oid FROM pg_class c WHERE c.relnamespace IN (SELECT oid FROM ns)
+       AND (c.relkind = 'f' OR c.reloftype <> 0
+            OR (c.relkind IN ('r', 'p') AND NOT c.relispartition
+                AND EXISTS (SELECT 1 FROM pg_inherits i WHERE i.inhrelid = c.oid))
+            OR (c.relispartition AND NOT EXISTS (SELECT 1 FROM pg_inherits i JOIN pg_class pc ON pc.oid = i.inhparent
+                  WHERE i.inhrelid = c.oid AND pc.relnamespace IN (SELECT oid FROM ns))))),
+  -- Those tables, and the sequences their columns own, which stay with them.
+  kept_rel AS (
+    SELECT oid FROM kept_table
+    UNION SELECT s.oid FROM pg_class s JOIN pg_depend o ON o.classid = 'pg_class'::regclass AND o.objid = s.oid
+     WHERE s.relkind = 'S' AND o.refclassid = 'pg_class'::regclass AND o.deptype IN ('a', 'i')
+       AND o.refobjid IN (SELECT oid FROM kept_table)),
+  kept_proc AS (
+    SELECT p.oid FROM pg_proc p JOIN pg_language l ON l.oid = p.prolang
+     WHERE p.pronamespace IN (SELECT oid FROM ns) AND (p.prokind = 'a' OR l.lanname IN ('c', 'internal'))
+       -- Not one made along with something else, as a range type's constructors are: those go
+       -- and come back with it.
+       AND NOT EXISTS (SELECT 1 FROM pg_depend i WHERE i.classid = 'pg_proc'::regclass AND i.objid = p.oid AND i.deptype = 'i')),
   inside AS (
     SELECT 'pg_class'::regclass::oid AS cat, c.oid FROM pg_class c WHERE c.relnamespace IN (SELECT oid FROM ns)
     UNION ALL SELECT 'pg_type'::regclass::oid, t.oid FROM pg_type t WHERE t.typnamespace IN (SELECT oid FROM ns)
     UNION ALL SELECT 'pg_proc'::regclass::oid, p.oid FROM pg_proc p WHERE p.pronamespace IN (SELECT oid FROM ns)
     UNION ALL SELECT 'pg_extension'::regclass::oid, x.oid FROM pg_extension x WHERE x.extnamespace IN (SELECT oid FROM ns)
+    -- What those extensions made, wherever it is and of whatever kind: a foreign-data wrapper
+    -- has no schema, and a server built on it goes when the extension is dropped.
+    UNION SELECT m.classid, m.objid FROM pg_depend m JOIN pg_extension x ON x.oid = m.refobjid
+     WHERE m.deptype = 'e' AND m.refclassid = 'pg_extension'::regclass
+       AND x.extnamespace IN (SELECT oid FROM ns)
   ),
   deps AS (
     SELECT d.classid, d.objid, d.objsubid, d.refclassid, d.refobjid,
@@ -88,15 +174,57 @@ const BLOCKED_SQL = `WITH ns AS (SELECT oid FROM pg_namespace WHERE nspname = AN
         WHEN 'pg_amop'::regclass THEN (SELECT f.opfnamespace FROM pg_amop o JOIN pg_opfamily f ON f.oid = o.amopfamily WHERE o.oid = d.objid)
         WHEN 'pg_amproc'::regclass THEN (SELECT f.opfnamespace FROM pg_amproc o JOIN pg_opfamily f ON f.oid = o.amprocfamily WHERE o.oid = d.objid)
         ELSE (SELECT n.oid FROM pg_namespace n WHERE n.nspname = (pg_identify_object(d.classid, d.objid, d.objsubid)).schema)
-      END AS ns
+      END AS ns,
+      -- The table a dependent is part of: itself, or its index's, default's, rule's, trigger's,
+      -- policy's, constraint's or statistics' table.
+      CASE d.classid
+        WHEN 'pg_class'::regclass THEN coalesce((SELECT x.indrelid FROM pg_index x WHERE x.indexrelid = d.objid), d.objid)
+        WHEN 'pg_constraint'::regclass THEN (SELECT nullif(conrelid, 0) FROM pg_constraint WHERE oid = d.objid)
+        WHEN 'pg_attrdef'::regclass THEN (SELECT adrelid FROM pg_attrdef WHERE oid = d.objid)
+        WHEN 'pg_rewrite'::regclass THEN (SELECT ev_class FROM pg_rewrite WHERE oid = d.objid)
+        WHEN 'pg_trigger'::regclass THEN (SELECT tgrelid FROM pg_trigger WHERE oid = d.objid)
+        WHEN 'pg_policy'::regclass THEN (SELECT polrelid FROM pg_policy WHERE oid = d.objid)
+        WHEN 'pg_statistic_ext'::regclass THEN (SELECT stxrelid FROM pg_statistic_ext WHERE oid = d.objid)
+      END AS rel
     FROM pg_depend d JOIN inside i ON i.cat = d.refclassid AND i.oid = d.refobjid
     WHERE d.deptype IN ('n', 'a')
       AND NOT EXISTS (SELECT 1 FROM pg_depend e WHERE e.classid = d.classid AND e.objid = d.objid AND e.deptype = 'e')
+      -- Nor a member of an extension's operator family: the family is the extension's, its
+      -- members are listed apart.
+      AND NOT EXISTS (SELECT 1 FROM pg_depend e WHERE e.classid = 'pg_opfamily'::regclass AND e.deptype = 'e'
+            AND e.objid = CASE d.classid
+              WHEN 'pg_amop'::regclass THEN (SELECT amopfamily FROM pg_amop WHERE oid = d.objid)
+              WHEN 'pg_amproc'::regclass THEN (SELECT amprocfamily FROM pg_amproc WHERE oid = d.objid) END)
+  ),
+  judged AS (
+    SELECT deps.*,
+      ns IS NULL OR ns NOT IN (SELECT oid FROM ns) AS outside,
+      -- What the restore leaves where it is: part of a table it leaves, an aggregate or a C
+      -- function, a C type, or a kind of thing a backup never holds (an operator, a collation…).
+      coalesce(rel IN (SELECT oid FROM kept_rel), false)
+        OR (classid = 'pg_proc'::regclass AND objid IN (SELECT oid FROM kept_proc))
+        OR (classid = 'pg_type'::regclass AND EXISTS (SELECT 1 FROM pg_type t WHERE t.oid = objid
+              AND t.typtype = 'b' AND t.typcategory <> 'A'))
+        OR classid NOT IN ('pg_class'::regclass, 'pg_type'::regclass, 'pg_proc'::regclass,
+              'pg_constraint'::regclass, 'pg_attrdef'::regclass, 'pg_rewrite'::regclass,
+              'pg_trigger'::regclass, 'pg_policy'::regclass, 'pg_statistic_ext'::regclass) AS kept,
+      (refclassid = 'pg_class'::regclass AND refobjid IN (SELECT oid FROM kept_rel))
+        OR (refclassid = 'pg_proc'::regclass AND refobjid IN (SELECT oid FROM kept_proc))
+        OR (refclassid = 'pg_type'::regclass AND EXISTS (SELECT 1 FROM pg_type t WHERE t.oid = refobjid
+              AND (t.typrelid IN (SELECT oid FROM kept_rel) OR (t.typtype = 'b' AND t.typcategory <> 'A')))) AS ref_kept
+    FROM deps
   )
   SELECT coalesce(json_agg(x.what ORDER BY x.what), '[]') FROM (
     SELECT DISTINCT pg_describe_object(classid, objid, objsubid) || ' needs '
-           || pg_describe_object(refclassid, refobjid, 0) AS what
-      FROM deps WHERE ns IS NULL OR ns NOT IN (SELECT oid FROM ns) LIMIT 50) x`
+           || pg_describe_object(refclassid, refobjid, 0)
+           || CASE WHEN outside OR kept THEN '' ELSE ', which the backup can’t hold' END AS what
+      FROM judged
+     WHERE outside OR (kept AND NOT ref_kept)
+        OR (NOT kept AND refclassid = 'pg_class'::regclass AND refobjid IN (SELECT oid FROM kept_rel)
+            AND classid = 'pg_constraint'::regclass
+            AND EXISTS (SELECT 1 FROM pg_constraint co WHERE co.oid = objid AND co.contype = 'f'
+                          AND co.confrelid = refobjid))
+     LIMIT 50) x`
 
 const MISSING_ROLES_SQL = `SELECT coalesce(json_agg(r ORDER BY r), '[]') FROM unnest($1::text[]) r
   WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = r)`
@@ -142,7 +270,7 @@ export function refuseBlocked(header: BackupHeader, plan: RestorePlan): void {
   }
   if (plan.blocked.length) {
     throw new DbAdminError(
-      `Restoring would also drop what's outside the backup's schemas (${header.schemas.join(', ')}):\n${plan.blocked.join('\n')}\nBack up those schemas too, or remove what depends on them, then restore.`,
+      `Restoring would also drop what the backup can't hold, or what's outside its schemas (${header.schemas.join(', ')}):\n${plan.blocked.join('\n')}\nBack up those schemas too, or remove what's listed here, then restore.`,
       409,
       'restore-blocked',
     )
@@ -162,9 +290,11 @@ export async function restoreSql(
   },
 ): Promise<RestoreResult> {
   const progress: RestoreProgress = { statements: 0, bytes: 0 }
+  const hash = createHash('sha256')
   const counted = (async function* () {
     for await (const chunk of bytes) {
       progress.bytes += chunk.byteLength
+      hash.update(chunk)
       yield chunk
     }
   })()
@@ -177,9 +307,13 @@ export async function restoreSql(
   let reported = 0
   const run = async (statements: string[]) => {
     for (const statement of statements) {
+      refuseOutside(progress.statements + 1, statement)
       try {
         await session.query(statement)
       } catch (error) {
+        // A lock it waited too long for isn't the backup's fault: the caller says the database
+        // is busy, and keeps the upload for another try.
+        if (error instanceof QueryError && error.sqlState === LOCK_NOT_AVAILABLE) throw error
         throw failed(progress.statements + 1, statement, error)
       }
       progress.statements += 1
@@ -216,7 +350,8 @@ export async function restoreSql(
     await run(splitter.end())
   } catch (error) {
     if (error instanceof DbAdminError) throw error
-    if (error instanceof TypeError && /encoded data|invalid/i.test(error.message)) {
+    // The decoder's own refusal, by its code: other TypeErrors aren't about the file's bytes.
+    if ((error as { code?: string }).code === 'ERR_ENCODING_INVALID_ENCODED_DATA') {
       throw new DbAdminError(
         "The backup isn't valid UTF-8 text: it may be damaged.",
         400,
@@ -237,7 +372,7 @@ export async function restoreSql(
     )
   }
   options.onProgress?.({ ...progress })
-  return { ...summary, statements: progress.statements }
+  return { ...summary, statements: progress.statements, sha256: hash.digest('hex') }
 }
 
 /** The bytes as they come, unzipped when they start as gzip does. */
@@ -250,7 +385,15 @@ async function text(bytes: AsyncIterator<Uint8Array> & AsyncIterable<Uint8Array>
     yield* { [Symbol.asyncIterator]: () => bytes }
   })()
   if (head[0] !== 0x1f || head[1] !== 0x8b) return all
-  return Readable.from(all).pipe(createGunzip()) as AsyncIterable<Uint8Array>
+  // pipeline(), not pipe(): pipe() leaves the source's failure (a piece missing, a connection
+  // gone) as an 'error' event nobody hears, which ends the process, while whoever reads the text
+  // waits for good. pipeline() hands it to the reader, and stops reading pieces when the reader
+  // stops. Bytes, one piece ahead at most: a piece is 4 MB, and sixteen would wait otherwise.
+  const gunzip = createGunzip()
+  pipeline(Readable.from(all, { objectMode: false, highWaterMark: 1 }), gunzip, () => {
+    // The failure reaches the reader through gunzip, which pipeline() destroys with it.
+  })
+  return gunzip as AsyncIterable<Uint8Array>
 }
 
 /** A statement's failure, saying which and where. */

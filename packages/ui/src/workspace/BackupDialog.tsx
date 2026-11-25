@@ -277,8 +277,20 @@ function RestorePanel({
   const [planError, setPlanError] = useState<string | null>(null)
   const [typed, setTyped] = useState('')
   const [phase, setPhase] = useState<Phase>({ step: 'idle' })
+  /**
+   * An upload still waiting on the server: a restore the database was too busy for leaves it
+   * there, so trying again doesn't send the file a second time.
+   */
+  const [kept, setKept] = useState<string | null>(null)
+
+  /** Drops the upload that waits, when it won't be run after all. */
+  const forget = () => {
+    if (kept) void api.restoreDiscard(connection.name, kept).catch(() => {})
+    setKept(null)
+  }
 
   const choose = async (chosen: File | null) => {
+    forget()
     setFile(chosen)
     setWhat(null)
     setPlan(null)
@@ -304,27 +316,34 @@ function RestorePanel({
     what.kind !== 'unknown' &&
     (what.kind === 'pg_dump' ? options.pgRestore.available : plan !== null && !blocked) &&
     typed === options.database &&
-    phase.step === 'idle'
+    (phase.step === 'idle' || kept !== null)
 
   const restore = async () => {
     if (!file) return
     setBusy(true)
-    setPhase({ step: 'uploading', sent: 0 })
     try {
-      const last = await api.restore(
-        connection.name,
-        file,
-        kind,
-        (sent) => setPhase({ step: 'uploading', sent }),
-        (line) => {
-          if (line.type === 'progress') setPhase({ step: 'restoring', statements: line.statements })
-        },
-      )
+      let upload = kept
+      if (!upload) {
+        setPhase({ step: 'uploading', sent: 0 })
+        upload = await api.restoreUpload(connection.name, file, kind, (sent) =>
+          setPhase({ step: 'uploading', sent }),
+        )
+      }
+      setPhase({ step: 'restoring', statements: 0 })
+      const last = await api.restoreRun(connection.name, upload, typed, (line) => {
+        if (line.type === 'progress') setPhase({ step: 'restoring', statements: line.statements })
+      })
       if (last.type === 'done') {
+        setKept(null)
         setPhase({ step: 'done', result: last })
         onRestored()
-      } else if (last.type === 'error') setPhase({ step: 'failed', message: last.error.message })
+      } else if (last.type === 'error') {
+        // Busy passes, and the server kept the upload for it: Restore runs it again.
+        setKept(last.error.code === 'busy' ? upload : null)
+        setPhase({ step: 'failed', message: last.error.message })
+      }
     } catch (e) {
+      setKept(null)
       setPhase({ step: 'failed', message: (e as Error).message })
     } finally {
       setBusy(false)
@@ -409,7 +428,15 @@ function RestorePanel({
         )}
       </div>
       <div className="dialog-actions">
-        <button type="button" className="button" disabled={busy} onClick={onClose}>
+        <button
+          type="button"
+          className="button"
+          disabled={busy}
+          onClick={() => {
+            forget()
+            onClose()
+          }}
+        >
           {phase.step === 'done' ? 'Close' : 'Cancel'}
         </button>
         {options.restore.allowed && (
@@ -419,7 +446,7 @@ function RestorePanel({
             disabled={!ready || busy}
             onClick={() => void restore()}
           >
-            {busy ? 'Restoring…' : 'Restore'}
+            {busy ? 'Restoring…' : kept ? 'Try again' : 'Restore'}
           </button>
         )}
       </div>
@@ -453,19 +480,20 @@ function Replaces({ plan, database }: { plan: RestorePlan; database: string }) {
       </div>
       {plan.blocked.length > 0 && (
         <div className="notice" role="alert">
-          Restoring would also drop what’s outside the backup:
+          Restoring would also drop what the backup can’t bring back:
           <ul>
             {plan.blocked.map((b) => (
               <li key={b}>{b}</li>
             ))}
           </ul>
-          Back up those schemas too, or remove what depends on them.
+          Back up those schemas too, or remove what’s listed here.
         </div>
       )}
       {plan.missingRoles.length > 0 && (
         <div className="notice warning">
-          These roles aren’t on this server, so their grants and policies will be skipped:{' '}
-          {plan.missingRoles.join(', ')}.
+          These roles aren’t on this server: {plan.missingRoles.join(', ')}. Their grants will be
+          skipped, and a policy made for the other roles it names (or skipped, when it names no
+          other).
         </div>
       )}
       {plan.warnings.map((w) => (

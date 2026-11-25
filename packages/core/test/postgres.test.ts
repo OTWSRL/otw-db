@@ -730,3 +730,99 @@ describe('the server’s other databases', () => {
     )
   })
 })
+
+describe('a PostgreSQL connection the tool is still holding', () => {
+  const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
+  const big = { schema: 'shop', table: 'held_rows' }
+  /**
+   * The tool's backends sitting between two batches of an export of held_rows: mid-statement as
+   * the server sees them, waiting for the client to ask for more.
+   */
+  const HELD = `SELECT pid FROM pg_stat_activity
+    WHERE application_name = 'otw-db' AND state = 'active' AND wait_event = 'ClientRead'
+      AND query LIKE 'SELECT * FROM "shop"."held_rows"%' AND pid <> pg_backend_pid()`
+
+  beforeAll(async () => {
+    await db.query(
+      'CREATE TABLE shop.held_rows AS SELECT g AS id FROM generate_series(1, 2500) g',
+      write,
+    )
+  })
+  afterAll(async () => {
+    await db.query('DROP TABLE IF EXISTS shop.held_rows', write)
+  })
+
+  it('fails an export, and nothing else, when the server drops it between batches', async () => {
+    const driver = postgresDriver(url)
+    try {
+      const batches = driver.export(big, LIMITS)
+      expect((await batches.next()).value?.rows).toHaveLength(1000)
+      const { rows } = await other.query(
+        HELD.replace('SELECT pid', 'SELECT pg_terminate_backend(pid)'),
+        write,
+      )
+      expect(rows).toHaveLength(1)
+      // The server's goodbye arrives while no statement runs: nobody is waiting to hear it.
+      await wait(300)
+      await expect(batches.next()).rejects.toBeInstanceOf(DbAdminError)
+      expect((await driver.query('SELECT 1', read)).rows).toEqual([['1']])
+    } finally {
+      await driver.close()
+    }
+  })
+
+  it('lets go of an export nobody reads, so it doesn’t hold a connection for good', async () => {
+    const driver = postgresDriver(url, { exportIdleMs: 300 })
+    try {
+      const batches = driver.export(big, LIMITS)
+      expect((await batches.next()).value?.rows).toHaveLength(1000)
+      expect((await other.query(HELD, read)).rows).toHaveLength(1)
+      // The browser stalls: nothing asks for the next batch.
+      await wait(1_000)
+      expect((await other.query(HELD, read)).rows).toEqual([])
+      await expect(batches.next()).rejects.toMatchObject({
+        code: 'export-stalled',
+        message:
+          'The export waited 0.3 s for its rows to be read, and was stopped so its connection is free for others.',
+      })
+      // Read without stalling, the same export goes through.
+      let rows = 0
+      for await (const batch of driver.export(big, LIMITS)) rows += batch.rows.length
+      expect(rows).toBe(2500)
+    } finally {
+      await driver.close()
+    }
+  })
+
+  it('says its connections are busy, rather than wait for one for good', async () => {
+    const driver = postgresDriver(url, { connectTimeoutMs: 300 })
+    const held = await Promise.all([1, 2, 3].map(() => driver.session!('snapshot')))
+    try {
+      const started = performance.now()
+      const waiting = driver.tables()
+      await expect(waiting).rejects.toBeInstanceOf(ConnectionError)
+      await expect(waiting).rejects.toThrow(
+        'All 3 of this connection’s PostgreSQL connections are busy (an export or a backup under way, perhaps), or the server didn’t answer in 0.3 s. Try again in a moment.',
+      )
+      expect(performance.now() - started).toBeLessThan(3_000)
+    } finally {
+      await Promise.all(held.map((session) => session.end(false)))
+    }
+    expect((await driver.tables()).length).toBeGreaterThan(0)
+    await driver.close()
+  })
+})
+
+describe('a PostgreSQL driver that was closed', () => {
+  it('stays closed: used again, it says so rather than open connections nobody will close', async () => {
+    const driver = postgresDriver(url)
+    expect((await driver.query('SELECT 1', read)).rows).toEqual([['1']])
+    await driver.close()
+    const refused = driver.tables()
+    await expect(refused).rejects.toBeInstanceOf(ConnectionError)
+    await expect(refused).rejects.toThrow('This connection to PostgreSQL was closed. Try again.')
+    await expect(driver.query('SELECT 1', read)).rejects.toThrow('was closed')
+    // Closing it twice is nothing.
+    await driver.close()
+  })
+})

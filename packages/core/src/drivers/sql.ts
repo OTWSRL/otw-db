@@ -33,13 +33,58 @@ export interface Dialect {
   ): string
   /** An insert of nothing but defaults: `DEFAULT VALUES`, or MySQL's `() VALUES ()`. */
   insertDefaults: string
+  /**
+   * Bytes as the grid shows them, as a literal that is those bytes; null when the text isn't in
+   * that form. Absent where the shown form is text the database reads as bytes itself.
+   */
+  bytes?(shown: string): string | null
+  /**
+   * What ends a SELECT that holds its rows until the transaction ends: ` FOR UPDATE`, or nothing
+   * where a write transaction already holds the whole database (SQLite).
+   */
+  forUpdate: string
 }
 
-/** Parameters as a builder adds them, with their placeholders. */
+/** How long an export may wait between two batches for its reader, unless a driver is told otherwise. */
+export const EXPORT_IDLE_MS = 300_000
+
+/** Milliseconds as people read them: `10 s`, `0.3 s`. */
+export function seconds(ms: number): string {
+  return `${(ms / 1000).toLocaleString('en', { maximumFractionDigits: 1 })} s`
+}
+
+/**
+ * What an export says when it's ended because nobody read it. A browser that stays away mid-file
+ * would otherwise hold what the export holds (a connection, a cursor's rows, a lock on the file)
+ * for as long as it stays away.
+ */
+export function stalledExport(idleMs: number): DbAdminError {
+  return new DbAdminError(
+    `The export waited ${seconds(idleMs)} for its rows to be read, and was stopped so its connection is free for others.`,
+    408,
+    'export-stalled',
+  )
+}
+
+/** No column holds bytes, or the database reads their shown form itself. */
+const NO_BYTES: ReadonlySet<string> = new Set()
+
+/**
+ * Parameters as a builder adds them, with their placeholders. `bytes` names the columns that hold
+ * bytes: a value for one of them, in the form the grid shows bytes in, goes into the SQL as the
+ * bytes it stands for, not as those letters.
+ */
 export class Parameters {
   readonly values: unknown[] = []
-  constructor(private readonly dialect: Dialect) {}
-  add = (value: unknown): string => {
+  constructor(
+    private readonly dialect: Dialect,
+    private readonly bytes: ReadonlySet<string> = NO_BYTES,
+  ) {}
+  add = (value: unknown, column?: string): string => {
+    if (column !== undefined && typeof value === 'string' && this.bytes.has(column)) {
+      const literal = this.dialect.bytes?.(value)
+      if (literal != null) return literal
+    }
     if (this.dialect.inline) return this.dialect.inline(value as string | null)
     this.values.push(value)
     return this.dialect.placeholder(this.values.length)
@@ -66,21 +111,23 @@ export function where(
 ): string {
   const conditions = filters.map(({ column, operator, value }) => {
     const name = dialect.identifier(column)
-    if (COMPARISONS.has(operator)) return `${name} ${operator} ${parameters.add(value)}`
+    // Compared with the column itself, so as the column's kind: bytes where it holds bytes.
+    const add = (compared: unknown) => parameters.add(compared, column)
+    if (COMPARISONS.has(operator)) return `${name} ${operator} ${add(value)}`
     switch (operator) {
       case 'is null':
         return `${name} IS NULL`
       case 'is not null':
         return `${name} IS NOT NULL`
       case 'in':
-        return dialect.inList(name, value as readonly string[], parameters.add)
+        return dialect.inList(name, value as readonly string[], add)
       case 'not in':
-        return `NOT (${dialect.inList(name, value as readonly string[], parameters.add)})`
+        return `NOT (${dialect.inList(name, value as readonly string[], add)})`
       case 'between':
       case 'not between': {
         const [low, high] = value as readonly string[]
         const not = operator === 'not between' ? 'NOT ' : ''
-        return `${name} ${not}BETWEEN ${parameters.add(low)} AND ${parameters.add(high)}`
+        return `${name} ${not}BETWEEN ${add(low)} AND ${add(high)}`
       }
       case 'like':
         return `${dialect.text(name)} LIKE ${parameters.add(value)}`
@@ -120,46 +167,132 @@ export interface ChangeStatement {
   shown: string
   /** Updates and deletes must change exactly one row. */
   oneRow: boolean
+  /**
+   * For an update that says what its cells held when they were edited: the SELECT that reads
+   * them now and holds the row until the transaction ends, and what they held, in its order.
+   */
+  check?: {
+    text: string
+    values: (string | null)[]
+    columns: string[]
+    original: (string | null)[]
+  }
 }
 
-export function changeStatement(dialect: Dialect, target: string, change: Change): ChangeStatement {
+/**
+ * SQL with its values: `build` writes the text, calling `value` where each one goes. They become
+ * parameters to run, or go into the text where the driver sends none, and literals to show.
+ */
+function written(
+  dialect: Dialect,
+  bytes: ReadonlySet<string>,
+  build: (value: (column: string, value: string | null) => string) => string,
+): { text: string; values: (string | null)[]; shown: string } {
   const values: (string | null)[] = []
-  const shownValues: string[] = []
-  const runValues: string[] = []
+  const slots: { run: string; shown: string }[] = []
   // Placeholders are numbered here and swapped afterwards: `?` alone can't be told apart.
-  const parameter = (value: string | null) => {
-    values.push(value)
-    shownValues.push(dialect.literal(value))
-    runValues.push(dialect.inline ? dialect.inline(value) : dialect.placeholder(values.length))
-    return `\uE000${values.length}\uE000`
-  }
-  const assignments = (record: Readonly<Record<string, string | null>>) =>
-    Object.entries(record).map(
-      ([column, value]) => `${dialect.identifier(column)} = ${parameter(value)}`,
-    )
-  let text: string
-  if (change.type === 'insert') {
-    const columns = Object.keys(change.values)
-    text = columns.length
-      ? `INSERT INTO ${target} (${columns.map(dialect.identifier).join(', ')}) VALUES (${columns.map((c) => parameter(change.values[c]!)).join(', ')})`
-      : `INSERT INTO ${target} ${dialect.insertDefaults}`
-  } else {
-    // SET before WHERE, in the order the SQL has them: `?` placeholders bind by position.
-    const set = change.type === 'update' ? assignments(change.values).join(', ') : ''
-    const key = assignments(change.key).join(' AND ')
-    text =
-      change.type === 'update'
-        ? `UPDATE ${target} SET ${set} WHERE ${key}`
-        : `DELETE FROM ${target} WHERE ${key}`
-  }
+  const text = build((column, value) => {
+    const literal = value !== null && bytes.has(column) ? (dialect.bytes?.(value) ?? null) : null
+    if (literal !== null) slots.push({ run: literal, shown: literal })
+    else if (dialect.inline) {
+      slots.push({ run: dialect.inline(value), shown: dialect.literal(value) })
+    } else {
+      values.push(value)
+      slots.push({ run: dialect.placeholder(values.length), shown: dialect.literal(value) })
+    }
+    return `\uE000${slots.length}\uE000`
+  })
   // A private-use character: no SQL a driver builds contains one.
   const mark = /\uE000(\d+)\uE000/g
   return {
-    text: text.replace(mark, (_, n: string) => runValues[Number(n) - 1]!),
-    values: dialect.inline ? [] : values,
-    shown: text.replace(mark, (_, n: string) => shownValues[Number(n) - 1]!),
-    oneRow: change.type !== 'insert',
+    text: text.replace(mark, (_, n: string) => slots[Number(n) - 1]!.run),
+    values,
+    shown: text.replace(mark, (_, n: string) => slots[Number(n) - 1]!.shown),
   }
+}
+
+/**
+ * A change as the statement that makes it. `bytes` names the table's columns that hold bytes,
+ * where the database doesn't read their shown form itself.
+ */
+export function changeStatement(
+  dialect: Dialect,
+  target: string,
+  change: Change,
+  bytes: ReadonlySet<string> = NO_BYTES,
+): ChangeStatement {
+  if (change.type === 'insert') {
+    const columns = Object.keys(change.values)
+    const statement = written(dialect, bytes, (value) =>
+      columns.length
+        ? `INSERT INTO ${target} (${columns.map(dialect.identifier).join(', ')}) VALUES (${columns.map((c) => value(c, change.values[c]!)).join(', ')})`
+        : `INSERT INTO ${target} ${dialect.insertDefaults}`,
+    )
+    return { ...statement, oneRow: false }
+  }
+  const assignments =
+    (value: (column: string, value: string | null) => string) =>
+    (record: Readonly<Record<string, string | null>>) =>
+      Object.entries(record).map(
+        ([column, v]) => `${dialect.identifier(column)} = ${value(column, v)}`,
+      )
+  // SET before WHERE, in the order the SQL has them: `?` placeholders bind by position.
+  const statement = written(dialect, bytes, (value) => {
+    const set = change.type === 'update' ? assignments(value)(change.values).join(', ') : ''
+    const key = assignments(value)(change.key).join(' AND ')
+    return change.type === 'update'
+      ? `UPDATE ${target} SET ${set} WHERE ${key}`
+      : `DELETE FROM ${target} WHERE ${key}`
+  })
+  const original = change.type === 'update' ? change.original : undefined
+  if (!original || !Object.keys(original).length) return { ...statement, oneRow: true }
+  const columns = Object.keys(original)
+  const { text, values } = written(
+    dialect,
+    bytes,
+    (value) =>
+      `SELECT ${columns.map(dialect.identifier).join(', ')} FROM ${target} WHERE ${assignments(value)(change.key).join(' AND ')}${dialect.forUpdate}`,
+  )
+  return {
+    ...statement,
+    oneRow: true,
+    check: { text, values, columns, original: columns.map((c) => original[c] ?? null) },
+  }
+}
+
+/**
+ * Refuses an update whose cells no longer hold what they did when the person edited them.
+ * `current` is the row the statement's check read, as the grid would show it, or nothing when the
+ * row is gone. The check reads inside the update's transaction and holds the row, so what it sees
+ * is what the update would overwrite.
+ */
+export function refuseChanged(
+  dialect: Dialect,
+  statement: ChangeStatement,
+  current: readonly (string | null)[] | undefined,
+): void {
+  const check = statement.check
+  if (!check) return
+  if (!current) {
+    throw new DbAdminError(
+      `Nothing was saved: its row is gone or its key changed.\n${statement.shown}`,
+      409,
+      'conflict',
+    )
+  }
+  const show = (value: string | null) => {
+    const literal = dialect.literal(value)
+    return literal.length > 200 ? `${literal.slice(0, 200)}…` : literal
+  }
+  check.columns.forEach((column, i) => {
+    const now = current[i] ?? null
+    if (now === check.original[i]) return
+    throw new DbAdminError(
+      `Nothing was saved: ${column} was changed by someone else meanwhile, from ${show(check.original[i]!)} to ${show(now)}.\n${statement.shown}`,
+      409,
+      'conflict',
+    )
+  })
 }
 
 /** A whole number for SQL text, which only ever takes numbers checked here. */

@@ -22,10 +22,13 @@ a window with the schema's tables in a sidebar, tabs for tables and SQL editors,
   in the right-hand panel.
 - **Editing**, on a write connection, in tables with a primary key: double-click, Enter or type to
   edit a cell (⌘⌫ sets NULL), "+ Row" to add, Delete to remove. Edits are staged in color until ⌘S
-  shows their SQL and commits them in one transaction: all or nothing, and nothing when a row
-  changed meanwhile. ⌘Z steps back; Discard drops them.
+  shows their SQL and commits them in one transaction: all or nothing, and nothing when a cell you
+  edited was changed by someone else meanwhile, or its row is gone. ⌘Z steps back; Discard drops
+  them.
 - **Export:** a table (with its filters and order) as CSV, JSON or SQL INSERTs, streamed from the
-  server; a query's result as CSV or JSON.
+  server; a query's result as CSV or JSON. The INSERTs put the rows back as they were: bytes as
+  bytes, the keys the rows had, the columns the database computes left to it, in strings that read
+  the same whatever the session they're run in is set to.
 - **SQL editor:** completion of tables; ⌘↵ runs the statement at the cursor, ⇧⌘↵ them all, each
   with its own result; errors point at their line and column; Cancel stops the query on the server.
   Writes on a `production` connection ask first.
@@ -55,6 +58,12 @@ DB_ADMIN_MAIN_DATABASES=one      # or all, the default
 `read` runs every query in a read-only transaction. The database role is still the real boundary:
 give read connections a role that may only `SELECT`.
 
+SQLite has no roles: there the file is the boundary, and the tool keeps to it. Each statement runs
+on a handle of its own, closed after it, so nothing it sets up (a transaction left open, a TEMP
+view named as a table is, a PRAGMA) reaches the next person's statement, the grid's edits or the
+app the file belongs to. `ATTACH` and `VACUUM INTO`, which reach other files on the server, are
+refused, and so is a `BEGIN` that nothing would ever commit.
+
 A PostgreSQL connection opens one database at a time, the URL's first. Its login may connect to
 others on the same server, as a superuser can to all, and the tool lists those: every database
 but the templates and those the login has no `CONNECT` on. Each opens with the same login, access
@@ -74,24 +83,41 @@ included) does both from the browser.
   tables with their rows, keys, indexes, foreign keys, views and materialized views, functions
   and procedures, triggers and rules, row-level security and policies, statistics, comments,
   owners and privileges. What it can't hold (aggregates, operators, C functions, foreign tables,
-  table inheritance, event triggers…) is listed before you download and in the file, never left
-  out unsaid. psql restores it too:
+  typed tables, tables that inherit another, event triggers…) is listed before you download and
+  in the file, never left out unsaid; so is a foreign key from a table it holds to one it can't,
+  and a sequence the login may not read. Nothing of a table it can't hold is in the file: not its
+  keys, indexes, triggers or the sequences its columns own. psql restores it too:
   `gunzip -c backup.sql.gz | psql --single-transaction -v ON_ERROR_STOP=1 -d <url>`.
 - **pg_dump** (`.dump`), where the server running the tool has `pg_dump`, as new as the
   database: a VPS, or a container with the PostgreSQL client. Not on Vercel, or for the embedded
   database.
 
 **Restore** needs a `write` connection. It shows what the file holds and what it replaces, and
-asks you to type the database's name. Then:
+asks you to type the database's name, which the server checks too. Then:
 
 - It replaces the schemas the backup holds: what they hold is dropped and made again from the
   file. The schema itself, its owner and its privileges stay. Other schemas aren't touched, and
   if anything in them depends on what's replaced (a view on one of its tables, say), the restore
   says what and refuses.
+- What a backup can't hold stays where it is: a foreign table, an aggregate, an operator. Where
+  one of those needs something the restore replaces (a table that inherits a replaced one, an
+  aggregate on a replaced function, a server on an extension of the schema), dropping that would
+  take it too, and no backup would bring it back: the restore says what, and refuses, until you
+  remove it yourself.
+- When something is using a table the restore replaces, it waits 10 seconds, then says the
+  database is busy. The upload stays (a day at most): Try again runs it without sending the file
+  a second time.
 - It runs in one transaction: if anything fails, or the file was cut short (every backup ends
-  with a line saying it's whole), nothing changes.
-- Owners, grants and policies that name a role this server lacks are skipped, and listed first.
-  Roles aren't in a backup.
+  with a line saying it's whole), nothing changes. A file that holds what would end that
+  transaction (`COMMIT`, `BEGIN`, `ROLLBACK`…) or a `COPY` was changed after it was made, and is
+  refused. Beyond that, a restore runs the SQL its file holds, as the connection's login: restore
+  the backups you made, or trust. The audit log has the file's SHA-256 and how many statements ran.
+- Owners and grants that name a role this server lacks are skipped, and listed first. A policy
+  is made for those of its roles the server has, so what it allowed them, or kept from them, still
+  holds; with none of them here, it's skipped. Roles aren't in a backup.
+- What's restored has the privileges the backup holds, whatever this server's default privileges
+  (`ALTER DEFAULT PRIVILEGES`, as hosted servers set for their API roles) would add to it: a
+  function the backup had revoked from everyone doesn't come back callable.
 - Generated columns are computed again by the restoring server, as with pg_dump: one that calls
   `lower()` on non-English letters, say, follows that server's locale.
 - Extensions the schemas use are made where they were. The database's other extensions are made
@@ -99,7 +125,9 @@ asks you to type the database's name. Then:
   and PostgreSQL keeps no record of what a body calls.
 - The browser sends the file in 4 MB pieces, which wait in the database itself (a schema named
   `otw_db_restore`, gone afterwards): Vercel takes 4.5 MB a request, and serverless instances
-  share nothing else. A restore is 1 GB at most by default (`backups.maxRestoreBytes`).
+  share nothing else. A restore is 1 GB at most by default (`backups.maxRestoreBytes`). That
+  schema must be the connection's login's own: one another role made, which could read the pieces
+  or change them, is refused, and the restore says to drop it.
 - A `.dump` is restored with `pg_restore --clean --if-exists --single-transaction --no-owner`,
   where the server has it.
 
@@ -158,9 +186,12 @@ the drivers to the host: a Next.js site builds without the ones it doesn't insta
 administrators (the `db.manage` capability), on the site's own database (read-only unless
 `DB_ADMIN_SITE_ACCESS=write`) and any `DB_ADMIN_<NAME>_URL` connections. On a site's embedded
 database (PGlite), a heavy statement holds the whole site until it finishes, and the tool says
-so. The plugin registers four routes at boot (about 0.2 ms) and loads the tool on the first
-request to it. It brings `pg` and `pg-cursor` itself, with npm or pnpm; MySQL and MariaDB
-connections need `mysql2` installed in the site.
+so; a query's rows are read through a cursor, so only those shown are built in the site's memory.
+The connection is the site's own: after a statement or a restore, what it set on the session
+(`SET`, a role, temporary tables, locks) is undone, and what the site set is left as it was. The
+plugin registers four routes at boot (about 0.2 ms) and loads the tool on the first request to
+it. It brings `pg` and `pg-cursor` itself, with npm or pnpm; MySQL and MariaDB connections need
+`mysql2` installed in the site.
 
 **Routers that register paths one by one:** `dbAdmin.routes`, or `ROUTES` from
 `@otwdesign/db-core/routes` to register at boot without loading the tool: four patterns.
@@ -185,6 +216,18 @@ Install the ones you use; nothing else is loaded.
 
 Addresses: `postgres://…`, `mysql://…` or `mariadb://…`, and `sqlite:/path/to/file.db` (or
 `sqlite:./relative.db`; the file must exist).
+
+A PostgreSQL connection has a pool of three. A request that finds them all held for 10 seconds
+fails and says so, rather than wait (`connectTimeoutMs`, an option of `postgresDriver`). A MySQL
+statement past its time limit is stopped with `KILL QUERY`; where that can't reach it (a proxy,
+a server at its connection limit), its connection is closed two seconds later instead.
+
+An export nobody reads for 5 minutes is ended (`exportIdleMs`, an option of `postgresDriver`,
+`sqliteDriver` and `pgliteDriver`), so it doesn't hold a connection, a lock or a file for as long
+as a browser stays away. Each driver exports a table a batch at a time, whatever its size: SQLite
+on a thread of the export's own, PGlite from rows the database keeps aside, so the site's own
+queries go on between batches. On MySQL and MariaDB an export's time limit is on the server
+sending nothing: a table that keeps coming may take as long as it takes.
 
 A driver that opens one database at a time offers the server's others with `databases()`, which
 lists them, and `withDatabase(name)`, which returns a driver for one; the PostgreSQL driver has

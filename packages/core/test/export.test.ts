@@ -75,6 +75,62 @@ describe('exportStream', () => {
     )
   })
 
+  it('writes SQL that puts rows back: bytes as bytes, no computed columns, keys kept', async () => {
+    const done = vi.fn()
+    const mysql = {
+      identifier: (name: string) => `\`${name}\``,
+      literal: (value: string | null) => (value === null ? 'NULL' : `'${value}'`),
+      bytes: (shown: string) => (/^0x[0-9A-F]*$/.test(shown) ? `X'${shown.slice(2)}'` : null),
+      overriding: ' OVERRIDING SYSTEM VALUE',
+      exportHeader: '-- first\n',
+      exportFooter: '-- last\n',
+    }
+    const text = await new Response(
+      exportStream(
+        'sql',
+        batches(
+          {
+            columns: [
+              { name: 'id', identity: true },
+              { name: 'data', bytes: true },
+              { name: 'total', generated: true },
+              { name: 'note' },
+            ],
+            rows: [
+              ['1', '0x00FF', '9', '0x00FF'],
+              ['2', null, '9', null],
+              // Not bytes as they're shown: taken as the text it is.
+              ['3', 'plain', '9', 'x'],
+            ],
+          },
+          { columns: [], rows: [['4', '0x', '9', 'y']] },
+        ),
+        target,
+        mysql,
+        done,
+      ),
+    ).text()
+    expect(text).toBe(
+      [
+        '-- first',
+        "INSERT INTO `public`.`posts` (`id`, `data`, `note`) OVERRIDING SYSTEM VALUE VALUES ('1', X'00FF', '0x00FF');",
+        "INSERT INTO `public`.`posts` (`id`, `data`, `note`) OVERRIDING SYSTEM VALUE VALUES ('2', NULL, NULL);",
+        "INSERT INTO `public`.`posts` (`id`, `data`, `note`) OVERRIDING SYSTEM VALUE VALUES ('3', 'plain', 'x');",
+        "INSERT INTO `public`.`posts` (`id`, `data`, `note`) OVERRIDING SYSTEM VALUE VALUES ('4', X'', 'y');",
+        '-- last',
+        '',
+      ].join('\n'),
+    )
+    expect(done).toHaveBeenCalledWith(4)
+  })
+
+  it('writes a row of nothing but computed columns as an INSERT of defaults', async () => {
+    const only = { columns: [{ name: 'total', generated: true }], rows: [['1'], ['2']] }
+    expect((await render('sql', only)).text).toBe(
+      'INSERT INTO "public"."posts" DEFAULT VALUES;\n'.repeat(2),
+    )
+  })
+
   it('writes a table with no rows as its header, or an empty array', async () => {
     expect((await render('csv', { columns, rows: [] })).text).toBe('id,title\r\n')
     expect(JSON.parse((await render('json', { columns, rows: [] })).text)).toEqual([])

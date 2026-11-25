@@ -32,7 +32,11 @@ describe('stagedReducer', () => {
       { type: 'edit', ...one, column: 'title', value: 'New', original: 'Old' },
       { type: 'edit', ...one, column: 'body', value: null, original: 'text' },
     )
-    expect(state.updates[one.id]).toEqual({ key: one.key, values: { title: 'New', body: null } })
+    expect(state.updates[one.id]).toEqual({
+      key: one.key,
+      values: { title: 'New', body: null },
+      original: { title: 'Old', body: 'text' },
+    })
     const back = stagedReducer(state, {
       type: 'edit',
       ...one,
@@ -40,7 +44,11 @@ describe('stagedReducer', () => {
       value: 'Old',
       original: 'Old',
     })
-    expect(back.updates[one.id]!.values).toEqual({ body: null })
+    expect(back.updates[one.id]).toEqual({
+      key: one.key,
+      values: { body: null },
+      original: { body: 'text' },
+    })
     const none = stagedReducer(back, {
       type: 'edit',
       ...one,
@@ -50,6 +58,29 @@ describe('stagedReducer', () => {
     })
     expect(none.updates).toEqual({})
     expect(stagedCount(none)).toBe(0)
+  })
+
+  it('remembers what a cell held when it was first edited, whatever the page shows later', () => {
+    // Edited, then the page is read again with someone else's change under the staged edit.
+    const state = run(
+      { type: 'edit', ...one, column: 'title', value: 'Mine', original: 'Old' },
+      { type: 'edit', ...one, column: 'title', value: 'Mine too', original: 'Theirs' },
+      { type: 'edit', ...one, column: 'body', value: 'x', original: null },
+    )
+    expect(state.updates[one.id]!.original).toEqual({ title: 'Old', body: null })
+    // Typed back to what the person first saw: no change of theirs is left to save.
+    const back = stagedReducer(state, {
+      type: 'edit',
+      ...one,
+      column: 'title',
+      value: 'Old',
+      original: 'Theirs',
+    })
+    expect(back.updates[one.id]).toEqual({
+      key: one.key,
+      values: { body: 'x' },
+      original: { body: null },
+    })
   })
 
   it('adds new rows, fills them in, and removes them', () => {
@@ -82,7 +113,13 @@ describe('toChanges', () => {
     )
     expect(toChanges(state)).toEqual([
       { type: 'delete', key: { id: '2' } },
-      { type: 'update', key: { id: '1' }, values: { title: 'Changed' } },
+      // With what the cell held, so the server saves nothing if it holds something else by now.
+      {
+        type: 'update',
+        key: { id: '1' },
+        values: { title: 'Changed' },
+        original: { title: 'Old' },
+      },
       { type: 'insert', values: { title: 'New' } },
     ])
     expect(stagedCount(state)).toBe(3)

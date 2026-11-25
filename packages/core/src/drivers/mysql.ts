@@ -1,6 +1,12 @@
 import type { Connection as CallbackConnection } from 'mysql2'
 import type * as MySqlModule from 'mysql2/promise'
-import type { FieldPacket, Pool, PoolConnection, PoolOptions } from 'mysql2/promise'
+import type {
+  ConnectionOptions,
+  FieldPacket,
+  Pool,
+  PoolConnection,
+  PoolOptions,
+} from 'mysql2/promise'
 import { ConnectionError, DbAdminError, QueryError } from '../errors.ts'
 import type {
   ApplyResult,
@@ -8,16 +14,26 @@ import type {
   Change,
   Column,
   Driver,
+  ExportColumn,
   QueryOptions,
   QueryResult,
   ResultSet,
   RowsRequest,
   ServerInfo,
+  SqlDialect,
   TableDetail,
   TableKind,
   TableSummary,
 } from '../types.ts'
-import { changeStatement, orderBy, Parameters, where, whole, type Dialect } from './sql.ts'
+import {
+  changeStatement,
+  orderBy,
+  Parameters,
+  refuseChanged,
+  where,
+  whole,
+  type Dialect,
+} from './sql.ts'
 
 type MySql = typeof MySqlModule
 
@@ -65,11 +81,58 @@ function hexLiteral(value: string | null): string {
   return value === '' ? "''" : `_utf8mb4 X'${Buffer.from(value, 'utf8').toString('hex')}'`
 }
 
+/**
+ * Bytes as the grid shows them, `0x1F`, as the literal that is those bytes; null for anything
+ * else. A binary column compared with the letters "0x1F" matches nothing, and set to them holds
+ * those letters.
+ */
+export function mysqlBytes(shown: string): string | null {
+  const hex = /^0x((?:[0-9A-Fa-f]{2})*)$/.exec(shown)?.[1]
+  return hex === undefined ? null : `X'${hex.toUpperCase()}'`
+}
+
+/**
+ * How MySQL's SQL is written for people and for exports. An export's strings escape a backslash
+ * with another, which a session in NO_BACKSLASH_ESCAPES mode would read as two: the file takes
+ * that mode off for itself, and puts the session's back at its end.
+ */
+const sqlDialect: SqlDialect = {
+  identifier: backtick,
+  literal: mysqlLiteral,
+  bytes: mysqlBytes,
+  insertDefaults: '() VALUES ()',
+  exportHeader:
+    "SET @otw_db_sql_mode = @@sql_mode, sql_mode = TRIM(BOTH ',' FROM REPLACE(CONCAT(',', @@sql_mode, ','), ',NO_BACKSLASH_ESCAPES,', ','));\n",
+  exportFooter: 'SET sql_mode = @otw_db_sql_mode;\n',
+}
+
+/** The types whose values are bytes, as information_schema names them. */
+const BYTE_TYPES = new Set([
+  'binary',
+  'varbinary',
+  'tinyblob',
+  'blob',
+  'mediumblob',
+  'longblob',
+  'bit',
+  'geometry',
+  'point',
+  'linestring',
+  'polygon',
+  'multipoint',
+  'multilinestring',
+  'multipolygon',
+  'geometrycollection',
+  'geomcollection',
+])
+
 const dialect: Dialect = {
   identifier: backtick,
   literal: mysqlLiteral,
   placeholder: () => '?',
   inline: hexLiteral,
+  bytes: mysqlBytes,
+  forUpdate: ' FOR UPDATE',
   text: (expression) => `CAST(${expression} AS CHAR)`,
   // LIKE follows the column's collation; the default ones ignore case.
   ilike: 'LIKE',
@@ -85,6 +148,8 @@ const SYSTEM_SCHEMAS = "('mysql', 'information_schema', 'performance_schema', 's
 const EXPORT_BATCH = 1_000
 /** "Query execution was interrupted": KILL QUERY's answer. */
 const INTERRUPTED = 1317
+/** How long KILL QUERY gets to end a statement before its connection is closed under it. */
+const KILL_GRACE_MS = 2_000
 
 /** MySQL's column types by number, as the protocol sends them. */
 const TYPES: Record<number, string> = {
@@ -133,24 +198,24 @@ export function mysqlDriver(url: string): Driver {
 class MySqlDriver implements Driver {
   readonly kind = 'mysql'
   readonly capabilities: Capabilities = { schemas: true, transactionalDdl: false, cancel: true }
-  readonly sql = { identifier: backtick, literal: mysqlLiteral }
+  readonly sql = sqlDialect
+  /** One connection's settings: the pool's, and the one that carries KILL QUERY. */
+  readonly #single: ConnectionOptions
   readonly #config: PoolOptions
   #pool: Promise<{ pool: Pool; mysql: MySql }> | undefined
 
   constructor(url: string) {
     // mysql2 reads mysql:// addresses; mariadb:// is the same thing.
     const address = url.replace(/^mariadb:/i, 'mysql:')
-    this.#config = {
+    this.#single = {
       uri: address,
-      connectionLimit: 3,
-      maxIdle: 3,
-      idleTimeout: 10_000,
       // One statement a query: `COMMIT; DROP …` is a syntax error.
       multipleStatements: false,
       // Rows matched, not rows changed: an update to the same value still counts its row.
       flags: ['FOUND_ROWS', '-LOCAL_FILES'],
       connectAttributes: { program_name: 'otw-db' },
     }
+    this.#config = { ...this.#single, connectionLimit: 3, maxIdle: 3, idleTimeout: 10_000 }
   }
 
   #open(): Promise<{ pool: Pool; mysql: MySql }> {
@@ -184,17 +249,30 @@ class MySqlDriver implements Driver {
     { timeoutMs, signal }: { timeoutMs: number; signal?: AbortSignal },
   ): Promise<{ rows: (string | null)[][]; fields: FieldPacket[]; affected: number | null }> {
     let stopped: 'timeout' | 'cancel' | null = null
+    let giveUp: NodeJS.Timeout | undefined
+    let abandon!: (error: Error) => void
+    const abandoned = new Promise<never>((_, reject) => (abandon = reject))
     const stop = (why: 'timeout' | 'cancel') => {
       if (stopped) return
       stopped = why
       void this.#kill(mysql, connection.threadId)
+      // KILL QUERY needs a connection of its own, which a server at its limit refuses, and some
+      // proxies never pass it on: the statement would run on, and the request wait with it.
+      // Closing its connection ends the wait whatever the server does.
+      giveUp = setTimeout(() => {
+        connection.destroy()
+        abandon(interrupted(why, timeoutMs))
+      }, KILL_GRACE_MS)
     }
     const timer = setTimeout(() => stop('timeout'), timeoutMs)
     const abort = () => stop('cancel')
     signal?.addEventListener('abort', abort, { once: true })
     try {
       if (signal?.aborted) throw new DbAdminError('The query was canceled.', 409, 'canceled')
-      const [result, fields] = await connection.query({ sql, rowsAsArray: true, typeCast: asBytes })
+      const running = connection.query({ sql, rowsAsArray: true, typeCast: asBytes })
+      // Abandoned, it fails later with its connection gone: nobody is left to hear that.
+      running.catch(() => {})
+      const [result, fields] = await Promise.race([running, abandoned])
       if (stopped) throw interrupted(stopped, timeoutMs)
       if (!Array.isArray(result)) {
         return { rows: [], fields: [], affected: (result as { affectedRows: number }).affectedRows }
@@ -210,6 +288,7 @@ class MySqlDriver implements Driver {
       throw error
     } finally {
       clearTimeout(timer)
+      clearTimeout(giveUp)
       signal?.removeEventListener('abort', abort)
     }
   }
@@ -217,7 +296,7 @@ class MySqlDriver implements Driver {
   /** KILL QUERY on a connection of its own: the busy one can't take it. You may kill your own. */
   async #kill(mysql: MySql, threadId: number): Promise<void> {
     try {
-      const killer = await mysql.createConnection(this.#config)
+      const killer = await mysql.createConnection(this.#single)
       try {
         await killer.query(`KILL QUERY ${whole(threadId)}`)
       } finally {
@@ -321,11 +400,39 @@ class MySqlDriver implements Driver {
     }
   }
 
+  /**
+   * What a statement must know of the table's columns that their values don't say: which hold
+   * bytes (shown as hex, and written back as bytes), and which the server computes itself.
+   */
+  async #columns(schema: string, table: string): Promise<Map<string, ExportColumn>> {
+    const rows = await this.#catalog(
+      `SELECT COLUMN_NAME, DATA_TYPE, CHARACTER_SET_NAME, EXTRA FROM information_schema.COLUMNS
+        WHERE TABLE_SCHEMA = ${hexLiteral(schema)} AND TABLE_NAME = ${hexLiteral(table)}`,
+    )
+    return new Map(
+      rows.map(([name, type, charset, extra]) => [
+        name!,
+        {
+          name: name!,
+          ...(BYTE_TYPES.has(type!.toLowerCase()) || charset === 'binary' ? { bytes: true } : {}),
+          ...(/\bGENERATED\b/i.test(extra ?? '') ? { generated: true } : {}),
+        },
+      ]),
+    )
+  }
+
+  /** The table's columns that hold bytes; not looked up where nothing is compared with a column. */
+  async #bytes(schema: string, table: string, needed = true): Promise<ReadonlySet<string>> {
+    if (!needed) return new Set()
+    const columns = await this.#columns(schema, table)
+    return new Set([...columns.values()].filter((c) => c.bytes).map((c) => c.name))
+  }
+
   async rows(
     { schema, table, limit, offset, order = [], filters = [] }: RowsRequest,
     options: Omit<QueryOptions, 'access' | 'maxRows'>,
   ): Promise<ResultSet> {
-    const parameters = new Parameters(dialect)
+    const parameters = new Parameters(dialect, await this.#bytes(schema, table, filters.length > 0))
     const sql = `SELECT * FROM ${backtick(schema)}.${backtick(table)}${where(dialect, filters, parameters)}${orderBy(dialect, order)} LIMIT ${whole(limit) + 1} OFFSET ${whole(offset)}`
     const started = performance.now()
     const { rows, fields } = await this.#pooled(sql, options)
@@ -342,7 +449,7 @@ class MySqlDriver implements Driver {
     { schema, table, filters = [] }: Pick<RowsRequest, 'schema' | 'table' | 'filters'>,
     options: Omit<QueryOptions, 'access' | 'maxRows'>,
   ): Promise<number> {
-    const parameters = new Parameters(dialect)
+    const parameters = new Parameters(dialect, await this.#bytes(schema, table, filters.length > 0))
     const sql = `SELECT COUNT(*) FROM ${backtick(schema)}.${backtick(table)}${where(dialect, filters, parameters)}`
     return Number((await this.#pooled(sql, options)).rows[0]![0])
   }
@@ -354,7 +461,14 @@ class MySqlDriver implements Driver {
     try {
       return await this.#run(connection, mysql, sql, options)
     } catch (error) {
-      broken = !(error instanceof DbAdminError) && !(error as { sqlMessage?: string }).sqlMessage
+      // A statement stopped at its limit or by its viewer: its KILL QUERY may still be on the
+      // way, and would stop whatever ran next on this connection. So the connection goes.
+      const stoppedHere =
+        error instanceof DbAdminError &&
+        (error.code === 'canceled' || (error as QueryError).sqlState === '70100')
+      broken =
+        stoppedHere ||
+        (!(error instanceof DbAdminError) && !(error as { sqlMessage?: string }).sqlMessage)
       throw toError(error)
     } finally {
       if (broken) connection.destroy()
@@ -409,13 +523,19 @@ class MySqlDriver implements Driver {
     { timeoutMs, dryRun = false }: { timeoutMs: number; dryRun?: boolean },
   ): Promise<ApplyResult> {
     const target = `${backtick(schema)}.${backtick(table)}`
-    const statements = changes.map((change) => changeStatement(dialect, target, change))
+    const bytes = await this.#bytes(schema, table)
+    const statements = changes.map((change) => changeStatement(dialect, target, change, bytes))
     const shown = statements.map((s) => s.shown)
     if (dryRun) return { statements: shown, applied: false }
     const { connection, mysql } = await this.#connect()
     try {
       await connection.query('START TRANSACTION')
       for (const statement of statements) {
+        if (statement.check) {
+          // Through #run, so each value reads as the grid read it.
+          const { rows } = await this.#run(connection, mysql, statement.check.text, { timeoutMs })
+          refuseChanged(dialect, statement, rows[0])
+        }
         const { affected } = await this.#run(connection, mysql, statement.text, { timeoutMs })
         if (statement.oneRow && affected !== 1) {
           const why =
@@ -443,14 +563,36 @@ class MySqlDriver implements Driver {
       order = [],
     }: Pick<RowsRequest, 'schema' | 'table' | 'filters' | 'order'>,
     { timeoutMs }: { timeoutMs: number },
-  ): AsyncGenerator<{ columns: { name: string }[]; rows: (string | null)[][] }> {
-    const parameters = new Parameters(dialect)
+  ): AsyncGenerator<{ columns: ExportColumn[]; rows: (string | null)[][] }> {
+    const known = await this.#columns(schema, table)
+    const bytes = new Set([...known.values()].filter((c) => c.bytes).map((c) => c.name))
+    const parameters = new Parameters(dialect, bytes)
     const sql = `SELECT * FROM ${backtick(schema)}.${backtick(table)}${where(dialect, filters, parameters)}${orderBy(dialect, order)}`
-    const { connection } = await this.#connect()
+    const columns = (fields: FieldPacket[]) =>
+      fields.map((f) => known.get(f.name) ?? { name: f.name })
+    const { connection, mysql } = await this.#connect()
     // Rows come as the server sends them; a stop on the way leaves the connection mid-result.
     let finished = false
+    // The time limit is on the server saying nothing: a statement that sends no row for that long
+    // is stopped, while a big table that keeps coming may take as long as it takes. It's kept
+    // here, not set on the session (max_execution_time would stay on a connection the pool hands
+    // to the next statement, and MariaDB has no such setting), and it rests while the reader has
+    // a batch in hand: that wait is the reader's.
+    let heard = performance.now()
+    let listening = true
+    let silent = false
+    const watch = setInterval(
+      () => {
+        if (!listening || silent || performance.now() - heard <= timeoutMs) return
+        silent = true
+        void this.#kill(mysql, connection.threadId)
+        // Where KILL QUERY can't reach it, its connection goes instead.
+        setTimeout(() => connection.destroy(), KILL_GRACE_MS).unref()
+      },
+      Math.max(20, Math.min(1_000, timeoutMs / 4)),
+    )
+    watch.unref()
     try {
-      await connection.query(`SET SESSION max_execution_time = ${whole(timeoutMs)}`).catch(() => {})
       // The callback connection underneath streams; the promise one doesn't.
       const stream = (connection.connection as unknown as CallbackConnection)
         .query({ sql, rowsAsArray: true, typeCast: asBytes })
@@ -460,19 +602,25 @@ class MySqlDriver implements Driver {
       let batch: (string | null)[][] = []
       let first = true
       for await (const row of stream as AsyncIterable<unknown[]>) {
+        heard = performance.now()
         batch.push(toText(row, fields))
         if (batch.length === EXPORT_BATCH) {
-          yield { columns: fields.map((f) => ({ name: f.name })), rows: batch }
+          listening = false
+          yield { columns: columns(fields), rows: batch }
+          heard = performance.now()
+          listening = true
           batch = []
           first = false
         }
       }
-      if (batch.length || first)
-        yield { columns: fields.map((f) => ({ name: f.name })), rows: batch }
+      listening = false
+      if (silent) throw interrupted('timeout', timeoutMs)
+      if (batch.length || first) yield { columns: columns(fields), rows: batch }
       finished = true
     } catch (error) {
-      throw toError(error)
+      throw silent ? interrupted('timeout', timeoutMs) : toError(error)
     } finally {
+      clearInterval(watch)
       if (finished) connection.release()
       else connection.destroy()
     }

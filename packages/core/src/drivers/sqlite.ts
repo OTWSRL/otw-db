@@ -6,6 +6,7 @@ import type {
   ApplyResult,
   Capabilities,
   Change,
+  ExportColumn,
   Column,
   Driver,
   QueryOptions,
@@ -19,8 +20,11 @@ import type {
 import {
   changeStatement,
   doubleQuote,
+  EXPORT_IDLE_MS,
   orderBy,
   Parameters,
+  refuseChanged,
+  stalledExport,
   where,
   whole,
   type Dialect,
@@ -32,9 +36,22 @@ export function sqliteLiteral(value: string | null): string {
   return `'${value.replaceAll("'", "''")}'`
 }
 
+/**
+ * Bytes as the grid shows them, `X'1F'`, as the literal that is those bytes; null for anything
+ * else. SQLite never finds a blob equal to text, so a blob key compared with those letters
+ * matches no row.
+ */
+export function sqliteBytes(shown: string): string | null {
+  const hex = /^X'((?:[0-9A-Fa-f]{2})*)'$/.exec(shown)?.[1]
+  return hex === undefined ? null : `X'${hex.toUpperCase()}'`
+}
+
 const dialect: Dialect = {
   identifier: doubleQuote,
   literal: sqliteLiteral,
+  bytes: sqliteBytes,
+  // A write transaction here holds the whole file.
+  forUpdate: '',
   placeholder: () => '?',
   text: (expression) => `CAST(${expression} AS TEXT)`,
   // SQLite's LIKE ignores case for ASCII letters, and has no escape until told.
@@ -127,8 +144,20 @@ function row(statement, columns, value) {
   return Array.isArray(value) ? value.map(text) : columns.map((c) => text(value[c.name]))
 }
 
-function run({ sql, params, maxRows, write, transaction }) {
-  const database = db(write)
+// Someone's own SQL runs on a handle of its own, closed after it: what the statement sets up (a
+// TEMP view named as a table is, a PRAGMA, a transaction left open) ends with it, and never
+// reaches the next person's statement, the grid's reads and edits, or the host's file.
+function run(message) {
+  if (!message.own) return runOn(db(message.write), message)
+  const database = new DatabaseSync(workerData.path, { readOnly: !message.write })
+  try {
+    return runOn(database, message)
+  } finally {
+    database.close()
+  }
+}
+
+function runOn(database, { sql, params, maxRows, transaction }) {
   const statement = prepare(database, sql)
   const columns = columnsOf(statement)
   if (!columns.length) {
@@ -136,9 +165,15 @@ function run({ sql, params, maxRows, write, transaction }) {
     try {
       const { changes } = statement.run(...params)
       if (transaction) database.exec('COMMIT')
+      else if (database.isTransaction) {
+        // BEGIN or SAVEPOINT, run alone: nothing after it would ever commit.
+        const error = new Error('a transaction left open')
+        error.leftOpen = true
+        throw error
+      }
       return { columns, rows: [], truncated: false, changes: Number(changes) }
     } catch (error) {
-      if (transaction && database.isTransaction) database.exec('ROLLBACK')
+      if (database.isTransaction) database.exec('ROLLBACK')
       throw error
     }
   }
@@ -158,7 +193,22 @@ function apply({ statements }) {
   const database = db(true)
   database.exec('BEGIN IMMEDIATE')
   try {
-    for (const { sql, params, oneRow, shown } of statements) {
+    for (const [index, { sql, params, oneRow, shown, check }] of statements.entries()) {
+      if (check) {
+        // The cells as the grid read them, for the driver to compare with what they held.
+        const reader = prepare(database, check.sql)
+        const columns = columnsOf(reader)
+        let current = null
+        for (const value of reader.iterate(...check.params)) {
+          current = row(reader, columns, value)
+          break
+        }
+        if (!current || check.original.some((was, i) => was !== current[i])) {
+          const error = new Error('a cell was changed meanwhile')
+          error.changed = { index, current }
+          throw error
+        }
+      }
       const { changes } = prepare(database, sql).run(...params)
       if (oneRow && Number(changes) !== 1) {
         const error = new Error(Number(changes) === 0 ? 'its row is gone or its key changed' : 'its key matched ' + changes + ' rows')
@@ -217,6 +267,8 @@ parentPort.on('message', (message) => {
         errcode: error.errcode,
         conflict: error.conflict,
         oneStatement: error.oneStatement === true,
+        leftOpen: error.leftOpen === true,
+        changed: error.changed,
       },
     })
   }
@@ -229,6 +281,9 @@ interface WorkerError {
   errcode?: number
   conflict?: string
   oneStatement?: boolean
+  leftOpen?: boolean
+  /** An update's check found its row changed or gone: which statement, and the row now. */
+  changed?: { index: number; current: (string | null)[] | null }
 }
 
 /** The file a `sqlite:` or `file:` address names. */
@@ -252,14 +307,26 @@ export function sqlitePath(url: string): string {
  * time on a worker thread: a long one never blocks the host, and stopping the worker stops it.
  * Read access opens the file read-only.
  */
-export function sqliteDriver(url: string): Driver {
-  return new SqliteDriver(sqlitePath(url))
+export function sqliteDriver(url: string, options: SqliteOptions = {}): Driver {
+  return new SqliteDriver(sqlitePath(url), options)
 }
 
-class SqliteDriver implements Driver {
-  readonly kind = 'sqlite'
-  readonly capabilities: Capabilities = { schemas: false, transactionalDdl: true, cancel: true }
-  readonly sql = { identifier: doubleQuote, literal: sqliteLiteral }
+/** How the SQLite driver behaves, where the defaults don't suit. */
+export interface SqliteOptions {
+  /**
+   * How long an export may sit between two batches, its rows unread, before it's ended and lets
+   * go of the file. Defaults to 5 minutes.
+   */
+  exportIdleMs?: number
+}
+
+/**
+ * A worker thread of its own with the file open on it, and the requests waiting for it. The
+ * driver has one for its statements; each export has another, so stopping a statement (which
+ * stops its worker) never ends an export under way, and an export nobody reads can be let go of
+ * by stopping its own.
+ */
+class Lane {
   readonly #path: string
   #worker: Worker | null = null
   #pending = new Map<number, { resolve(value: unknown): void; reject(error: Error): void }>()
@@ -303,7 +370,7 @@ class SqliteDriver implements Driver {
    * Sends a request when the ones before it are done. The timer and the signal stop the worker,
    * which stops the statement; the next request starts a fresh one.
    */
-  #send<T>(
+  send<T>(
     message: Record<string, unknown>,
     options: { timeoutMs?: number; signal?: AbortSignal } = {},
   ): Promise<T> {
@@ -358,6 +425,44 @@ class SqliteDriver implements Driver {
     return result
   }
 
+  /** Stops the worker once the requests before this are done: what it held on the file goes. */
+  async close(): Promise<void> {
+    const worker = this.#worker
+    this.#worker = null
+    await this.#queue
+    await worker?.terminate()
+  }
+
+  /** Stops the worker now, whatever it's doing: the requests it had fail. */
+  stop(): void {
+    const worker = this.#worker
+    this.#worker = null
+    void worker?.terminate()
+  }
+}
+
+class SqliteDriver implements Driver {
+  readonly kind = 'sqlite'
+  readonly capabilities: Capabilities = { schemas: false, transactionalDdl: true, cancel: true }
+  readonly sql = { identifier: doubleQuote, literal: sqliteLiteral, bytes: sqliteBytes }
+  readonly #path: string
+  readonly #exportIdleMs: number
+  /** The driver's own statements, one at a time. */
+  readonly #lane: Lane
+
+  constructor(path: string, options: SqliteOptions) {
+    this.#path = path
+    this.#exportIdleMs = options.exportIdleMs ?? EXPORT_IDLE_MS
+    this.#lane = new Lane(path)
+  }
+
+  #send<T>(
+    message: Record<string, unknown>,
+    options: { timeoutMs?: number; signal?: AbortSignal } = {},
+  ): Promise<T> {
+    return this.#lane.send<T>(message, options)
+  }
+
   #run(
     sql: string,
     params: unknown[],
@@ -367,6 +472,8 @@ class SqliteDriver implements Driver {
       timeoutMs: number
       signal?: AbortSignal
       transaction?: boolean
+      /** Someone's own SQL, not the driver's: it runs on a handle of its own, closed after. */
+      own?: boolean
     },
   ) {
     return this.#send<{
@@ -382,6 +489,7 @@ class SqliteDriver implements Driver {
         maxRows: options.maxRows,
         write: options.write,
         transaction: options.transaction ?? false,
+        own: options.own ?? false,
       },
       options,
     )
@@ -488,11 +596,40 @@ class SqliteDriver implements Driver {
     }
   }
 
+  /**
+   * What a statement must know of the table's columns that their values don't say: which hold
+   * bytes, and which SQLite computes itself. A column holds bytes when it's declared BLOB, or
+   * with no type at all: SQLite lets any column hold a blob, but those are where they're kept.
+   */
+  async #columns(schema: string, table: string): Promise<Map<string, ExportColumn>> {
+    // table_xinfo: cid, name, type, notnull, dflt_value, pk, hidden (2 virtual, 3 stored).
+    const rows = await this.#catalog(
+      `PRAGMA ${doubleQuote(schema)}.table_xinfo(${doubleQuote(table)})`,
+    )
+    return new Map(
+      rows.map(([, name, type, , , , hidden]) => [
+        name!,
+        {
+          name: name!,
+          ...(!type || /blob/i.test(type) ? { bytes: true } : {}),
+          ...(hidden === '2' || hidden === '3' ? { generated: true } : {}),
+        },
+      ]),
+    )
+  }
+
+  /** The table's columns that hold bytes; not looked up where nothing is compared with a column. */
+  async #bytes(schema: string, table: string, needed = true): Promise<ReadonlySet<string>> {
+    if (!needed) return new Set()
+    const columns = await this.#columns(schema, table)
+    return new Set([...columns.values()].filter((c) => c.bytes).map((c) => c.name))
+  }
+
   async rows(
     { schema, table, limit, offset, order = [], filters = [] }: RowsRequest,
     options: Omit<QueryOptions, 'access' | 'maxRows'>,
   ): Promise<ResultSet> {
-    const parameters = new Parameters(dialect)
+    const parameters = new Parameters(dialect, await this.#bytes(schema, table, filters.length > 0))
     const sql = `SELECT * FROM ${doubleQuote(schema)}.${doubleQuote(table)}${where(dialect, filters, parameters)}${orderBy(dialect, order)} LIMIT ${whole(limit) + 1} OFFSET ${whole(offset)}`
     const started = performance.now()
     const result = await this.#run(sql, parameters.values, {
@@ -512,7 +649,7 @@ class SqliteDriver implements Driver {
     { schema, table, filters = [] }: Pick<RowsRequest, 'schema' | 'table' | 'filters'>,
     options: Omit<QueryOptions, 'access' | 'maxRows'>,
   ): Promise<number> {
-    const parameters = new Parameters(dialect)
+    const parameters = new Parameters(dialect, await this.#bytes(schema, table, filters.length > 0))
     const sql = `SELECT count(*) FROM ${doubleQuote(schema)}.${doubleQuote(table)}${where(dialect, filters, parameters)}`
     const { rows } = await this.#run(sql, parameters.values, {
       ...options,
@@ -528,23 +665,35 @@ class SqliteDriver implements Driver {
   }
 
   /**
-   * One statement: read access on a read-only handle to the file, write access in a transaction,
-   * or alone where SQLite refuses one (VACUUM).
+   * One statement, on a handle of its own that's closed after it: read access opens the file
+   * read-only, write access runs in a transaction, or alone where SQLite refuses one (VACUUM).
+   * Nothing a statement sets up outlasts it.
    */
   async query(sql: string, options: QueryOptions): Promise<QueryResult> {
     const started = performance.now()
     const write = options.access === 'write'
-    const run = (transaction: boolean) => this.#run(sql, [], { ...options, write, transaction })
-    let result
-    try {
-      result = await run(write)
-    } catch (error) {
-      if (!write || !/within a transaction/i.test((error as Error).message)) throw error
-      result = await run(false)
-    }
     const command = (
       /^\s*(?:--[^\n]*\n\s*|\/\*[\s\S]*?\*\/\s*)*(\w+)/.exec(sql)?.[1] ?? ''
     ).toUpperCase()
+    this.#refuseOtherFiles(command, sql)
+    const run = (transaction: boolean) =>
+      this.#run(sql, [], { ...options, write, transaction, own: true })
+    let result
+    try {
+      try {
+        result = await run(write)
+      } catch (error) {
+        if (!write || !/within a transaction/i.test((error as Error).message)) throw error
+        result = await run(false)
+      }
+    } catch (error) {
+      if (!(error instanceof LeftOpen)) throw error
+      throw new DbAdminError(
+        `A transaction can’t stay open here: each statement is committed as it finishes, and ${command} would leave one open.`,
+        400,
+        'no-transactions',
+      )
+    }
     return {
       columns: result.columns,
       rows: result.rows,
@@ -555,27 +704,68 @@ class SqliteDriver implements Driver {
     }
   }
 
+  /**
+   * SQLite has no roles: a connection's one boundary is the file it opens. ATTACH opens any other
+   * file the process can read, and VACUUM INTO writes one anywhere it can write, even from a
+   * read-only handle. Both are statements of their own, never part of another, so their first
+   * word tells.
+   */
+  #refuseOtherFiles(command: string, sql: string): void {
+    const file = basename(this.#path)
+    if (command === 'ATTACH') {
+      throw new DbAdminError(
+        `This connection opens ${file} only: ATTACH would open another file on the server.`,
+        403,
+        'not-allowed',
+      )
+    }
+    if (command === 'DETACH') {
+      throw new DbAdminError(
+        `This connection opens ${file} only: DETACH has nothing to let go of.`,
+        403,
+        'not-allowed',
+      )
+    }
+    if (command === 'VACUUM' && /\binto\b/i.test(sql)) {
+      throw new DbAdminError(
+        'VACUUM INTO writes a copy of the database to a file on the server, which this tool doesn’t do. Export the tables instead.',
+        403,
+        'not-allowed',
+      )
+    }
+  }
+
   async apply(
     { schema, table }: { schema: string; table: string },
     changes: readonly Change[],
     { timeoutMs, dryRun = false }: { timeoutMs: number; dryRun?: boolean },
   ): Promise<ApplyResult> {
     const target = `${doubleQuote(schema)}.${doubleQuote(table)}`
-    const statements = changes.map((change) => changeStatement(dialect, target, change))
+    const bytes = await this.#bytes(schema, table)
+    const statements = changes.map((change) => changeStatement(dialect, target, change, bytes))
     const shown = statements.map((s) => s.shown)
     if (dryRun) return { statements: shown, applied: false }
-    await this.#send(
-      {
-        type: 'apply',
-        statements: statements.map((s) => ({
-          sql: s.text,
-          params: s.values,
-          oneRow: s.oneRow,
-          shown: s.shown,
-        })),
-      },
-      { timeoutMs },
-    )
+    try {
+      await this.#send(
+        {
+          type: 'apply',
+          statements: statements.map((s) => ({
+            sql: s.text,
+            params: s.values,
+            oneRow: s.oneRow,
+            shown: s.shown,
+            ...(s.check
+              ? { check: { sql: s.check.text, params: s.check.values, original: s.check.original } }
+              : {}),
+          })),
+        },
+        { timeoutMs },
+      )
+    } catch (error) {
+      // The worker rolled back; which cell, and from what to what, is said here as for the others.
+      if (error instanceof Changed) refuseChanged(dialect, statements[error.index]!, error.current)
+      throw error
+    }
     return { statements: shown, applied: true }
   }
 
@@ -587,38 +777,73 @@ class SqliteDriver implements Driver {
       order = [],
     }: Pick<RowsRequest, 'schema' | 'table' | 'filters' | 'order'>,
     { timeoutMs }: { timeoutMs: number },
-  ): AsyncGenerator<{ columns: { name: string }[]; rows: (string | null)[][] }> {
-    const parameters = new Parameters(dialect)
+  ): AsyncGenerator<{ columns: ExportColumn[]; rows: (string | null)[][] }> {
+    const known = await this.#columns(schema, table)
+    const bytes = new Set([...known.values()].filter((c) => c.bytes).map((c) => c.name))
+    const parameters = new Parameters(dialect, bytes)
     const sql = `SELECT * FROM ${doubleQuote(schema)}.${doubleQuote(table)}${where(dialect, filters, parameters)}${orderBy(dialect, order)}`
-    const { cursor, columns } = await this.#send<{ cursor: number; columns: { name: string }[] }>(
-      { type: 'open', sql, params: parameters.values },
-      { timeoutMs },
-    )
-    let done = false
+    // A worker of its own: a statement of someone else's stopped at its time limit takes the
+    // driver's worker with it, and would take every export being read from that worker too.
+    const lane = new Lane(this.#path)
+    // Mid-read, the export holds the file (in a rollback journal, no write of the host's can
+    // commit meanwhile): nobody reading, it would hold it for as long as the browser stays away.
+    let stalled = false
+    const stall = () => {
+      stalled = true
+      lane.stop()
+    }
     try {
-      for (let first = true; !done; first = false) {
-        const batch = await this.#send<{ rows: (string | null)[][]; done: boolean }>(
+      const opened = await lane.send<{ cursor: number; columns: { name: string }[] }>(
+        { type: 'open', sql, params: parameters.values },
+        { timeoutMs },
+      )
+      const cursor = opened.cursor
+      const columns = opened.columns.map((c) => known.get(c.name) ?? { name: c.name })
+      for (let first = true, done = false; !done; first = false) {
+        const batch = await lane.send<{ rows: (string | null)[][]; done: boolean }>(
           { type: 'next', cursor, count: EXPORT_BATCH },
           { timeoutMs },
         )
         done = batch.done
-        if (batch.rows.length || first) yield { columns, rows: batch.rows }
+        if (batch.rows.length || first) {
+          const waiting = setTimeout(stall, this.#exportIdleMs)
+          waiting.unref()
+          try {
+            yield { columns, rows: batch.rows }
+          } finally {
+            clearTimeout(waiting)
+          }
+          if (stalled) throw stalledExport(this.#exportIdleMs)
+        }
       }
     } finally {
-      if (!done) await this.#send({ type: 'close', cursor }).catch(() => {})
+      // The worker goes, and with it the cursor and its hold on the file, read to the end or not.
+      await lane.close()
     }
   }
 
   async close(): Promise<void> {
-    const worker = this.#worker
-    this.#worker = null
-    await this.#queue
-    await worker?.terminate()
+    await this.#lane.close()
+  }
+}
+
+/** A statement that left a transaction open on its handle: BEGIN or SAVEPOINT, run alone. */
+class LeftOpen extends Error {}
+
+/** An update's check found its cells changed, or its row gone (`current` undefined). */
+class Changed extends Error {
+  constructor(
+    readonly index: number,
+    readonly current: (string | null)[] | undefined,
+  ) {
+    super('A cell was changed meanwhile.')
   }
 }
 
 /** The worker's errors as the API's. */
 function fromWorker(error: WorkerError): Error {
+  if (error.leftOpen) return new LeftOpen(error.message)
+  if (error.changed) return new Changed(error.changed.index, error.changed.current ?? undefined)
   if (error.conflict)
     return new DbAdminError(
       `Nothing was saved: ${error.message}.\n${error.conflict}`,

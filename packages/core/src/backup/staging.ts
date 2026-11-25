@@ -23,9 +23,42 @@ export interface Upload {
   /** The pieces received, and their bytes. */
   chunks: number
   received: number
+  /** The last piece's number, -1 with none: one less than `chunks` when none is missing. */
+  last: number
 }
 
 const SCHEMA = quote(STAGING_SCHEMA)
+
+/**
+ * Whether the staging schema is there, refusing one this login didn't make. The schema is found
+ * by its name, and it's dropped after each restore, so any role that may create schemas could
+ * make it first: with tables of its own it would read the uploaded backup, change the pieces
+ * before they run as this login, or have a trigger on them run as this login. So the schema and
+ * everything in it must belong to the login that uses them.
+ */
+async function ours(session: Session): Promise<boolean> {
+  const { rows } = await session.query(
+    `SELECT pg_catalog.pg_get_userbyid(n.nspowner), current_user,
+            (SELECT pg_catalog.pg_get_userbyid(c.relowner) FROM pg_catalog.pg_class c
+              WHERE c.relnamespace = n.oid AND c.relowner <> n.nspowner LIMIT 1)
+       FROM pg_catalog.pg_namespace n WHERE n.nspname = $1`,
+    [STAGING_SCHEMA],
+  )
+  const found = rows[0]
+  if (!found) return false
+  const [owner, login, stranger] = found
+  const other = owner !== login ? owner : stranger
+  if (other !== null && other !== undefined) {
+    throw new DbAdminError(
+      owner !== login
+        ? `The schema ${STAGING_SCHEMA}, where a restore’s upload waits, belongs to "${owner}", not to this connection’s login "${login}": someone else made it. Drop it (DROP SCHEMA ${STAGING_SCHEMA} CASCADE), then restore.`
+        : `The schema ${STAGING_SCHEMA}, where a restore’s upload waits, holds a table of "${stranger}", not of this connection’s login "${login}": someone else put it there. Drop the schema (DROP SCHEMA ${STAGING_SCHEMA} CASCADE), then restore.`,
+      409,
+      'staging-taken',
+    )
+  }
+  return true
+}
 
 /** Makes the tables if need be, drops uploads a day old, and starts one. */
 export async function startUpload(
@@ -33,6 +66,8 @@ export async function startUpload(
   upload: { viewer: string; kind: UploadKind; size: number; name: string },
 ): Promise<string> {
   await session.query(`CREATE SCHEMA IF NOT EXISTS ${SCHEMA}`)
+  // Before anything is put in it: one made by someone else is refused, not filled.
+  await ours(session)
   await session.query(`CREATE TABLE IF NOT EXISTS ${SCHEMA}.uploads (
     id uuid PRIMARY KEY, viewer text NOT NULL, kind text NOT NULL, size bigint NOT NULL,
     name text NOT NULL, created timestamptz NOT NULL DEFAULT now())`)
@@ -53,12 +88,10 @@ export async function findUpload(session: Session, id: string, viewer: string): 
   const missing = () =>
     new DbAdminError('That upload is gone: start the restore again.', 404, 'unknown-upload')
   if (!UUID.test(id)) throw missing()
-  const exists = await session.query(`SELECT 1 FROM pg_namespace WHERE nspname = $1`, [
-    STAGING_SCHEMA,
-  ])
-  if (!exists.rows.length) throw missing()
+  if (!(await ours(session))) throw missing()
   const { rows } = await session.query(
-    `SELECT u.kind, u.size, count(c.seq), coalesce(sum(length(c.data)), 0)
+    `SELECT u.kind, u.size, count(c.seq), coalesce(sum(length(c.data)), 0),
+            coalesce(max(c.seq), -1)
        FROM ${SCHEMA}.uploads u LEFT JOIN ${SCHEMA}.chunks c ON c.upload = u.id
       WHERE u.id = $1 AND u.viewer = $2 GROUP BY u.id`,
     [id, viewer],
@@ -71,6 +104,7 @@ export async function findUpload(session: Session, id: string, viewer: string): 
     size: Number(row[1]),
     chunks: Number(row[2]),
     received: Number(row[3]),
+    last: Number(row[4]),
   }
 }
 
@@ -99,11 +133,21 @@ export async function putChunk(
   }
 }
 
-/** Refuses an upload with pieces missing. */
+/**
+ * Refuses an upload with pieces missing: bytes short, or a number skipped. The bytes alone can
+ * add up with a piece missing in the middle, when another was sent too long.
+ */
 export function complete(upload: Upload): void {
   if (upload.received !== upload.size) {
     throw new DbAdminError(
       `The upload isn't complete: ${upload.received.toLocaleString('en')} of ${upload.size.toLocaleString('en')} bytes arrived. Start the restore again.`,
+      400,
+      'incomplete-upload',
+    )
+  }
+  if (upload.last + 1 !== upload.chunks) {
+    throw new DbAdminError(
+      `The upload has pieces missing: ${upload.chunks.toLocaleString('en')} arrived, the last of them number ${(upload.last + 1).toLocaleString('en')}. Start the restore again.`,
       400,
       'incomplete-upload',
     )
@@ -128,10 +172,7 @@ export async function* chunks(session: Session, upload: Upload): AsyncGenerator<
 
 /** Drops the upload, and the schema once nothing else waits in it. */
 export async function discard(session: Session, id: string): Promise<void> {
-  const exists = await session.query(`SELECT 1 FROM pg_namespace WHERE nspname = $1`, [
-    STAGING_SCHEMA,
-  ])
-  if (!exists.rows.length) return
+  if (!(await ours(session))) return
   await session.query(
     `DELETE FROM ${SCHEMA}.uploads WHERE id = $1 OR created < now() - interval '1 day'`,
     [id],

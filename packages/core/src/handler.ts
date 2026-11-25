@@ -1,7 +1,7 @@
 import { driverKind } from './connections.ts'
 import { openDriver } from './drivers/index.ts'
 import { DbAdminError, QueryError } from './errors.ts'
-import { EXPORT_TYPES, exportStream } from './export.ts'
+import { EXPORT_TYPES, exportStream, type ExportBatch } from './export.ts'
 import type {
   Access,
   AuditEvent,
@@ -148,7 +148,7 @@ export function createDbAdmin(options: DbAdminOptions): DbAdmin {
   const backups = () => (backupApi ??= import('./backup/api.ts'))
   const maxRestoreBytes = options.backups?.maxRestoreBytes ?? 1_073_741_824
   /** What a backup endpoint needs to know, from the connection it reached. */
-  const backupContext = (target: ReturnType<typeof reach>, viewer: Viewer) => ({
+  const backupContext = (target: Awaited<ReturnType<typeof reach>>, viewer: Viewer) => ({
     ...target,
     viewer,
     record,
@@ -185,16 +185,31 @@ export function createDbAdmin(options: DbAdminOptions): DbAdmin {
     return found
   }
 
+  /** Each connection's databases, as its server last listed them. */
+  const listed = new Map<string, Set<string>>()
+
+  /**
+   * Whether the connection's server has the database, for its login to open. A name not in the
+   * list as last read has the list read again: a database may have been made since.
+   */
+  async function hasDatabase(connection: ConnectionConfig, database: string): Promise<boolean> {
+    if (listed.get(connection.name)?.has(database)) return true
+    const { databases } = await driver(connection).databases!()
+    listed.set(connection.name, new Set(databases))
+    return databases.includes(database)
+  }
+
   /**
    * The connection by name, with this viewer's access to it and the driver for `database`: one of
    * the server's other databases, or the connection's own when none is named. Unknown and hidden
-   * connections look the same.
+   * connections look the same. A database is opened only if the server lists it: each one opened
+   * takes a place among the eight kept open, and a made-up name would push a real one out.
    */
-  function reach(
+  async function reach(
     viewer: Viewer,
     name: unknown,
     database?: unknown,
-  ): { connection: ConnectionConfig; access: Access; db: Driver; database?: string } {
+  ): Promise<{ connection: ConnectionConfig; access: Access; db: Driver; database?: string }> {
     const connection = typeof name === 'string' ? connections.get(name) : undefined
     const access = connection ? accessOf(viewer, connection) : null
     if (!connection || !access) {
@@ -205,6 +220,13 @@ export function createDbAdmin(options: DbAdminOptions): DbAdmin {
     }
     const named = databaseName(database)
     if (!opensOthers(connection)) throw oneDatabase(connection)
+    if (!(await hasDatabase(connection, named))) {
+      throw new DbAdminError(
+        `There’s no database "${named}" on the server of connection "${connection.name}", or its login may not open it.`,
+        404,
+        'unknown-database',
+      )
+    }
     return { connection, access, db: driverAt(connection, named), database: named }
   }
 
@@ -261,7 +283,7 @@ export function createDbAdmin(options: DbAdminOptions): DbAdmin {
       method: 'GET',
       path: '/api/databases',
       async run(request, viewer) {
-        const { connection, db } = reach(
+        const { connection, db } = await reach(
           viewer,
           new URL(request.url).searchParams.get('connection'),
         )
@@ -274,7 +296,7 @@ export function createDbAdmin(options: DbAdminOptions): DbAdmin {
       path: '/api/tables',
       async run(request, viewer) {
         const params = new URL(request.url).searchParams
-        const { db } = reach(viewer, params.get('connection'), params.get('database'))
+        const { db } = await reach(viewer, params.get('connection'), params.get('database'))
         return { tables: await db.tables() }
       },
     },
@@ -283,7 +305,7 @@ export function createDbAdmin(options: DbAdminOptions): DbAdmin {
       path: '/api/table',
       async run(request, viewer) {
         const params = new URL(request.url).searchParams
-        const { db } = reach(viewer, params.get('connection'), params.get('database'))
+        const { db } = await reach(viewer, params.get('connection'), params.get('database'))
         const table = await db.table(
           text(params.get('schema'), 'schema'),
           text(params.get('name'), 'name'),
@@ -297,7 +319,7 @@ export function createDbAdmin(options: DbAdminOptions): DbAdmin {
       path: '/api/info',
       async run(request, viewer) {
         const params = new URL(request.url).searchParams
-        const { db } = reach(viewer, params.get('connection'), params.get('database'))
+        const { db } = await reach(viewer, params.get('connection'), params.get('database'))
         return { info: await db.info() }
       },
     },
@@ -306,7 +328,7 @@ export function createDbAdmin(options: DbAdminOptions): DbAdmin {
       path: '/api/count',
       async run(request, viewer) {
         const body = await json(request)
-        const { connection, db, database } = reach(viewer, body.connection, body.database)
+        const { connection, db, database } = await reach(viewer, body.connection, body.database)
         const target = {
           schema: text(body.schema, 'schema'),
           table: text(body.table, 'table'),
@@ -348,7 +370,7 @@ export function createDbAdmin(options: DbAdminOptions): DbAdmin {
       path: '/api/rows',
       async run(request, viewer) {
         const body = await json(request)
-        const { connection, db, database } = reach(viewer, body.connection, body.database)
+        const { connection, db, database } = await reach(viewer, body.connection, body.database)
         const page = rowsRequest(body)
         const started = performance.now()
         const statement = `${page.schema}.${page.table}`
@@ -386,7 +408,11 @@ export function createDbAdmin(options: DbAdminOptions): DbAdmin {
       path: '/api/query',
       async run(request, viewer) {
         const body = await json(request)
-        const { connection, access, db, database } = reach(viewer, body.connection, body.database)
+        const { connection, access, db, database } = await reach(
+          viewer,
+          body.connection,
+          body.database,
+        )
         const sql = text(body.sql, 'sql')
         const maxRows =
           body.maxRows === undefined
@@ -443,7 +469,11 @@ export function createDbAdmin(options: DbAdminOptions): DbAdmin {
       path: '/api/apply',
       async run(request, viewer) {
         const body = await json(request)
-        const { connection, access, db, database } = reach(viewer, body.connection, body.database)
+        const { connection, access, db, database } = await reach(
+          viewer,
+          body.connection,
+          body.database,
+        )
         const target = { schema: text(body.schema, 'schema'), table: text(body.table, 'table') }
         const changes = changesOf(body.changes)
         const dryRun = body.dryRun === true
@@ -489,7 +519,7 @@ export function createDbAdmin(options: DbAdminOptions): DbAdmin {
       path: '/api/export',
       async run(request, viewer) {
         const body = await json(request)
-        const { connection, db, database } = reach(viewer, body.connection, body.database)
+        const { connection, db, database } = await reach(viewer, body.connection, body.database)
         const format = formatOf(body.format)
         const page = rowsRequest({ ...body, limit: undefined, offset: undefined })
         const started = performance.now()
@@ -497,7 +527,7 @@ export function createDbAdmin(options: DbAdminOptions): DbAdmin {
         // Read the first batch before answering, so a bad table or filter is a proper error.
         const first = await batches.next()
         let replayed = false
-        const replay: AsyncIterator<{ columns: { name: string }[]; rows: (string | null)[][] }> = {
+        const replay: AsyncIterator<ExportBatch> = {
           next: async () => {
             if (replayed) return batches.next()
             replayed = true
@@ -539,7 +569,7 @@ export function createDbAdmin(options: DbAdminOptions): DbAdmin {
       path: '/api/backup-options',
       async run(request, viewer) {
         const params = new URL(request.url).searchParams
-        const target = reach(viewer, params.get('connection'), params.get('database'))
+        const target = await reach(viewer, params.get('connection'), params.get('database'))
         return (await backups()).options(backupContext(target, viewer))
       },
     },
@@ -556,7 +586,7 @@ export function createDbAdmin(options: DbAdminOptions): DbAdmin {
       path,
       async run(request: Request, viewer: Viewer) {
         const body = await json(request)
-        const target = reach(viewer, body.connection, body.database)
+        const target = await reach(viewer, body.connection, body.database)
         return (await backups())[action](backupContext(target, viewer), body)
       },
     })),
@@ -566,7 +596,7 @@ export function createDbAdmin(options: DbAdminOptions): DbAdmin {
       async run(request, viewer) {
         // The body is the piece itself; the rest comes in the address.
         const params = new URL(request.url).searchParams
-        const target = reach(viewer, params.get('connection'), params.get('database'))
+        const target = await reach(viewer, params.get('connection'), params.get('database'))
         return (await backups()).chunk(backupContext(target, viewer), request)
       },
     },
@@ -883,10 +913,16 @@ function changesOf(value: unknown): Change[] {
     if (change.type === 'insert')
       return { type: 'insert', values: values(change.values ?? {}, `${at}.values`, true, false) }
     if (change.type === 'update') {
+      const set = values(change.values, `${at}.values`, true, true)
+      const original =
+        change.original === undefined
+          ? undefined
+          : values(change.original, `${at}.original`, true, false)
       return {
         type: 'update',
         key: values(change.key, `${at}.key`, false, true) as Record<string, string>,
-        values: values(change.values, `${at}.values`, true, true),
+        values: set,
+        ...(original ? { original } : {}),
       }
     }
     if (change.type === 'delete') {

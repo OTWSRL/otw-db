@@ -1,14 +1,16 @@
 import type CursorClass from 'pg-cursor'
 import { connect } from 'node:net'
-import type { FieldDef, Pool, PoolClient, PoolConfig } from 'pg'
+import type { FieldDef, Pool, PoolClient, PoolConfig, QueryArrayConfig } from 'pg'
 import { ConnectionError, DbAdminError, QueryError } from '../errors.ts'
 import {
   DATABASES_SQL,
   detail,
   dialect,
+  EXPORT_COLUMNS_SQL,
+  exportColumns,
   INFO_SQL,
-  literal,
   quote,
+  sqlDialect,
   summary,
   TABLE_SQL,
   TABLES_SQL,
@@ -17,13 +19,24 @@ import {
   type CatalogDetail,
   type CatalogTable,
 } from './postgres-catalog.ts'
-import { changeStatement, orderBy, Parameters, where, whole } from './sql.ts'
+import {
+  changeStatement,
+  EXPORT_IDLE_MS,
+  orderBy,
+  Parameters,
+  refuseChanged,
+  seconds,
+  stalledExport,
+  where,
+  whole,
+} from './sql.ts'
 import type {
   ApplyResult,
   Capabilities,
   Change,
   DatabaseList,
   Driver,
+  ExportColumn,
   QueryOptions,
   QueryResult,
   ResultSet,
@@ -68,7 +81,20 @@ export interface PostgresOptions {
    * from that package, which pnpm requires, since it keeps a package's dependencies beside it.
    */
   modules?: PostgresModules
+  /**
+   * How long a request waits for one of the pool's three connections, or for the server to
+   * answer, before it fails and says so. Defaults to 10 seconds.
+   */
+  connectTimeoutMs?: number
+  /**
+   * How long an export may sit between two batches, its rows unread, before it's ended and its
+   * connection is free again. Defaults to 5 minutes.
+   */
+  exportIdleMs?: number
 }
+
+const CONNECT_TIMEOUT_MS = 10_000
+const POOL_SIZE = 3
 
 // Imported where the app runs, not bundled: an app installs only the drivers it uses, and a
 // bundler (Next.js) mustn't fail on one it doesn't have.
@@ -147,35 +173,55 @@ export function postgresUrlAt(url: string, database: string): string {
  * connections, each closed after 10 s unused; an admin tool needs few.
  */
 export function postgresDriver(url: string, options: PostgresOptions = {}): Driver {
-  return new PostgresDriver(url, options.modules)
+  return new PostgresDriver(url, options)
 }
 
 class PostgresDriver implements Driver {
   readonly kind = 'postgres'
   readonly capabilities: Capabilities = { schemas: true, transactionalDdl: true, cancel: true }
-  readonly sql = { identifier: quote, literal }
+  readonly sql = sqlDialect
   readonly pgUrl: string
   readonly #url: string
   readonly #config: PoolConfig
   readonly #modules: PostgresModules | undefined
+  readonly #options: PostgresOptions
+  readonly #connectTimeoutMs: number
+  readonly #exportIdleMs: number
   #pool: Promise<{ pool: Pool; modules: Modules }> | undefined
   /** Type names by OID, filled as results bring new ones. */
   readonly #typeNames = new Map<number, string>()
+  /** Closed for good: a pool opened after that would be one nobody closes. */
+  #closed = false
+  /** The pool's clients that have their error listener: each comes back many times. */
+  readonly #heard = new WeakSet<PoolClient>()
 
-  constructor(url: string, modules: PostgresModules | undefined) {
+  constructor(url: string, options: PostgresOptions) {
     this.#url = url
     this.pgUrl = url
-    this.#modules = modules
+    this.#options = options
+    this.#modules = options.modules
+    this.#connectTimeoutMs = options.connectTimeoutMs ?? CONNECT_TIMEOUT_MS
+    this.#exportIdleMs = options.exportIdleMs ?? EXPORT_IDLE_MS
     this.#config = {
       connectionString: url,
-      max: 3,
+      max: POOL_SIZE,
       idleTimeoutMillis: 10_000,
+      // Without it a request waits for good behind three connections that are held: exports
+      // nobody reads, a backup under way.
+      connectionTimeoutMillis: this.#connectTimeoutMs,
       application_name: 'otw-db',
       types: AS_TEXT,
     }
   }
 
   #open(): Promise<{ pool: Pool; modules: Modules }> {
+    // Whoever still holds a driver that was closed (a request under way when its database was
+    // the one used longest ago) is told, and asks again for one that's open.
+    if (this.#closed) {
+      return Promise.reject(
+        new ConnectionError('This connection to PostgreSQL was closed. Try again.'),
+      )
+    }
     this.#pool ??= loadModules(this.#modules).then(
       (modules) => {
         const pool = new modules.Pool(this.#config)
@@ -194,11 +240,27 @@ class PostgresDriver implements Driver {
 
   async #connect(): Promise<{ client: PoolClient; modules: Modules }> {
     const { pool, modules } = await this.#open()
+    let client: PoolClient
     try {
-      return { client: await pool.connect(), modules }
+      client = await pool.connect()
     } catch (error) {
-      throw new ConnectionError(`Could not connect to PostgreSQL: ${(error as Error).message}`)
+      const message = (error as Error).message
+      // pg-pool's one message for both: no connection came free, or none could be opened in time.
+      throw new ConnectionError(
+        /timeout exceeded when trying to connect/i.test(message)
+          ? `All ${POOL_SIZE} of this connection’s PostgreSQL connections are busy (an export or a backup under way, perhaps), or the server didn’t answer in ${seconds(this.#connectTimeoutMs)}. Try again in a moment.`
+          : `Could not connect to PostgreSQL: ${message}`,
+      )
     }
+    if (!this.#heard.has(client)) {
+      this.#heard.add(client)
+      // The pool listens for a client's errors only while the client is idle in it. The server
+      // dropping one that's held (between an export's batches, in a backup's session) emits an
+      // error too, and one nobody listens for ends the process. The statement that next finds
+      // the connection gone reports it.
+      client.on('error', () => {})
+    }
+    return { client, modules }
   }
 
   async #catalog<T>(text: string, values: unknown[] = []): Promise<T[]> {
@@ -270,7 +332,7 @@ class PostgresDriver implements Driver {
   }
 
   withDatabase(name: string): Driver {
-    return new PostgresDriver(postgresUrlAt(this.#url, name), this.#modules)
+    return new PostgresDriver(postgresUrlAt(this.#url, name), this.#options)
   }
 
   async apply(
@@ -287,6 +349,16 @@ class PostgresDriver implements Driver {
     try {
       await client.query(`BEGIN; SET LOCAL statement_timeout = ${whole(timeoutMs)}`)
       for (const statement of statements) {
+        if (statement.check) {
+          // As the grid read them: every value the server's own text.
+          const { rows } = await client.query({
+            text: statement.check.text,
+            values: statement.check.values,
+            rowMode: 'array',
+            types: AS_TEXT,
+          })
+          refuseChanged(dialect, statement, rows[0] as (string | null)[] | undefined)
+        }
         const { rowCount } = await client.query(statement.text, statement.values)
         if (statement.oneRow && rowCount !== 1) {
           const why =
@@ -315,31 +387,64 @@ class PostgresDriver implements Driver {
       order = [],
     }: Pick<RowsRequest, 'schema' | 'table' | 'filters' | 'order'>,
     { timeoutMs }: { timeoutMs: number },
-  ): AsyncGenerator<{ columns: { name: string }[]; rows: (string | null)[][] }> {
+  ): AsyncGenerator<{ columns: ExportColumn[]; rows: (string | null)[][] }> {
     const parameters = new Parameters(dialect)
     const values = parameters.values
     const sql = `SELECT * FROM ${quote(schema)}.${quote(table)}${where(dialect, filters, parameters)}${orderBy(dialect, order)}`
     const { client, modules } = await this.#connect()
     // Until the last batch is read, the connection is mid-transaction: a stop on the way closes it.
     let finished = false
+    let released = false
+    const release = (destroy: boolean) => {
+      if (released) return
+      released = true
+      client.release(destroy)
+    }
+    // An export nobody reads sits between two batches with its cursor open: it would hold one of
+    // the pool's three connections, a snapshot and a lock on the table for as long as the browser
+    // stays away. No server timeout covers that wait (the session counts as active, and
+    // statement_timeout isn't acted on while it waits for the client), so it's ended from here.
+    let stalled = false
+    const stall = () => {
+      stalled = true
+      release(true)
+    }
     try {
       await client.query(`BEGIN READ ONLY; SET LOCAL statement_timeout = ${whole(timeoutMs)}`)
+      const catalog = await client.query({
+        text: EXPORT_COLUMNS_SQL,
+        values: [schema, table],
+        rowMode: 'array',
+        types: AS_TEXT,
+      })
       const cursor = client.query(
         new modules.Cursor(sql, values, { rowMode: 'array', types: AS_TEXT } as never),
       )
       // The first batch always, even empty, so a file of no rows still has its column names.
       for (let first = true; ; first = false) {
         const { rows, fields } = await readBatch(cursor, EXPORT_BATCH)
-        if (rows.length || first) yield { columns: fields.map((f) => ({ name: f.name })), rows }
+        if (rows.length || first) {
+          const names = fields.map((f) => f.name)
+          const waiting = setTimeout(stall, this.#exportIdleMs)
+          // The wait is its reader's, not the process's: it doesn't keep a server from stopping.
+          waiting.unref()
+          try {
+            yield { columns: exportColumns(names, catalog.rows as (string | null)[][]), rows }
+          } finally {
+            clearTimeout(waiting)
+          }
+          if (stalled) break
+        }
         if (rows.length < EXPORT_BATCH) break
       }
+      if (stalled) throw stalledExport(this.#exportIdleMs)
       await new Promise<void>((resolve, reject) => cursor.close((e) => (e ? reject(e) : resolve())))
       await client.query(READ_CLEANUP)
       finished = true
     } catch (error) {
       throw toError(error)
     } finally {
-      client.release(!finished)
+      release(!finished)
     }
   }
 
@@ -439,14 +544,23 @@ class PostgresDriver implements Driver {
       exclusive: false,
       async query(text, values) {
         try {
-          const result = await client.query({
+          // The extended protocol: one statement a query, whatever the text holds, as the server
+          // refuses a second. A restore's statements come from a file, and none may end its
+          // transaction. (pg 8.12 and later take queryMode; its types don't list it yet.)
+          const config: QueryArrayConfig<unknown[]> & { queryMode: 'extended' } = {
             text,
-            values: values?.map((v) =>
-              v instanceof Uint8Array ? Buffer.from(v.buffer, v.byteOffset, v.byteLength) : v,
-            ),
+            ...(values
+              ? {
+                  values: values.map((v) =>
+                    v instanceof Uint8Array ? Buffer.from(v.buffer, v.byteOffset, v.byteLength) : v,
+                  ),
+                }
+              : {}),
             rowMode: 'array',
             types: AS_TEXT,
-          })
+            queryMode: 'extended',
+          }
+          const result = await client.query(config)
           return { rows: result.rows as (string | null)[][] }
         } catch (error) {
           throw toError(error)
@@ -467,6 +581,7 @@ class PostgresDriver implements Driver {
   }
 
   async close(): Promise<void> {
+    this.#closed = true
     const opened = this.#pool
     this.#pool = undefined
     // One that failed to open has nothing to close.

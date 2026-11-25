@@ -1,4 +1,12 @@
-import type { Column, Definition, TableDetail, TableKind, TableSummary } from '../types.ts'
+import type {
+  Column,
+  Definition,
+  ExportColumn,
+  SqlDialect,
+  TableDetail,
+  TableKind,
+  TableSummary,
+} from '../types.ts'
 import { doubleQuote, type Dialect } from './sql.ts'
 
 /*
@@ -36,6 +44,48 @@ export const dialect: Dialect = {
   // One array parameter, read as the column's type's array.
   inList: (expression, values, parameter) => `${expression} = ANY(${parameter(values)})`,
   insertDefaults: 'DEFAULT VALUES',
+  forUpdate: ' FOR UPDATE',
+}
+
+/**
+ * A value as a literal that reads the same whatever standard_conforming_strings is, as
+ * quote_literal() writes them: a value with a backslash goes in an E'…' string, where a
+ * backslash always escapes. In a plain '…' string a session with the setting off would read
+ * `\'` as a quote, and the value could end its string there and run as SQL. A SET at the top of
+ * the file wouldn't do: a client that sends the whole file at once has it parsed before the SET
+ * runs.
+ */
+export function portableLiteral(value: string | null): string {
+  if (value === null) return 'NULL'
+  const quoted = value.replaceAll("'", "''")
+  return value.includes('\\') ? `E'${quoted.replaceAll('\\', '\\\\')}'` : `'${quoted}'`
+}
+
+/** How PostgreSQL's SQL is written for exports: files run later, in sessions set up anyhow. */
+export const sqlDialect: SqlDialect = {
+  identifier: quote,
+  literal: portableLiteral,
+  overriding: ' OVERRIDING SYSTEM VALUE',
+}
+
+/** A table's columns an INSERT can't simply fill: generated ones, and identities numbered always. */
+export const EXPORT_COLUMNS_SQL = `SELECT a.attname, a.attgenerated <> '', a.attidentity = 'a'
+  FROM pg_catalog.pg_attribute a
+ WHERE a.attrelid = to_regclass(format('%I.%I', $1::text, $2::text)) AND a.attnum > 0 AND NOT a.attisdropped`
+
+/** An export's columns, by the names its rows came with, from EXPORT_COLUMNS_SQL's rows. */
+export function exportColumns(
+  names: readonly string[],
+  catalog: readonly (readonly (string | null)[])[],
+): ExportColumn[] {
+  const flags = new Map(
+    catalog.map(([name, generated, identity]) => [name, { generated, identity }]),
+  )
+  return names.map((name) => ({
+    name,
+    ...(flags.get(name)?.generated === 't' ? { generated: true } : {}),
+    ...(flags.get(name)?.identity === 't' ? { identity: true } : {}),
+  }))
 }
 
 /** Every table and view, but the system's. */

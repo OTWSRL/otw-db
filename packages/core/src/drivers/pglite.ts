@@ -4,6 +4,7 @@ import type {
   Capabilities,
   Change,
   Driver,
+  ExportColumn,
   QueryOptions,
   QueryResult,
   ResultSet,
@@ -16,9 +17,11 @@ import type {
 import {
   detail,
   dialect,
+  EXPORT_COLUMNS_SQL,
+  exportColumns,
   INFO_SQL,
-  literal,
   quote,
+  sqlDialect,
   summary,
   TABLE_SQL,
   TABLES_SQL,
@@ -27,7 +30,16 @@ import {
   type CatalogDetail,
   type CatalogTable,
 } from './postgres-catalog.ts'
-import { changeStatement, orderBy, Parameters, where, whole } from './sql.ts'
+import {
+  changeStatement,
+  EXPORT_IDLE_MS,
+  orderBy,
+  Parameters,
+  refuseChanged,
+  stalledExport,
+  where,
+  whole,
+} from './sql.ts'
 
 /** What this driver uses of a PGlite instance: shapes only, so the core needs no PGlite. */
 export interface PGliteQueryable {
@@ -37,6 +49,7 @@ export interface PGliteQueryable {
     options?: {
       rowMode?: 'array' | 'object'
       parsers?: Record<number, (value: string) => unknown>
+      serializers?: Record<number, (value: unknown) => string>
     },
   ): Promise<{
     rows: unknown[]
@@ -50,6 +63,8 @@ export interface PGliteQueryable {
 export interface PGliteLike extends PGliteQueryable {
   /** Its parsers by type OID: the types it would turn into JavaScript values. */
   parsers: Record<number, unknown>
+  /** How it writes a JavaScript value of each type for the server, by type OID. */
+  serializers?: Record<number | string, (value: never) => string>
   /** Runs alone: the host's own queries wait until it's done. */
   transaction<T>(
     callback: (tx: PGliteQueryable & { rollback(): Promise<void> }) => Promise<T>,
@@ -60,31 +75,156 @@ const asIs = (value: string) => value
 
 const NOT_IN_TRANSACTION = '25001'
 const EXPORT_BATCH = 1_000
+const CURSOR = 'otw_db_cursor'
+const FIX = 'otw_db_fix'
+
+/** The statements a cursor can read from, past the comments and brackets before them. */
+const READS_ROWS = /^(?:\s+|--[^\n]*(?:\n|$)|\/\*[\s\S]*?\*\/|\()*(?:SELECT|WITH|VALUES|TABLE)\b/i
+
+/**
+ * What a statement can leave on a session past its own transaction. The host shares the one
+ * connection, so all of it is the host's to find again as it left it: its settings (search_path,
+ * a role), its temporary tables, prepared statements, cursors, LISTENs and advisory locks.
+ */
+interface SessionState {
+  /** The settings SET for the session, by name, and always `role` and `session_authorization`. */
+  settings: Record<string, string>
+  temp: { oid: number; drop: string }[]
+  prepared: string[]
+  cursors: string[]
+  channels: string[]
+  /** Advisory locks as pg_locks has them: classid, objid, objsubid, mode. */
+  locks: [number, number, number, string][]
+}
+
+const STATE_SQL = `SELECT json_build_object(
+  'settings', (SELECT json_object_agg(s.name, s.setting) FROM (
+                 SELECT name, setting FROM pg_catalog.pg_settings WHERE source = 'session'
+                 -- Who the session runs as: pg_settings leaves these two out.
+                 UNION ALL SELECT 'role', current_setting('role')
+                 UNION ALL SELECT 'session_authorization', session_user::text) s),
+  'temp', (SELECT coalesce(json_agg(json_build_object('oid', c.oid::bigint, 'drop',
+             format('DROP %s IF EXISTS pg_temp.%I CASCADE', CASE c.relkind WHEN 'v' THEN 'VIEW'
+               WHEN 'm' THEN 'MATERIALIZED VIEW' WHEN 'S' THEN 'SEQUENCE' WHEN 'f' THEN 'FOREIGN TABLE'
+               ELSE 'TABLE' END, c.relname))), '[]')
+             FROM pg_catalog.pg_class c
+            WHERE c.relnamespace = pg_catalog.pg_my_temp_schema() AND c.relkind IN ('r', 'p', 'v', 'm', 'S', 'f')),
+  'prepared', (SELECT coalesce(json_agg(name), '[]') FROM pg_catalog.pg_prepared_statements),
+  'cursors', (SELECT coalesce(json_agg(name), '[]') FROM pg_catalog.pg_cursors),
+  'channels', (SELECT coalesce(json_agg(c), '[]') FROM pg_catalog.pg_listening_channels() c),
+  'locks', (SELECT coalesce(json_agg(json_build_array(classid::bigint, objid::bigint, objsubid, mode)), '[]')
+              FROM pg_catalog.pg_locks
+             WHERE locktype = 'advisory' AND pid = pg_catalog.pg_backend_pid() AND granted))::text`
+
+/** A setting's name, as RESET takes it: `search_path`, or an extension's `app.tenant`. */
+const SETTING = /^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_$]*)*$/
+
+async function sessionState(on: PGliteQueryable): Promise<SessionState> {
+  const { rows } = await on.query(STATE_SQL, [], { rowMode: 'array', parsers: {} })
+  return JSON.parse((rows as [string][])[0]![0]) as SessionState
+}
+
+/** The statements that put a session back as `before` has it, from how it is `now`. */
+function repairs(before: SessionState, now: SessionState): { sql: string; values?: unknown[] }[] {
+  const fixes: { sql: string; values?: unknown[] }[] = []
+  // Who the session runs as comes first: the rest may need the host's own privileges.
+  const first = ['session_authorization', 'role']
+  const names = [...new Set([...Object.keys(before.settings), ...Object.keys(now.settings)])].sort(
+    (a, b) => first.indexOf(b) - first.indexOf(a),
+  )
+  for (const name of names) {
+    const was = before.settings[name]
+    if (was === now.settings[name]) continue
+    if (was !== undefined)
+      fixes.push({ sql: 'SELECT set_config($1, $2, false)', values: [name, was] })
+    else if (SETTING.test(name)) fixes.push({ sql: `RESET ${name}` })
+  }
+  const had = new Set(before.temp.map((t) => t.oid))
+  for (const made of now.temp) if (!had.has(made.oid)) fixes.push({ sql: made.drop })
+  const added = (list: (s: SessionState) => string[]) =>
+    list(now).filter((name) => !list(before).includes(name))
+  for (const name of added((s) => s.cursors)) fixes.push({ sql: `CLOSE ${quote(name)}` })
+  for (const name of added((s) => s.prepared)) fixes.push({ sql: `DEALLOCATE ${quote(name)}` })
+  for (const name of added((s) => s.channels)) fixes.push({ sql: `UNLISTEN ${quote(name)}` })
+  const held = new Set(before.locks.map((l) => l.join(' ')))
+  const taken = now.locks.filter((l) => !held.has(l.join(' ')))
+  if (taken.length && !before.locks.length) fixes.push({ sql: 'SELECT pg_advisory_unlock_all()' })
+  else {
+    for (const [classid, objid, objsubid, mode] of taken) {
+      const shared = mode === 'ShareLock' ? '_shared' : ''
+      // One key of 64 bits (objsubid 1), or two of 32: as pg_locks splits them.
+      const key =
+        objsubid === 1
+          ? '($1::bigint << 32) | $2::bigint'
+          : '$1::bigint::oid::int4, $2::bigint::oid::int4'
+      // Taken more than once, it's let go as often: until PostgreSQL says it wasn't held.
+      fixes.push({
+        sql: `SELECT count(*) FROM generate_series(1, 1000) WHERE pg_advisory_unlock${shared}(${key})`,
+        values: [classid, objid],
+      })
+    }
+  }
+  return fixes
+}
+
+/**
+ * Puts the session back as `before` has it. Inside a transaction (`savepoints`), each fix is on
+ * its own savepoint, so one that fails doesn't take the transaction's work with it.
+ */
+async function restoreSession(
+  on: PGliteQueryable,
+  before: SessionState,
+  savepoints: boolean,
+): Promise<void> {
+  for (const fix of repairs(before, await sessionState(on))) {
+    try {
+      if (savepoints) await on.query(`SAVEPOINT ${FIX}`)
+      await on.query(fix.sql, fix.values)
+      if (savepoints) await on.query(`RELEASE SAVEPOINT ${FIX}`)
+    } catch (error) {
+      console.error(`otw-db: could not reset the PGlite session (${fix.sql})`, error)
+      if (savepoints) await on.query(`ROLLBACK TO SAVEPOINT ${FIX}`)
+    }
+  }
+}
 
 /**
  * A driver for a PGlite database a host already has open, such as an OTW CMS site's embedded one:
  * PGlite takes one process, so the tool uses the host's instance rather than opening the files.
  * Each statement runs in PGlite's exclusive transaction, so it never interleaves with the host's
- * queries; reads roll back; a write is followed by DISCARD ALL, so nothing it set (SET, SET ROLE,
- * temporary tables, session locks) stays on the connection the host shares.
+ * queries; reads roll back. The connection is the host's own, so after someone's statement the
+ * session is put back as the host had it: what the statement set (SET, SET ROLE, temporary
+ * tables, LISTEN, session locks) is undone before the host's next query, and what the host set
+ * is left alone.
  *
  * PGlite runs on the host's own thread and can't be interrupted: a heavy statement holds the host
  * until it finishes. Tell people so where they choose this connection.
  */
-export function pgliteDriver(client: PGliteLike): Driver {
-  return new PGliteDriver(client)
+export function pgliteDriver(client: PGliteLike, options: PGliteOptions = {}): Driver {
+  return new PGliteDriver(client, options)
+}
+
+/** How the PGlite driver behaves, where the defaults don't suit. */
+export interface PGliteOptions {
+  /**
+   * How long an export may sit between two batches, its rows unread, before it's ended and the
+   * rows the database kept for it are let go. Defaults to 5 minutes.
+   */
+  exportIdleMs?: number
 }
 
 class PGliteDriver implements Driver {
   readonly kind = 'postgres'
   readonly capabilities: Capabilities = { schemas: true, transactionalDdl: true, cancel: false }
-  readonly sql = { identifier: quote, literal }
+  readonly sql = sqlDialect
   readonly #client: PGliteLike
+  readonly #exportIdleMs: number
   readonly #typeNames = new Map<number, string>()
   #asText: Record<number, (value: string) => unknown> = {}
 
-  constructor(client: PGliteLike) {
+  constructor(client: PGliteLike, options: PGliteOptions) {
     this.#client = client
+    this.#exportIdleMs = options.exportIdleMs ?? EXPORT_IDLE_MS
   }
 
   /**
@@ -99,7 +239,25 @@ class PGliteDriver implements Driver {
     return this.#asText
   }
 
-  /** One statement in a read-only transaction that rolls back. */
+  /**
+   * How a parameter is written for the server. PGlite's own way wants a JavaScript value of the
+   * parameter's type: a Uint8Array for bytea, and it refuses text. The grid has every value as
+   * the server's own text, which the server reads as any type: so text goes as it is, a list of
+   * text (a filter's IN) as an array of it, and anything else as PGlite would write it.
+   */
+  readonly #asGiven = new Proxy({} as Record<number, (value: unknown) => string>, {
+    get: (_, oid) => (value: unknown) => {
+      if (typeof value === 'string') return value
+      if (Array.isArray(value) && value.every((v) => typeof v === 'string')) {
+        return `{${value.map((v: string) => `"${v.replaceAll('\\', '\\\\').replaceAll('"', '\\"')}"`).join(',')}}`
+      }
+      const own = this.#client.serializers?.[oid as string] as
+        ((value: unknown) => string) | undefined
+      return own ? own(value) : String(value)
+    },
+  })
+
+  /** One of the driver's own statements, in a read-only transaction that rolls back. */
   async #read(
     sql: string,
     params: unknown[] = [],
@@ -107,19 +265,53 @@ class PGliteDriver implements Driver {
     timeoutMs = 30_000,
   ) {
     try {
-      const result = await this.#client.transaction(async (tx) => {
+      return await this.#client.transaction(async (tx) => {
         await tx.query('SET TRANSACTION READ ONLY')
         await tx.query(`SET LOCAL statement_timeout = ${whole(timeoutMs)}`)
-        const answer = await tx.query(sql, params, { rowMode, parsers: this.#text })
+        const answer = await tx.query(sql, params, {
+          rowMode,
+          parsers: this.#text,
+          serializers: this.#asGiven,
+        })
         await tx.rollback()
         return answer
       })
-      // Session advisory locks outlast a rollback.
-      await this.#client.query('SELECT pg_advisory_unlock_all()')
-      return result
     } catch (error) {
       throw toError(error)
     }
+  }
+
+  /**
+   * Someone's statement, read through a cursor where it's one a cursor takes, so only the rows
+   * that will be shown (and one more, to say there are more) are built in the host's memory.
+   * PGlite hands a query's whole result over at once, in the host's process: a million rows asked
+   * for are a million rows held. What a cursor can't read (SHOW, EXPLAIN, INSERT … RETURNING)
+   * runs as it is, and so does a statement PostgreSQL refuses, so its error says where in the
+   * person's own SQL it is.
+   */
+  async #limited(tx: PGliteQueryable, sql: string, maxRows: number) {
+    const options = { rowMode: 'array' as const, parsers: this.#text }
+    if (!READS_ROWS.test(sql)) return tx.query(sql, [], options)
+    await tx.query(`SAVEPOINT ${CURSOR}`)
+    try {
+      await tx.query(`DECLARE ${CURSOR} NO SCROLL CURSOR FOR ${sql}`)
+    } catch {
+      await tx.query(`ROLLBACK TO SAVEPOINT ${CURSOR}`)
+      return tx.query(sql, [], options)
+    }
+    return tx.query(`FETCH ${whole(maxRows) + 1} FROM ${CURSOR}`, [], options)
+  }
+
+  /**
+   * Puts the session back once a statement's transaction is over. A rollback undid what a
+   * transaction undoes, but prepared statements and session locks outlast it; a commit's LISTEN
+   * only shows once it has committed.
+   */
+  async #restoreAfter(before: SessionState | undefined): Promise<void> {
+    if (!before) return
+    await restoreSession(this.#client, before, false).catch((error: unknown) =>
+      console.error('otw-db: could not reset the PGlite session', error),
+    )
   }
 
   async #named(fields: { name: string; dataTypeID: number }[]) {
@@ -182,33 +374,41 @@ class PGliteDriver implements Driver {
 
   /**
    * One statement. Reads in a read-only transaction that rolls back; writes in one that commits,
-   * or alone where PostgreSQL refuses one (VACUUM), then DISCARD ALL.
+   * or alone where PostgreSQL refuses one (VACUUM). Either way the session is then as the host
+   * had it.
    */
   async query(sql: string, options: QueryOptions): Promise<QueryResult> {
     if (options.signal?.aborted) throw new DbAdminError('The query was canceled.', 409, 'canceled')
     const started = performance.now()
+    const write = options.access !== 'read'
+    let before: SessionState | undefined
     let result
-    if (options.access === 'read') {
-      result = await this.#read(sql, [], 'array', options.timeoutMs)
-    } else {
+    try {
+      result = await this.#client.transaction(async (tx) => {
+        // Before anything is set: SET LOCAL would read as the session's own.
+        before = await sessionState(tx)
+        if (!write) await tx.query('SET TRANSACTION READ ONLY')
+        await tx.query(`SET LOCAL statement_timeout = ${whole(options.timeoutMs)}`)
+        const answer = await this.#limited(tx, sql, options.maxRows)
+        if (write) {
+          // Inside the transaction, so the host's next query, waiting for it, already finds its
+          // own settings.
+          await restoreSession(tx, before, true)
+        } else await tx.rollback()
+        return answer
+      })
+      await this.#restoreAfter(before)
+    } catch (error) {
+      if (!write || (error as { code?: string }).code !== NOT_IN_TRANSACTION) {
+        await this.#restoreAfter(before)
+        throw toError(error)
+      }
       try {
-        result = await this.#client.transaction(async (tx) => {
-          await tx.query(`SET LOCAL statement_timeout = ${whole(options.timeoutMs)}`)
-          return tx.query(sql, [], { rowMode: 'array', parsers: this.#text })
-        })
-      } catch (error) {
-        if ((error as { code?: string }).code !== NOT_IN_TRANSACTION) throw toError(error)
-        result = await this.#client
-          .query(sql, [], { rowMode: 'array', parsers: this.#text })
-          .catch((e: unknown) => {
-            throw toError(e)
-          })
+        result = await this.#client.query(sql, [], { rowMode: 'array', parsers: this.#text })
+      } catch (alone) {
+        throw toError(alone)
       } finally {
-        await this.#client
-          .exec('DISCARD ALL')
-          .catch((error: unknown) =>
-            console.error('otw-db: could not reset the PGlite session', error),
-          )
+        await this.#restoreAfter(before)
       }
     }
     const rows = result.rows as (string | null)[][]
@@ -243,7 +443,18 @@ class PGliteDriver implements Driver {
       await this.#client.transaction(async (tx) => {
         await tx.query(`SET LOCAL statement_timeout = ${whole(timeoutMs)}`)
         for (const statement of statements) {
-          const { affectedRows } = await tx.query(statement.text, statement.values)
+          if (statement.check) {
+            // As the grid read them: every value the server's own text.
+            const { rows } = await tx.query(statement.check.text, statement.check.values, {
+              rowMode: 'array',
+              parsers: this.#text,
+              serializers: this.#asGiven,
+            })
+            refuseChanged(dialect, statement, rows[0] as (string | null)[] | undefined)
+          }
+          const { affectedRows } = await tx.query(statement.text, statement.values, {
+            serializers: this.#asGiven,
+          })
           if (statement.oneRow && affectedRows !== 1) {
             const why =
               affectedRows === 0
@@ -271,15 +482,68 @@ class PGliteDriver implements Driver {
       order = [],
     }: Pick<RowsRequest, 'schema' | 'table' | 'filters' | 'order'>,
     { timeoutMs }: { timeoutMs: number },
-  ): AsyncGenerator<{ columns: { name: string }[]; rows: (string | null)[][] }> {
+  ): AsyncGenerator<{ columns: ExportColumn[]; rows: (string | null)[][] }> {
     const parameters = new Parameters(dialect)
     const sql = `SELECT * FROM ${quote(schema)}.${quote(table)}${where(dialect, filters, parameters)}${orderBy(dialect, order)}`
-    // PGlite has no cursor to read from bit by bit: the rows come at once, then go out in batches.
-    const { rows, fields } = await this.#read(sql, parameters.values, 'array', timeoutMs)
-    const columns = fields.map((f) => ({ name: f.name }))
-    const list = rows as (string | null)[][]
-    for (let at = 0; at === 0 || at < list.length; at += EXPORT_BATCH) {
-      yield { columns, rows: list.slice(at, at + EXPORT_BATCH) }
+    const catalog = await this.#read(EXPORT_COLUMNS_SQL, [schema, table], 'array', timeoutMs)
+    // A cursor WITH HOLD, declared in a read-only transaction that ends at once: the database
+    // keeps the rows as they were at that moment, on its own side, and hands them over a batch
+    // at a time. Asked for whole, they would all be built in the host's memory at once; read
+    // through a cursor inside one transaction, they would hold the host's queries for as long
+    // as the file takes to download.
+    const cursor = `otw_db_export_${crypto.randomUUID().replaceAll('-', '')}`
+    const close = () => this.#client.query(`CLOSE ${cursor}`).catch(() => {})
+    try {
+      await this.#client.transaction(async (tx) => {
+        await tx.query('SET TRANSACTION READ ONLY')
+        await tx.query(`SET LOCAL statement_timeout = ${whole(timeoutMs)}`)
+        await tx.query(
+          `DECLARE ${cursor} NO SCROLL CURSOR WITH HOLD FOR ${sql}`,
+          parameters.values,
+          {
+            serializers: this.#asGiven,
+          },
+        )
+      })
+    } catch (error) {
+      throw toError(error)
+    }
+    // Nobody reading, the rows kept for the export would stay in the host's database for good.
+    let stalled = false
+    const stall = () => {
+      stalled = true
+      void close()
+    }
+    try {
+      for (let first = true; ; first = false) {
+        const { rows, fields } = await this.#client.query(
+          `FETCH ${EXPORT_BATCH} FROM ${cursor}`,
+          [],
+          {
+            rowMode: 'array',
+            parsers: this.#text,
+          },
+        )
+        if (rows.length || first) {
+          const columns = exportColumns(
+            fields.map((f) => f.name),
+            catalog.rows as (string | null)[][],
+          )
+          const waiting = setTimeout(stall, this.#exportIdleMs)
+          waiting.unref?.()
+          try {
+            yield { columns, rows: rows as (string | null)[][] }
+          } finally {
+            clearTimeout(waiting)
+          }
+          if (stalled) throw stalledExport(this.#exportIdleMs)
+        }
+        if (rows.length < EXPORT_BATCH) break
+      }
+    } catch (error) {
+      throw toError(error)
+    } finally {
+      await close()
     }
   }
 
@@ -292,10 +556,11 @@ class PGliteDriver implements Driver {
     const parsers = () => this.#text
     return new Promise<Session>((resolve, reject) => {
       let opened = false
+      let before: SessionState | undefined
       const done = client.transaction(async (tx) => {
         if (mode === 'snapshot') {
           await tx.query('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY')
-        }
+        } else before = await sessionState(tx)
         let decide!: (commit: boolean) => void
         const decided = new Promise<boolean>((r) => (decide = r))
         let ended = false
@@ -319,17 +584,20 @@ class PGliteDriver implements Driver {
             } catch (error) {
               throw toError(error)
             } finally {
-              // As after every write: nothing the session set (SET, locks) stays on the connection
-              // the host shares.
-              await client
-                .exec(mode === 'write' ? 'DISCARD ALL' : 'SELECT pg_advisory_unlock_all()')
-                .catch((error: unknown) =>
+              // A rollback leaves prepared statements and session locks, and a commit's LISTEN
+              // shows only now.
+              if (before) {
+                await restoreSession(client, before, false).catch((error: unknown) =>
                   console.error('otw-db: could not reset the PGlite session', error),
                 )
+              }
             }
           },
         })
-        if (!(await decided)) await tx.rollback()
+        if (!(await decided)) return tx.rollback()
+        // As after every write: what the session set (a restore's SETs, its locks) is undone
+        // inside the transaction, so the host's queries waiting for it find their own settings.
+        if (before) await restoreSession(tx, before, true)
       })
       done.catch((error: unknown) => {
         if (!opened) reject(toError(error))

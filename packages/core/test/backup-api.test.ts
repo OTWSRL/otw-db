@@ -57,7 +57,11 @@ async function restore(
   admin: DbAdmin,
   connection: string,
   file: Uint8Array,
-  { size = CHUNK_BYTES, kind = 'sql' }: { size?: number; kind?: string } = {},
+  {
+    size = CHUNK_BYTES,
+    kind = 'sql',
+    confirm = 'postgres',
+  }: { size?: number; kind?: string; confirm?: string } = {},
 ) {
   const started = await admin.fetch(
     request('/restore-start', { body: { connection, size: file.length, kind, name: 'b' } }),
@@ -72,7 +76,7 @@ async function restore(
     )
     expect(piece.status).toBe(200)
   }
-  const ran = await admin.fetch(request('/restore-run', { body: { connection, upload } }))
+  const ran = await admin.fetch(request('/restore-run', { body: { connection, upload, confirm } }))
   expect(ran.status).toBe(200)
   expect(ran.headers.get('content-type')).toBe('application/x-ndjson; charset=utf-8')
   return { upload, lines: await lines(ran) }

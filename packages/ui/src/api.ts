@@ -154,7 +154,7 @@ export function createApi(config: UiConfig, onUnauthorized: () => void, database
     return call<T>(where, sent, signal)
   }
 
-  return {
+  const api = {
     /** The same API on another of the connection's server's databases; null for its own. */
     forDatabase: (name: string | null) => createApi(config, onUnauthorized, name ?? undefined),
     connections: () =>
@@ -211,15 +211,30 @@ export function createApi(config: UiConfig, onUnauthorized: () => void, database
       on<RestorePlan>('/restore-plan', { connection, header }),
     /**
      * Uploads `file` a piece at a time (a host may take 4.5 MB a request at most), then runs the
-     * restore, telling `onLine` how it goes. Resolves with the restore's last line.
+     * restore, telling `onLine` how it goes. Resolves with the restore's last line. `confirm` is
+     * the database's name as the person typed it: the server runs nothing without it.
      */
     restore: async (
       connection: string,
       file: Blob & { name?: string },
       kind: 'sql' | 'pg_dump',
+      confirm: string,
       onUpload: (sent: number) => void,
       onLine: (line: RestoreLine) => void,
-    ): Promise<RestoreLine> => {
+    ): Promise<RestoreLine> =>
+      api.restoreRun(
+        connection,
+        await api.restoreUpload(connection, file, kind, onUpload),
+        confirm,
+        onLine,
+      ),
+    /** Sends `file` to wait in the database, a piece at a time, and resolves with its upload. */
+    restoreUpload: async (
+      connection: string,
+      file: Blob & { name?: string },
+      kind: 'sql' | 'pg_dump',
+      onUpload: (sent: number) => void,
+    ): Promise<string> => {
       const { upload, chunkBytes } = await on<{ upload: string; chunkBytes: number }>(
         '/restore-start',
         { connection, size: file.size, kind, name: file.name ?? 'backup' },
@@ -244,7 +259,19 @@ export function createApi(config: UiConfig, onUnauthorized: () => void, database
         await on('/restore-discard', { connection, upload }).catch(() => {})
         throw error
       }
-      const response = await send(...at('/restore-run', { connection, upload }))
+      return upload
+    },
+    /**
+     * Runs the restore of an upload, telling `onLine` how it goes, and resolves with its last
+     * line. After an error whose code is `busy` the upload is still there, to run again.
+     */
+    restoreRun: async (
+      connection: string,
+      upload: string,
+      confirm: string,
+      onLine: (line: RestoreLine) => void,
+    ): Promise<RestoreLine> => {
+      const response = await send(...at('/restore-run', { connection, upload, confirm }))
       if (!response.ok) throw await failure(response)
       let last: RestoreLine | null = null
       for await (const line of ndjson(response)) {
@@ -255,7 +282,11 @@ export function createApi(config: UiConfig, onUnauthorized: () => void, database
         throw new ApiError(500, 'failed', 'The restore stopped without saying how it went.')
       return last
     },
+    /** Drops an upload that won't be restored after all. */
+    restoreDiscard: (connection: string, upload: string) =>
+      on<{ discarded: true }>('/restore-discard', { connection, upload }),
   }
+  return api
 }
 
 /** Tries `work` again, twice, after a network failure or a server error: an upload goes on. */

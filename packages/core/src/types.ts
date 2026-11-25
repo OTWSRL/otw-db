@@ -181,6 +181,12 @@ export type Change =
       type: 'update'
       key: Readonly<Record<string, string>>
       values: Readonly<Record<string, string | null>>
+      /**
+       * What the edited cells held when the person edited them, as the grid showed them. With
+       * it, nothing is saved if one holds something else by now: someone changed it meanwhile.
+       * Without it, the update goes by the key alone, and the last to save wins.
+       */
+      original?: Readonly<Record<string, string | null>>
     }
   | { type: 'delete'; key: Readonly<Record<string, string>> }
 
@@ -199,6 +205,31 @@ export type ExportFormat = 'csv' | 'json' | 'sql'
 export interface SqlDialect {
   identifier(name: string): string
   literal(value: string | null): string
+  /**
+   * Bytes as the grid shows them (MySQL's `0x1F`, SQLite's `X'1F'`), as a literal that is those
+   * bytes; null when `shown` isn't in that form. Absent where the shown form is text the
+   * database reads as bytes itself (PostgreSQL's `\x1f`).
+   */
+  bytes?(shown: string): string | null
+  /** What an INSERT says before VALUES to bring its own values for a column numbered always. */
+  overriding?: string
+  /** An INSERT of nothing but defaults, where it isn't `DEFAULT VALUES`. */
+  insertDefaults?: string
+  /** What an SQL export starts with, so its literals are read as written whatever the session. */
+  exportHeader?: string
+  /** What it ends with, putting back what the header changed. */
+  exportFooter?: string
+}
+
+/** A column of an export, with what an SQL export must know to put its values back. */
+export interface ExportColumn {
+  name: string
+  /** Its values are bytes, in the database's own hex form. */
+  bytes?: boolean
+  /** The database computes it from other columns: an INSERT leaves it out. */
+  generated?: boolean
+  /** The database numbers it always: an INSERT says it brings its own values. */
+  identity?: boolean
 }
 
 /** The server a connection reaches, for the toolbar. */
@@ -262,7 +293,7 @@ export interface Driver {
   export(
     request: Pick<RowsRequest, 'schema' | 'table' | 'filters' | 'order'>,
     options: { timeoutMs: number },
-  ): AsyncGenerator<{ columns: { name: string }[]; rows: (string | null)[][] }>
+  ): AsyncGenerator<{ columns: ExportColumn[]; rows: (string | null)[][] }>
   readonly sql: SqlDialect
   /** One statement. */
   query(sql: string, options: QueryOptions): Promise<QueryResult>

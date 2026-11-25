@@ -1,8 +1,9 @@
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { pipeline, Readable } from 'node:stream'
 import { createGunzip } from 'node:zlib'
 import { DbAdminError, QueryError } from '../errors.ts'
 import type { Session } from '../types.ts'
+import { firstWords } from '../words.ts'
 import {
   readHeader,
   readTrailer,
@@ -62,37 +63,11 @@ export interface RestoreResult extends BackupSummary {
  * INSERTs. A file someone edited is refused at the first of these, before it runs.
  */
 const NEVER_IN_A_BACKUP =
-  /^(BEGIN|START|COMMIT|END|ROLLBACK|ABORT|SAVEPOINT|RELEASE|PREPARE(?=\s+TRANSACTION\b)|COPY)\b/i
-
-/** The statement's first word, past the comments and spaces before it. */
-function firstWord(statement: string): string {
-  let at = 0
-  for (;;) {
-    while (/\s/.test(statement[at] ?? '')) at += 1
-    if (statement.startsWith('--', at)) {
-      const end = statement.indexOf('\n', at)
-      if (end === -1) return ''
-      at = end + 1
-    } else if (statement.startsWith('/*', at)) {
-      // Block comments nest in PostgreSQL.
-      let depth = 0
-      do {
-        if (statement.startsWith('/*', at)) {
-          depth += 1
-          at += 2
-        } else if (statement.startsWith('*/', at)) {
-          depth -= 1
-          at += 2
-        } else at += 1
-      } while (depth > 0 && at < statement.length)
-    } else break
-  }
-  return /^[A-Za-z_]+(?:\s+[A-Za-z_]+)?/.exec(statement.slice(at))?.[0] ?? ''
-}
+  /^(BEGIN|START|COMMIT|END|ROLLBACK|ABORT|SAVEPOINT|RELEASE|PREPARE(?= TRANSACTION\b)|COPY)\b/i
 
 /** Refuses a statement that would step out of the restore's transaction. */
 function refuseOutside(n: number, statement: string): void {
-  const word = NEVER_IN_A_BACKUP.exec(firstWord(statement))?.[1]
+  const word = NEVER_IN_A_BACKUP.exec(firstWords(statement))?.[1]
   if (!word) return
   throw new DbAdminError(
     `Statement ${n.toLocaleString('en')} of the backup is ${word.toUpperCase()}, which a backup never holds: a restore is one transaction from its first statement to its last, and its rows are INSERTs. The file was changed after it was made, so nothing was restored.`,
@@ -305,6 +280,9 @@ export async function restoreSql(
   /** The end of the text so far, for the last line. */
   let tail = ''
   let reported = 0
+  // A mark only this transaction has: gone once it ends, whatever a new one is called.
+  const mark = randomUUID()
+  await session.query(`SELECT set_config('otw_db.restore', $1, true)`, [mark])
   const run = async (statements: string[]) => {
     for (const statement of statements) {
       refuseOutside(progress.statements + 1, statement)
@@ -315,6 +293,15 @@ export async function restoreSql(
         // is busy, and keeps the upload for another try.
         if (error instanceof QueryError && error.sqlState === LOCK_NOT_AVAILABLE) throw error
         throw failed(progress.statements + 1, statement, error)
+      }
+      // Behind the check of its words: whatever a statement was, if the transaction is over, it
+      // is the last to run. The next would run with nothing to undo it.
+      if (session.inTransaction?.() === false) {
+        throw new DbAdminError(
+          `Statement ${(progress.statements + 1).toLocaleString('en')} of the backup ended the restore’s transaction, which a backup never does: the file was changed after it was made. The restore stopped there, and nothing after that statement ran, but what came before it may have been kept. Look at the database before it’s used, and restore a backup nobody has edited.`,
+          400,
+          'bad-backup',
+        )
       }
       progress.statements += 1
       const now = performance.now()
@@ -369,6 +356,16 @@ export async function restoreSql(
       'The backup stops before its end, so nothing was restored: it may have been cut off while downloading. Download it again.',
       400,
       'incomplete-backup',
+    )
+  }
+  // The transaction about to be committed must be the one this began: COMMIT AND CHAIN leaves
+  // another open in its place, which the server reports no differently.
+  const { rows } = await session.query(`SELECT current_setting('otw_db.restore', true)`)
+  if (rows[0]?.[0] !== mark) {
+    throw new DbAdminError(
+      'The backup left the restore’s transaction for another, which a backup never does: the file was changed after it was made. What came after that was undone, but what came before it may have been kept. Look at the database before it’s used, and restore a backup nobody has edited.',
+      400,
+      'bad-backup',
     )
   }
   options.onProgress?.({ ...progress })

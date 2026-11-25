@@ -327,13 +327,18 @@ export async function run(ctx: BackupContext, body: Record<string, unknown>): Pr
               )
         audit(result)
         const { statements, tables, rows } = result
-        send({
-          type: 'done',
-          statements,
-          tables,
-          rows,
-          durationMs: Math.round(performance.now() - started),
-        })
+        try {
+          send({
+            type: 'done',
+            statements,
+            tables,
+            rows,
+            durationMs: Math.round(performance.now() - started),
+          })
+        } catch {
+          // Gone at the very end. It's committed, and the audit log has said so: this must not
+          // reach the catch below, which would log that nothing was restored.
+        }
       } catch (error) {
         const failure =
           error instanceof DbAdminError

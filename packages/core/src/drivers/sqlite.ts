@@ -1,3 +1,4 @@
+import { spawn, type ChildProcess } from 'node:child_process'
 import { existsSync } from 'node:fs'
 import { basename, resolve } from 'node:path'
 import { Worker } from 'node:worker_threads'
@@ -105,10 +106,80 @@ function hasMoreStatements(sql: string): boolean {
   return false
 }
 
-/** The worker's code: runs on its own thread, so a long statement never blocks the host. */
-const WORKER = `
-const { parentPort, workerData } = require('node:worker_threads')
-const { DatabaseSync } = require('node:sqlite')
+/**
+ * PRAGMAs that set something for the whole process, not for the connection they're run on: with
+ * `hard_heap_limit = 1`, no SQLite handle in the process can read a row again, the host's own
+ * included, until it restarts.
+ */
+const PROCESS_WIDE = [
+  'hard_heap_limit',
+  'soft_heap_limit',
+  'temp_store_directory',
+  'data_store_directory',
+]
+
+/**
+ * The one of those a statement would set, by its tokens: past comments, EXPLAIN [QUERY PLAN] (a
+ * PRAGMA acts when it's prepared, explained or not) and a schema's name, however the name is
+ * quoted. Null for any other statement, and for a PRAGMA that only reads. Self-contained.
+ */
+export function processWidePragma(sql: string): string | null {
+  let at = 0
+  const skip = () => {
+    for (;;) {
+      while (at < sql.length && /\s/.test(sql[at]!)) at++
+      if (sql.startsWith('--', at)) {
+        const end = sql.indexOf('\n', at)
+        at = end === -1 ? sql.length : end + 1
+      } else if (sql.startsWith('/*', at)) {
+        const end = sql.indexOf('*/', at + 2)
+        at = end === -1 ? sql.length : end + 2
+      } else return
+    }
+  }
+  const name = (): string | null => {
+    skip()
+    const open = sql[at]
+    const close = open === '[' ? ']' : open === '"' || open === '`' || open === "'" ? open : null
+    if (close) {
+      const end = sql.indexOf(close, at + 1)
+      if (end === -1) return null
+      const quoted = sql.slice(at + 1, end)
+      at = end + 1
+      return quoted.toLowerCase()
+    }
+    const word = /^[A-Za-z_][\w$]*/.exec(sql.slice(at, at + 64))?.[0]
+    if (!word) return null
+    at += word.length
+    return word.toLowerCase()
+  }
+  let word = name()
+  if (word === 'explain') {
+    word = name()
+    if (word === 'query') {
+      name()
+      word = name()
+    }
+  }
+  if (word !== 'pragma') return null
+  let pragma = name()
+  skip()
+  if (sql[at] === '.') {
+    at++
+    pragma = name()
+    skip()
+  }
+  if (!pragma || !PROCESS_WIDE.includes(pragma)) return null
+  return sql[at] === '=' || sql[at] === '(' ? pragma : null
+}
+
+/**
+ * The worker's code, for a thread or a process of its own: `parentPort` and `workerData` are
+ * given by whichever of the two openings below it runs after.
+ */
+const WORKER_BODY = `
+const { DatabaseSync, constants } = require('node:sqlite')
+const PROCESS_WIDE = ${JSON.stringify(PROCESS_WIDE)}
 ${hasMoreStatements.toString()}
 let reader, writer
 const cursors = new Map()
@@ -150,6 +221,14 @@ function row(statement, columns, value) {
 function run(message) {
   if (!message.own) return runOn(db(message.write), message)
   const database = new DatabaseSync(workerData.path, { readOnly: !message.write })
+  // Behind the driver's reading of the statement, where this Node has it: SQLite itself says
+  // which PRAGMA a statement sets, whatever its text.
+  if (database.setAuthorizer && constants && constants.SQLITE_PRAGMA !== undefined) {
+    database.setAuthorizer((action, name, value) =>
+      action === constants.SQLITE_PRAGMA && value != null && PROCESS_WIDE.includes(String(name).toLowerCase())
+        ? constants.SQLITE_DENY
+        : constants.SQLITE_OK)
+  }
   try {
     return runOn(database, message)
   } finally {
@@ -275,6 +354,42 @@ parentPort.on('message', (message) => {
 })
 `
 
+/** On a thread: a long statement never blocks the host. */
+const THREAD_WORKER = `
+const { parentPort, workerData } = require('node:worker_threads')
+${WORKER_BODY}`
+
+/**
+ * In a process: for someone's own SQL. A statement can stay inside SQLite for as long as it
+ * likes (a recursive query with no end), where nothing stops a thread: stopping the thread stops
+ * its JavaScript, and there is none running. A process can be killed, and what it held on the
+ * file goes with it.
+ */
+const PROCESS_WORKER = `
+const workerData = JSON.parse(process.env.OTW_DB_SQLITE_WORKER)
+const parentPort = {
+  on: (event, listener) => process.on(event, listener),
+  postMessage: (message) => process.send(message),
+}
+// The server gone, whichever way: nobody is left to answer.
+process.on('disconnect', () => process.exit(0))
+${WORKER_BODY}`
+
+/** What the process is given of the server's environment: where programs and temporary files are. */
+const PROCESS_ENV = [
+  'PATH',
+  'SystemRoot',
+  'TMPDIR',
+  'TEMP',
+  'TMP',
+  'SQLITE_TMPDIR',
+  'HOME',
+  'USERPROFILE',
+]
+
+/** How long a process with nothing to run is kept before it's let go of. */
+const PROCESS_IDLE_MS = 60_000
+
 interface WorkerError {
   message: string
   code?: string
@@ -320,50 +435,153 @@ export interface SqliteOptions {
   exportIdleMs?: number
 }
 
+/** A worker as a lane holds it, thread or process: told what to run, and stopped. */
+interface Running {
+  /** Sends it a request, which is its own to answer or to fail. */
+  post(message: Record<string, unknown> & { id: number }): void
+  /** Stops it now, whatever it's doing; done once it's gone. */
+  stop(): Promise<void>
+}
+
+/** What a worker sends back: a request's result, or why it has none. */
+interface Answer {
+  id: number
+  result?: unknown
+  error?: WorkerError
+}
+
+/** This server can't start a process: the lane goes on a thread instead, as it did before. */
+class NoProcess extends Error {}
+
 /**
- * A worker thread of its own with the file open on it, and the requests waiting for it. The
- * driver has one for its statements; each export has another, so stopping a statement (which
- * stops its worker) never ends an export under way, and an export nobody reads can be let go of
- * by stopping its own.
+ * A worker of its own with the file open on it, and the requests waiting for it. The driver has
+ * one for its statements; each export has another, so stopping a statement (which stops its
+ * worker) never ends an export under way, and an export nobody reads can be let go of by
+ * stopping its own. Those are threads. Someone's own SQL has a third, a process: see
+ * PROCESS_WORKER.
  */
 class Lane {
   readonly #path: string
-  #worker: Worker | null = null
+  #kind: 'thread' | 'process'
+  #worker: Running | null = null
   #pending = new Map<number, { resolve(value: unknown): void; reject(error: Error): void }>()
   #next = 1
   /** One request at a time: the worker's connection is single-threaded. */
   #queue: Promise<unknown> = Promise.resolve()
+  #idle: ReturnType<typeof setTimeout> | undefined
 
-  constructor(path: string) {
+  constructor(path: string, kind: 'thread' | 'process' = 'thread') {
     this.#path = path
+    this.#kind = kind
   }
 
-  #spawn(): Worker {
+  #spawn(): Running {
     if (this.#worker) return this.#worker
     if (!existsSync(this.#path))
       throw new ConnectionError(`There's no SQLite database at ${this.#path}.`)
-    const worker = new Worker(WORKER, { eval: true, workerData: { path: this.#path } })
-    worker.on(
-      'message',
-      ({ id, result, error }: { id: number; result?: unknown; error?: WorkerError }) => {
-        const waiting = this.#pending.get(id)
-        this.#pending.delete(id)
-        if (!waiting) return
-        if (error) waiting.reject(fromWorker(error))
-        else waiting.resolve(result)
-      },
-    )
-    const fail = (error: Error) => {
-      for (const waiting of this.#pending.values()) waiting.reject(error)
-      this.#pending.clear()
-      if (this.#worker === worker) this.#worker = null
+    // The requests this worker was sent: when it goes, those fail, and no others. A worker
+    // stopped at a time limit is still on its way out when the next request has a new one.
+    const mine = new Set<number>()
+    const answer = ({ id, result, error }: Answer) => {
+      mine.delete(id)
+      const waiting = this.#pending.get(id)
+      this.#pending.delete(id)
+      if (!waiting) return
+      if (error) waiting.reject(fromWorker(error))
+      else waiting.resolve(result)
     }
+    const fail = (error: Error) => {
+      for (const id of mine) {
+        this.#pending.get(id)?.reject(error)
+        this.#pending.delete(id)
+      }
+      mine.clear()
+      if (this.#worker === running) this.#worker = null
+    }
+    const sent = (id: number) => void mine.add(id)
+    const running: Running =
+      this.#kind === 'thread' ? this.#thread(answer, fail, sent) : this.#process(answer, fail, sent)
+    this.#worker = running
+    return running
+  }
+
+  #thread(
+    answer: (message: Answer) => void,
+    fail: (error: Error) => void,
+    sent: (id: number) => void,
+  ): Running {
+    const worker = new Worker(THREAD_WORKER, { eval: true, workerData: { path: this.#path } })
+    worker.on('message', answer)
     worker.on('error', (error) =>
       fail(new ConnectionError(`The SQLite worker failed: ${error.message}`)),
     )
     worker.on('exit', () => fail(new ConnectionError('The SQLite worker stopped.')))
-    this.#worker = worker
-    return worker
+    return {
+      post: (message) => {
+        sent(message.id)
+        worker.postMessage(message)
+      },
+      stop: async () => void (await worker.terminate()),
+    }
+  }
+
+  #process(
+    answer: (message: Answer) => void,
+    fail: (error: Error) => void,
+    sent: (id: number) => void,
+  ): Running {
+    const env: Record<string, string> = {
+      OTW_DB_SQLITE_WORKER: JSON.stringify({ path: this.#path }),
+    }
+    for (const name of PROCESS_ENV)
+      if (process.env[name] !== undefined) env[name] = process.env[name]
+    let child: ChildProcess
+    try {
+      child = spawn(
+        process.execPath,
+        ['--disable-warning=ExperimentalWarning', '-e', PROCESS_WORKER],
+        // Nothing to read or write but what it's sent: its errors go where the server's do.
+        {
+          stdio: ['ignore', 'ignore', 'inherit', 'ipc'],
+          serialization: 'advanced',
+          env,
+          windowsHide: true,
+        },
+      )
+    } catch (error) {
+      throw new NoProcess((error as Error).message)
+    }
+    const gone = () => child.exitCode !== null || child.signalCode !== null
+    child.on('message', answer)
+    child.on('error', (error) =>
+      fail(
+        child.pid === undefined
+          ? new NoProcess(error.message)
+          : new ConnectionError(`The SQLite worker failed: ${error.message}`),
+      ),
+    )
+    child.on('exit', () => fail(new ConnectionError('The SQLite worker stopped.')))
+    return {
+      post: (message) => {
+        sent(message.id)
+        // One that never started has no channel; its 'error' says so to whoever waits.
+        if (child.pid !== undefined && child.connected) child.send(message)
+      },
+      stop: () =>
+        new Promise<void>((resolve) => {
+          if (child.pid === undefined || gone()) return resolve()
+          child.once('exit', () => resolve())
+          // Not asked: killed. SQLite, mid-statement, hears nothing else.
+          child.kill('SIGKILL')
+        }),
+    }
+  }
+
+  /** Runs `work` when the requests before it are done, and holds those after it until it is. */
+  after<T>(work: () => Promise<T>): Promise<T> {
+    const result = this.#queue.then(work, work)
+    this.#queue = result.catch(() => {})
+    return result
   }
 
   /**
@@ -377,6 +595,7 @@ class Lane {
     const run = async (): Promise<T> => {
       if (options.signal?.aborted)
         throw new DbAdminError('The query was canceled.', 409, 'canceled')
+      clearTimeout(this.#idle)
       const worker = this.#spawn()
       const id = this.#next++
       return new Promise<T>((resolve, reject) => {
@@ -386,7 +605,7 @@ class Lane {
           stopped = error
           this.#pending.delete(id)
           this.#worker = null
-          void worker.terminate()
+          void worker.stop()
           reject(error)
         }
         const timer = options.timeoutMs
@@ -417,27 +636,47 @@ class Lane {
             reject(error)
           },
         })
-        worker.postMessage({ ...message, id })
+        worker.post({ ...message, id })
       })
     }
-    const result = this.#queue.then(run, run)
-    this.#queue = result.catch(() => {})
-    return result
+    return this.after(async () => {
+      try {
+        return await run()
+      } catch (error) {
+        if (!(error instanceof NoProcess)) throw error
+        this.#kind = 'thread'
+        return await run()
+      } finally {
+        this.#rest()
+      }
+    })
+  }
+
+  /** A process with nothing to run is let go of after a while: it's a whole Node, kept for one file. */
+  #rest(): void {
+    if (this.#kind !== 'process') return
+    clearTimeout(this.#idle)
+    this.#idle = setTimeout(() => {
+      if (this.#pending.size === 0) this.stop()
+    }, PROCESS_IDLE_MS)
+    this.#idle.unref()
   }
 
   /** Stops the worker once the requests before this are done: what it held on the file goes. */
   async close(): Promise<void> {
+    await this.#queue
+    clearTimeout(this.#idle)
     const worker = this.#worker
     this.#worker = null
-    await this.#queue
-    await worker?.terminate()
+    await worker?.stop()
   }
 
   /** Stops the worker now, whatever it's doing: the requests it had fail. */
   stop(): void {
+    clearTimeout(this.#idle)
     const worker = this.#worker
     this.#worker = null
-    void worker?.terminate()
+    void worker?.stop()
   }
 }
 
@@ -449,11 +688,14 @@ class SqliteDriver implements Driver {
   readonly #exportIdleMs: number
   /** The driver's own statements, one at a time. */
   readonly #lane: Lane
+  /** Someone's own SQL: in a process, which a time limit can really stop. */
+  readonly #own: Lane
 
   constructor(path: string, options: SqliteOptions) {
     this.#path = path
     this.#exportIdleMs = options.exportIdleMs ?? EXPORT_IDLE_MS
     this.#lane = new Lane(path)
+    this.#own = new Lane(path, 'process')
   }
 
   #send<T>(
@@ -476,23 +718,25 @@ class SqliteDriver implements Driver {
       own?: boolean
     },
   ) {
-    return this.#send<{
+    const message = {
+      type: 'run',
+      sql,
+      params,
+      maxRows: options.maxRows,
+      write: options.write,
+      transaction: options.transaction ?? false,
+      own: options.own ?? false,
+    }
+    type Ran = {
       columns: { name: string; type: string }[]
       rows: (string | null)[][]
       truncated: boolean
       changes: number | null
-    }>(
-      {
-        type: 'run',
-        sql,
-        params,
-        maxRows: options.maxRows,
-        write: options.write,
-        transaction: options.transaction ?? false,
-        own: options.own ?? false,
-      },
-      options,
-    )
+    }
+    // In its turn among the driver's statements, as when one worker ran both: two writers on
+    // the file at once would have one of them find it locked.
+    if (options.own) return this.#lane.after(() => this.#own.send<Ran>(message, options))
+    return this.#send<Ran>(message, options)
   }
 
   #catalog(sql: string, params: unknown[] = []) {
@@ -676,6 +920,14 @@ class SqliteDriver implements Driver {
       /^\s*(?:--[^\n]*\n\s*|\/\*[\s\S]*?\*\/\s*)*(\w+)/.exec(sql)?.[1] ?? ''
     ).toUpperCase()
     this.#refuseOtherFiles(command, sql)
+    const pragma = processWidePragma(sql)
+    if (pragma) {
+      throw new DbAdminError(
+        `PRAGMA ${pragma} sets a limit for every SQLite database this server has open, not for this one: it isn’t set from here.`,
+        403,
+        'not-allowed',
+      )
+    }
     const run = (transaction: boolean) =>
       this.#run(sql, [], { ...options, write, transaction, own: true })
     let result
@@ -824,6 +1076,7 @@ class SqliteDriver implements Driver {
 
   async close(): Promise<void> {
     await this.#lane.close()
+    await this.#own.close()
   }
 }
 

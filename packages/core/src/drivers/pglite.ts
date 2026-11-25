@@ -1,4 +1,5 @@
 import { DbAdminError, QueryError } from '../errors.ts'
+import { refuseBeyondReadingPostgres } from './read-only.ts'
 import type {
   ApplyResult,
   Capabilities,
@@ -69,6 +70,8 @@ export interface PGliteLike extends PGliteQueryable {
   transaction<T>(
     callback: (tx: PGliteQueryable & { rollback(): Promise<void> }) => Promise<T>,
   ): Promise<T>
+  /** Whether a transaction is open, as the server last said. Not every version has it. */
+  isInTransaction?(): boolean
 }
 
 const asIs = (value: string) => value
@@ -95,6 +98,11 @@ interface SessionState {
   channels: string[]
   /** Advisory locks as pg_locks has them: classid, objid, objsubid, mode. */
   locks: [number, number, number, string][]
+  /**
+   * Settings no catalog lists, a plugin's or an app's own (`app.tenant`), by the names a
+   * statement's text gives; null for one that was never set.
+   */
+  custom: Record<string, string | null> | null
 }
 
 const STATE_SQL = `SELECT json_build_object(
@@ -114,18 +122,46 @@ const STATE_SQL = `SELECT json_build_object(
   'channels', (SELECT coalesce(json_agg(c), '[]') FROM pg_catalog.pg_listening_channels() c),
   'locks', (SELECT coalesce(json_agg(json_build_array(classid::bigint, objid::bigint, objsubid, mode)), '[]')
               FROM pg_catalog.pg_locks
-             WHERE locktype = 'advisory' AND pid = pg_catalog.pg_backend_pid() AND granted))::text`
+             WHERE locktype = 'advisory' AND pid = pg_catalog.pg_backend_pid() AND granted),
+  'custom', (SELECT json_object_agg(n, pg_catalog.current_setting(n, true)) FROM unnest($1::text[]) n))::text`
 
 /** A setting's name, as RESET takes it: `search_path`, or an extension's `app.tenant`. */
 const SETTING = /^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_$]*)*$/
 
-async function sessionState(on: PGliteQueryable): Promise<SessionState> {
-  const { rows } = await on.query(STATE_SQL, [], { rowMode: 'array', parsers: {} })
+async function sessionState(
+  on: PGliteQueryable,
+  custom: readonly string[] = [],
+): Promise<SessionState> {
+  const { rows } = await on.query(STATE_SQL, [custom], { rowMode: 'array', parsers: {} })
   return JSON.parse((rows as [string][])[0]![0]) as SessionState
 }
 
-/** The statements that put a session back as `before` has it, from how it is `now`. */
-function repairs(before: SessionState, now: SessionState): { sql: string; values?: unknown[] }[] {
+/**
+ * The names in a statement that could be settings of a plugin's or an app's own: words with a
+ * dot between them, as `app.tenant` is, and as `public.users` is too, which costs nothing to ask
+ * after. pg_settings has none of them, so what a statement set can only be found by name.
+ */
+function customSettings(sql: string): string[] {
+  const names = new Set<string>()
+  for (const [name] of sql.matchAll(
+    /[A-Za-z_][A-Za-z0-9_]*(?:"?\s*\.\s*"?[A-Za-z_][A-Za-z0-9_$]*)+/g,
+  )) {
+    const plain = name.replace(/["\s]/g, '').toLowerCase()
+    if (SETTING.test(plain)) names.add(plain)
+    if (names.size === 64) break
+  }
+  return [...names]
+}
+
+/**
+ * The statements that put a session back as `before` has it, from how it is `now`. `listens`:
+ * inside a transaction about to commit, where a LISTEN it ran doesn't show yet.
+ */
+function repairs(
+  before: SessionState,
+  now: SessionState,
+  listens: boolean,
+): { sql: string; values?: unknown[] }[] {
   const fixes: { sql: string; values?: unknown[] }[] = []
   // Who the session runs as comes first: the rest may need the host's own privileges.
   const first = ['session_authorization', 'role']
@@ -139,13 +175,25 @@ function repairs(before: SessionState, now: SessionState): { sql: string; values
       fixes.push({ sql: 'SELECT set_config($1, $2, false)', values: [name, was] })
     else if (SETTING.test(name)) fixes.push({ sql: `RESET ${name}` })
   }
+  for (const [name, was] of Object.entries(before.custom ?? {})) {
+    if (was === (now.custom ?? {})[name]) continue
+    if (was !== null) fixes.push({ sql: 'SELECT set_config($1, $2, false)', values: [name, was] })
+    else if (SETTING.test(name)) fixes.push({ sql: `RESET ${name}` })
+  }
   const had = new Set(before.temp.map((t) => t.oid))
   for (const made of now.temp) if (!had.has(made.oid)) fixes.push({ sql: made.drop })
   const added = (list: (s: SessionState) => string[]) =>
     list(now).filter((name) => !list(before).includes(name))
   for (const name of added((s) => s.cursors)) fixes.push({ sql: `CLOSE ${quote(name)}` })
   for (const name of added((s) => s.prepared)) fixes.push({ sql: `DEALLOCATE ${quote(name)}` })
-  for (const name of added((s) => s.channels)) fixes.push({ sql: `UNLISTEN ${quote(name)}` })
+  if (listens) {
+    // What the transaction listened to isn't listed until it commits: all of it goes, and the
+    // host's own channels are listened to again, in the same commit.
+    fixes.push({ sql: 'UNLISTEN *' })
+    for (const name of before.channels) fixes.push({ sql: `LISTEN ${quote(name)}` })
+  } else {
+    for (const name of added((s) => s.channels)) fixes.push({ sql: `UNLISTEN ${quote(name)}` })
+  }
   const held = new Set(before.locks.map((l) => l.join(' ')))
   const taken = now.locks.filter((l) => !held.has(l.join(' ')))
   if (taken.length && !before.locks.length) fixes.push({ sql: 'SELECT pg_advisory_unlock_all()' })
@@ -168,15 +216,20 @@ function repairs(before: SessionState, now: SessionState): { sql: string; values
 }
 
 /**
- * Puts the session back as `before` has it. Inside a transaction (`savepoints`), each fix is on
- * its own savepoint, so one that fails doesn't take the transaction's work with it.
+ * Puts the session back as `before` has it. Always while the host's queries are still waiting
+ * for the statement's transaction: what they set the moment it ends is theirs, and seen from
+ * after it, nothing would tell it from what the statement left. Inside a transaction
+ * (`savepoints`), each fix is on its own savepoint, so one that fails doesn't take the
+ * transaction's work with it.
  */
 async function restoreSession(
   on: PGliteQueryable,
   before: SessionState,
   savepoints: boolean,
+  listens = false,
 ): Promise<void> {
-  for (const fix of repairs(before, await sessionState(on))) {
+  const now = await sessionState(on, Object.keys(before.custom ?? {}))
+  for (const fix of repairs(before, now, listens)) {
     try {
       if (savepoints) await on.query(`SAVEPOINT ${FIX}`)
       await on.query(fix.sql, fix.values)
@@ -186,6 +239,14 @@ async function restoreSession(
       if (savepoints) await on.query(`ROLLBACK TO SAVEPOINT ${FIX}`)
     }
   }
+}
+
+/**
+ * Rolls back the transaction `tx` is in and leaves it usable, outside any transaction but still
+ * PGlite's exclusive one: nothing of the host's runs until its callback returns.
+ */
+async function undo(tx: PGliteQueryable): Promise<void> {
+  await tx.query('ROLLBACK')
 }
 
 /**
@@ -302,18 +363,6 @@ class PGliteDriver implements Driver {
     return tx.query(`FETCH ${whole(maxRows) + 1} FROM ${CURSOR}`, [], options)
   }
 
-  /**
-   * Puts the session back once a statement's transaction is over. A rollback undid what a
-   * transaction undoes, but prepared statements and session locks outlast it; a commit's LISTEN
-   * only shows once it has committed.
-   */
-  async #restoreAfter(before: SessionState | undefined): Promise<void> {
-    if (!before) return
-    await restoreSession(this.#client, before, false).catch((error: unknown) =>
-      console.error('otw-db: could not reset the PGlite session', error),
-    )
-  }
-
   async #named(fields: { name: string; dataTypeID: number }[]) {
     const unknown = [...new Set(fields.map((f) => f.dataTypeID))].filter(
       (oid) => !this.#typeNames.has(oid),
@@ -381,34 +430,43 @@ class PGliteDriver implements Driver {
     if (options.signal?.aborted) throw new DbAdminError('The query was canceled.', 409, 'canceled')
     const started = performance.now()
     const write = options.access !== 'read'
-    let before: SessionState | undefined
+    if (!write) refuseBeyondReadingPostgres(sql)
     let result
     try {
       result = await this.#client.transaction(async (tx) => {
         // Before anything is set: SET LOCAL would read as the session's own.
-        before = await sessionState(tx)
+        const before = await sessionState(tx, customSettings(sql))
         if (!write) await tx.query('SET TRANSACTION READ ONLY')
         await tx.query(`SET LOCAL statement_timeout = ${whole(options.timeoutMs)}`)
-        const answer = await this.#limited(tx, sql, options.maxRows)
-        if (write) {
-          // Inside the transaction, so the host's next query, waiting for it, already finds its
-          // own settings.
-          await restoreSession(tx, before, true)
-        } else await tx.rollback()
-        return answer
+        let answer
+        let failure: unknown
+        try {
+          answer = await this.#limited(tx, sql, options.maxRows)
+        } catch (error) {
+          failure = error
+        }
+        if (write && failure === undefined) {
+          // Committed with the statement, so the host's next query already finds its own.
+          await restoreSession(tx, before, true, /listen/i.test(sql))
+          return answer!
+        }
+        // A read, or a statement that failed: undone here by hand, and then what a rollback
+        // doesn't undo (a prepared statement, a session's lock) is put back, still in the
+        // host's way. PGlite ends its transaction after this, and finds none: that's all.
+        await undo(tx)
+        await restoreSession(tx, before, false).catch((error: unknown) =>
+          console.error('otw-db: could not reset the PGlite session', error),
+        )
+        if (failure !== undefined) throw failure
+        return answer!
       })
-      await this.#restoreAfter(before)
     } catch (error) {
-      if (!write || (error as { code?: string }).code !== NOT_IN_TRANSACTION) {
-        await this.#restoreAfter(before)
-        throw toError(error)
-      }
+      if (!write || (error as { code?: string }).code !== NOT_IN_TRANSACTION) throw toError(error)
       try {
+        // What refuses to run in a transaction (VACUUM, CREATE DATABASE) sets nothing on a session.
         result = await this.#client.query(sql, [], { rowMode: 'array', parsers: this.#text })
       } catch (alone) {
         throw toError(alone)
-      } finally {
-        await this.#restoreAfter(before)
       }
     }
     const rows = result.rows as (string | null)[][]
@@ -567,6 +625,8 @@ class PGliteDriver implements Driver {
         opened = true
         resolve({
           exclusive: true,
+          // PGlite keeps what the server says after each query, as its own transactions need.
+          ...(client.isInTransaction ? { inTransaction: () => client.isInTransaction!() } : {}),
           async query(sql, values) {
             try {
               const result = await tx.query(sql, values, { rowMode: 'array', parsers: parsers() })
@@ -583,21 +643,23 @@ class PGliteDriver implements Driver {
               await done
             } catch (error) {
               throw toError(error)
-            } finally {
-              // A rollback leaves prepared statements and session locks, and a commit's LISTEN
-              // shows only now.
-              if (before) {
-                await restoreSession(client, before, false).catch((error: unknown) =>
-                  console.error('otw-db: could not reset the PGlite session', error),
-                )
-              }
             }
           },
         })
-        if (!(await decided)) return tx.rollback()
-        // As after every write: what the session set (a restore's SETs, its locks) is undone
-        // inside the transaction, so the host's queries waiting for it find their own settings.
-        if (before) await restoreSession(tx, before, true)
+        if (!(await decided)) {
+          // Rolled back by hand, and then what a rollback leaves (prepared statements, session
+          // locks) is put back while the host's queries still wait: see restoreSession.
+          await undo(tx)
+          if (before) {
+            await restoreSession(tx, before, false).catch((error: unknown) =>
+              console.error('otw-db: could not reset the PGlite session', error),
+            )
+          }
+          return
+        }
+        // As after every write: what the session set (a restore's SETs, its locks, a LISTEN) is
+        // undone inside the transaction, so the host's queries waiting for it find their own.
+        if (before) await restoreSession(tx, before, true, true)
       })
       done.catch((error: unknown) => {
         if (!opened) reject(toError(error))

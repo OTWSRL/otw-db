@@ -110,7 +110,7 @@ export async function* backupSql(
   yield section('Extensions', plan.extensionStatements())
   yield section('Types, functions, sequences, tables and views', plan.preData())
   for (const table of plan.dataTables()) {
-    yield `\n-- Data: ${table.schema}.${table.name}\n`
+    yield `\n-- Data: ${inComment(`${table.schema}.${table.name}`)}\n`
     let rows = 0
     for await (const piece of tableRows(session, table)) {
       rows += piece.rows
@@ -1009,6 +1009,15 @@ function freshPrivileges(schemas: string[]): string {
     `NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depend e WHERE e.classid = ${catalog} AND e.objid = ${oid} AND e.deptype = 'e')`
   const entries = (acl: string) =>
     `SELECT a.grantee, a.privilege_type, a.is_grantable FROM pg_catalog.aclexplode(${acl}) a`
+  const inside = `ARRAY[${schemas.map(literal).join(', ')}]::text[]`
+  // What emptySchema left where it was, which the backup doesn't hold: its privileges are its
+  // own, and nothing here could put them back. A foreign table, a table a backup can't hold, and
+  // a partition of a table outside the schemas, which went nowhere when they were emptied.
+  const stays = (c: string) => `(${c}.relkind = 'f' OR ${KEPT_TABLE(c)}
+           OR (${c}.relispartition AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_inherits pi
+                 JOIN pg_catalog.pg_class pp ON pp.oid = pi.inhparent
+                 JOIN pg_catalog.pg_namespace pn ON pn.oid = pp.relnamespace
+                WHERE pi.inhrelid = ${c}.oid AND pn.nspname = ANY (${inside}))))`
   const body = `
 DECLARE
   fix text;
@@ -1019,13 +1028,19 @@ BEGIN
              pg_catalog.format('%I.%I', n.nspname, c.relname) AS name, c.relacl AS acl,
              pg_catalog.acldefault(CASE c.relkind WHEN 'S' THEN 's' ELSE 'r' END::"char", c.relowner) AS fresh
         FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-       WHERE n.nspname = ANY (ARRAY[${schemas.map(literal).join(', ')}]::text[]) AND c.relacl IS NOT NULL
-         AND c.relkind IN ('r', 'p', 'v', 'm', 'f', 'S') AND ${notMember(Q.PG_CLASS, 'c.oid')}
+       WHERE n.nspname = ANY (${inside}) AND c.relacl IS NOT NULL
+         AND c.relkind IN ('r', 'p', 'v', 'm', 'S') AND ${notMember(Q.PG_CLASS, 'c.oid')}
+         AND NOT ${stays('c')}
+         -- Nor the sequences their columns own, which stayed with them.
+         AND NOT (c.relkind = 'S' AND EXISTS (SELECT 1 FROM pg_catalog.pg_depend o
+               JOIN pg_catalog.pg_class oc ON oc.oid = o.refobjid
+              WHERE o.classid = ${Q.PG_CLASS} AND o.objid = c.oid AND o.refclassid = ${Q.PG_CLASS}
+                AND o.deptype IN ('a', 'i') AND ${stays('oc')}))
       UNION ALL
       SELECT 'ROUTINE', p.oid::pg_catalog.regprocedure::text, p.proacl, pg_catalog.acldefault('f', p.proowner)
         FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
         JOIN pg_catalog.pg_language l ON l.oid = p.prolang
-       WHERE n.nspname = ANY (ARRAY[${schemas.map(literal).join(', ')}]::text[]) AND p.proacl IS NOT NULL
+       WHERE n.nspname = ANY (${inside}) AND p.proacl IS NOT NULL
          -- Those a restore makes, as emptySchema drops them: an aggregate or a C function stays
          -- through a restore, and its privileges are its own.
          AND p.prokind IN ('f', 'p', 'w') AND l.lanname NOT IN ('c', 'internal')
@@ -1033,7 +1048,7 @@ BEGIN
       UNION ALL
       SELECT 'TYPE', pg_catalog.format('%I.%I', n.nspname, t.typname), t.typacl, pg_catalog.acldefault('T', t.typowner)
         FROM pg_catalog.pg_type t JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace
-       WHERE n.nspname = ANY (ARRAY[${schemas.map(literal).join(', ')}]::text[]) AND t.typacl IS NOT NULL
+       WHERE n.nspname = ANY (${inside}) AND t.typacl IS NOT NULL
          AND ${notMember(Q.PG_TYPE, 't.oid')}
          AND (t.typtype IN ('d', 'e', 'r') OR (t.typtype = 'c' AND EXISTS (
                SELECT 1 FROM pg_catalog.pg_class r WHERE r.oid = t.typrelid AND r.relkind = 'c')))
@@ -1080,7 +1095,8 @@ const KEPT_TABLE = (
  * hasn't got it. Emptying keeps the schema itself, its owner and its privileges as they are. It
  * drops extensions, tables, views, sequences, functions and types. What a backup can't hold
  * stays: operators, aggregates and the like, and the tables it can't hold (foreign tables, typed
- * tables, tables that inherit another) with the sequences their columns own. One of those that
+ * tables, tables that inherit another, partitions of a table outside the schemas) with the
+ * sequences their columns own. One of those that
  * needs something dropped here would go with it, by CASCADE: the restore's plan looks for that
  * first, and refuses.
  */
@@ -1121,7 +1137,10 @@ ${then}
          AND NOT (c.relkind = 'S' AND EXISTS (SELECT 1 FROM pg_catalog.pg_depend o
                JOIN pg_catalog.pg_class oc ON oc.oid = o.refobjid
               WHERE o.classid = ${Q.PG_CLASS} AND o.objid = c.oid AND o.refclassid = ${Q.PG_CLASS}
-                AND o.deptype IN ('a', 'i') AND (oc.relkind = 'f' OR ${KEPT_TABLE('oc')})))
+                AND o.deptype IN ('a', 'i')
+                -- A partition isn't dropped by name: it goes with its parent, and its sequence
+                -- with it, or stays, its parent being outside the schemas, and its sequence too.
+                AND (oc.relkind = 'f' OR oc.relispartition OR ${KEPT_TABLE('oc')})))
       UNION ALL
       SELECT 4, p.proname, pg_catalog.format('DROP ROUTINE IF EXISTS %s CASCADE', p.oid::pg_catalog.regprocedure)
         FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
@@ -1145,6 +1164,15 @@ END
   return `DO ${tag}${body}${tag};`
 }
 
+/**
+ * A name as a `--` comment can hold it: on the comment's line. A name may hold a line feed or a
+ * carriage return, and either ends the comment for the server: what followed it in the name
+ * would be SQL, run by whoever restores the backup.
+ */
+function inComment(text: string): string {
+  return text.replace(/[\n\r]+/g, ' ')
+}
+
 function section(title: string, statements: string[]): string {
   return statements.length ? `\n-- ${title}\n\n${statements.join('\n')}\n` : ''
 }
@@ -1152,14 +1180,18 @@ function section(title: string, statements: string[]): string {
 function preamble(header: BackupHeader): string {
   const lines = [
     '--',
-    `-- Database ${header.database} on ${header.server}: schemas ${header.schemas.join(', ')}.`,
+    `-- Database ${inComment(header.database)} on ${inComment(header.server)}: schemas ${inComment(header.schemas.join(', '))}.`,
     `-- Made ${header.createdAt} by otw-db.`,
     '--',
     '-- Restoring it replaces everything in those schemas, and drops what elsewhere depends on it.',
     '-- Restore it on the Database screen, or with psql, in one transaction:',
     '--   gunzip -c this.sql.gz | psql --single-transaction -v ON_ERROR_STOP=1 -d <database URL>',
     ...(header.notIncluded.length
-      ? ['--', '-- Not in this backup:', ...header.notIncluded.map((what) => `--   ${what}`)]
+      ? [
+          '--',
+          '-- Not in this backup:',
+          ...header.notIncluded.map((what) => `--   ${inComment(what)}`),
+        ]
       : []),
     '--',
     '',

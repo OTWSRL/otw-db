@@ -196,6 +196,72 @@ export function conformance(name: string, open: () => Promise<Fixture>) {
       expect(await f.driver.table(f.schema, 'conf_digits')).not.toBeNull()
     })
 
+    it('keeps read access to reading the database, whatever its login may do', async () => {
+      // A read-only transaction stops changes to rows. The server's files, its programs, its
+      // settings and its other connections aren't rows: a login allowed those (a superuser,
+      // root) would still reach them through a connection marked read-only.
+      const beyond: Record<string, string[]> = {
+        postgres: [
+          `COPY (SELECT 1) TO PROGRAM 'cat > /tmp/otw_db_conformance'`,
+          `/* a note */ copy conf_items TO '/tmp/otw_db_conformance'`,
+          `--x\rCOPY (SELECT 1) TO '/tmp/otw_db_conformance'`,
+          `COPY (SELECT 1) TO STDOUT`,
+          `DO $$ BEGIN EXECUTE 'COPY (SELECT 1) TO ''/tmp/otw_db_conformance'''; END $$`,
+          `SELECT lo_export(1, '/tmp/otw_db_conformance')`,
+          `SELECT pg_read_file('/etc/hostname')`,
+          `SELECT * FROM pg_ls_dir('/etc')`,
+          `SELECT pg_terminate_backend(pid) FROM pg_stat_activity`,
+          `SELECT * FROM dblink('dbname=postgres', 'DROP TABLE conf_items') AS t(a int)`,
+          'SELECT U&"lo\\005Fexport"(1, \'/tmp/otw_db_conformance\')',
+        ],
+        mysql: [
+          `SELECT 'x' INTO OUTFILE '/var/lib/mysql-files/otw_db_conformance'`,
+          `SELECT 'x' /*!50000 INTO DUMPFILE '/var/lib/mysql-files/otw_db_conformance' */`,
+          `SELECT LOAD_FILE('/etc/hostname')`,
+          `SET GLOBAL max_connections = 151`,
+          `SET @@global.max_connections = 151`,
+          `/*!50000 SET PERSIST max_connections = 151 */`,
+          `KILL 999999`,
+          `# a note\nFLUSH PRIVILEGES`,
+        ],
+      }
+      const kind = name === 'PGlite' ? 'postgres' : name === 'MariaDB' ? 'mysql' : f.driver.kind
+      for (const sql of beyond[kind] ?? []) {
+        await expect(f.driver.query(sql, read), sql).rejects.toMatchObject({
+          code: 'not-allowed',
+          message: expect.stringContaining('This connection is read-only'),
+        })
+      }
+      // Reading goes on as it did: these only look like the statements above.
+      const fine = [
+        `SELECT name FROM conf_items WHERE name = 'copy to do kill set global'`,
+        `SELECT 'copy' AS a, 'kill' AS b FROM conf_items LIMIT 1`,
+        `-- copy\nSELECT name FROM conf_items WHERE name <> 'do'`,
+      ]
+      for (const sql of fine) await expect(f.driver.query(sql, read), sql).resolves.toBeDefined()
+      // And the grid opens a table whatever it's called: its statements are the driver's own.
+      await f.driver.query(
+        'CREATE TABLE conf_dblink_copy (lo_export INTEGER, load_file INTEGER)',
+        write,
+      )
+      try {
+        await f.driver.query('INSERT INTO conf_dblink_copy VALUES (1, 2)', write)
+        const grid = await f.driver.rows(
+          {
+            schema: f.schema,
+            table: 'conf_dblink_copy',
+            limit: 10,
+            offset: 0,
+            order: [{ column: 'lo_export' }],
+          },
+          LIMITS,
+        )
+        expect(grid.rows).toEqual([['1', '2']])
+      } finally {
+        await f.driver.query('DROP TABLE conf_dblink_copy', write)
+      }
+    })
+
     it('runs one statement at a time', async () => {
       await expect(
         f.driver.query('SELECT 1; DELETE FROM conf_items', write),

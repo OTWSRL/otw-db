@@ -331,6 +331,12 @@ export interface Session {
    * Finish quickly, without waiting on a slow download.
    */
   readonly exclusive: boolean
+  /**
+   * Whether the transaction it opened is still open: false once a statement has ended it, by a
+   * COMMIT or a ROLLBACK of its own. A restore asks after each statement of its file, so one
+   * that ends the transaction is the last to run. A driver that can't tell leaves it out.
+   */
+  inTransaction?(): boolean
 }
 
 /** Who is asking, as the host's `authorize()` says. */

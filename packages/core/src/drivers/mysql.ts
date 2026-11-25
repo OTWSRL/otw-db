@@ -8,6 +8,7 @@ import type {
   PoolOptions,
 } from 'mysql2/promise'
 import { ConnectionError, DbAdminError, QueryError } from '../errors.ts'
+import { refuseBeyondReadingMysql } from './read-only.ts'
 import type {
   ApplyResult,
   Capabilities,
@@ -495,6 +496,7 @@ class MySqlDriver implements Driver {
    * refused too; and caps what a SELECT returns at the row limit, plus one to tell it was cut.
    */
   async query(sql: string, options: QueryOptions): Promise<QueryResult> {
+    if (options.access === 'read') refuseBeyondReadingMysql(sql)
     const { connection, mysql } = await this.#connect()
     const started = performance.now()
     try {

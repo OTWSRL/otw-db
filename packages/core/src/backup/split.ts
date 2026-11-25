@@ -1,7 +1,8 @@
 /**
  * PostgreSQL's SQL cut into statements as it streams in, the way psql reads a file: a semicolon
  * ends a statement unless it's inside a string ('…', E'…', $tag$…$tag$), a quoted name ("…") or a
- * comment (-- … and nested /* … *\/), inside parentheses, or inside a function's BEGIN ATOMIC …
+ * comment (-- … to the line's end, a line feed or a carriage return, and nested /* … *\/), inside
+ * parentheses, or inside a function's BEGIN ATOMIC …
  * END body. Text may arrive cut anywhere, even inside a string or a dollar quote's tag. A
  * statement keeps the comments inside and before it; comments with nothing after them are
  * dropped.
@@ -28,21 +29,47 @@ export class StatementSplitter {
   /** Words read in the statement, and the first letters of the first four that matter. */
   #words = 0
   #head = ''
+  /** What has come since the last read, and how much text must have come before the next. */
+  #waiting: string[] = []
+  #waitingLength = 0
+  #hold = 0
 
-  /** Reads `text` and returns the statements it completes, without their semicolons. */
+  /**
+   * Reads `text` and returns the statements it completes, without their semicolons. While one
+   * statement is longer than `LONG`, its text is read again only once as much again has come, so
+   * the statements after it may come out a push or two later, or from `end()`.
+   */
   push(text: string): string[] {
-    // Drop what earlier statements took, once per push rather than once per statement.
+    this.#waiting.push(text)
+    this.#waitingLength += text.length
+    if (this.#waitingLength < this.#hold) return []
+    this.#take()
+    const done = this.#read(false)
+    // Each read makes one string of all the statement has so far. Once per piece, a statement
+    // of megabytes that comes in kilobytes is copied thousands of times over; reading it again
+    // only when it has doubled copies it twice in all, whatever its length.
+    const unfinished = this.#text.length - this.#start
+    this.#hold = done.length === 0 && unfinished >= LONG ? unfinished : 0
+    return done
+  }
+
+  /** Adds what has come since the last read to the text. */
+  #take(): void {
+    // Drop what earlier statements took, once per read rather than once per statement.
     if (this.#start > 0) {
       this.#text = this.#text.slice(this.#start)
       this.#at -= this.#start
       this.#start = 0
     }
-    this.#text += text
-    return this.#read(false)
+    this.#text += this.#waiting.length === 1 ? this.#waiting[0]! : this.#waiting.join('')
+    this.#waiting = []
+    this.#waitingLength = 0
   }
 
   /** The statement left at the end, if any: the last one may have no semicolon. */
   end(): string[] {
+    this.#take()
+    this.#hold = 0
     const done = this.#read(true)
     if (this.#state !== 'code' && this.#state !== 'line-comment') {
       throw new Error(`The SQL ends inside ${UNFINISHED[this.#state]}.`)
@@ -188,7 +215,9 @@ export class StatementSplitter {
           break
         }
         case 'line-comment': {
-          const end = s.indexOf('\n', at)
+          // At a line feed or a carriage return, whichever comes first, as the server ends it.
+          LINE_END.lastIndex = at
+          const end = LINE_END.exec(s)?.index ?? -1
           if (end === -1) {
             at = n
             break read
@@ -231,6 +260,9 @@ export class StatementSplitter {
 type State =
   'code' | 'string' | 'escape-string' | 'name' | 'line-comment' | 'block-comment' | 'dollar'
 
+const LINE_END = /[\n\r]/g
+/** From this many characters on, an unfinished statement waits to double before it's read again. */
+const LONG = 65_536
 const SEMICOLON = 59
 const QUOTE = 39
 const DOUBLE_QUOTE = 34

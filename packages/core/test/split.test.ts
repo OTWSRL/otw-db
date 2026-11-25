@@ -102,6 +102,41 @@ END`
     expect(() => split('SELECT $$ open')).toThrow('The SQL ends inside a dollar-quoted string.')
   })
 
+  it('ends a -- comment at a carriage return too, as PostgreSQL does', () => {
+    // The server reads what follows the \r as SQL: so must whoever checks the statements.
+    expect(split('--x\rSELECT 1;\nSELECT 2;')).toEqual(['--x\rSELECT 1', 'SELECT 2'])
+    expect(split('SELECT 1; -- a; b\r\nSELECT 2')).toEqual(['SELECT 1', '-- a; b\r\nSELECT 2'])
+  })
+
+  it('reads one long statement in time that grows with its length, not its square', () => {
+    // A row of megabytes arrives in pieces of a few kilobytes: read again from its start at each
+    // piece, 16 MB took a second and 500 MB would take hours, holding the restore's transaction.
+    const statement = `INSERT INTO t VALUES ('${'x'.repeat(16_000_000)}')`
+    const started = performance.now()
+    const splitter = new StatementSplitter()
+    const done: string[] = []
+    for (let at = 0; at < statement.length; at += 16_384)
+      done.push(...splitter.push(statement.slice(at, at + 16_384)))
+    done.push(...splitter.push(';\nSELECT 1;'))
+    done.push(...splitter.end())
+    expect(done.map((sql) => sql.length)).toEqual([statement.length, 8])
+    expect(performance.now() - started).toBeLessThan(400)
+  })
+
+  it('gives short statements out as soon as they end, however the text is cut', () => {
+    const splitter = new StatementSplitter()
+    expect(splitter.push('SELECT 1; SEL')).toEqual(['SELECT 1'])
+    expect(splitter.push('ECT 2;')).toEqual(['SELECT 2'])
+    // A long statement holds its pieces back until it has doubled, or the text ends.
+    const long = `SELECT '${'y'.repeat(200_000)}'`
+    const out: string[] = []
+    for (let at = 0; at < long.length; at += 1_000)
+      out.push(...splitter.push(long.slice(at, at + 1_000)))
+    expect(out).toEqual([])
+    // What follows it comes out now or at the end, in order either way.
+    expect([...splitter.push('; SELECT 3;'), ...splitter.end()]).toEqual([long, 'SELECT 3'])
+  })
+
   it('reads megabytes of INSERTs quickly, in pieces of any size', () => {
     const row = `('a;b', 'it''s', E'x\\'y', 42, NULL)`
     const statement = `INSERT INTO "t" (a, b, c, d, e) VALUES\n${Array(50).fill(row).join(',\n')};\n`

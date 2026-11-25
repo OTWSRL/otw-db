@@ -135,6 +135,112 @@ describe('a SQLite connection, one statement after another', () => {
     ).rejects.toThrow('FOREIGN KEY constraint failed')
   })
 
+  it.each([
+    'PRAGMA hard_heap_limit = 1',
+    'pragma hard_heap_limit(1)',
+    'PRAGMA/* */main . "hard_heap_limit"/**/=1',
+    '-- first\nEXPLAIN PRAGMA [hard_heap_limit] = 1',
+    'EXPLAIN QUERY PLAN PRAGMA `soft_heap_limit`=1',
+    "PRAGMA temp_store_directory = '/tmp/elsewhere'",
+    "PRAGMA data_store_directory = '/tmp/elsewhere'",
+  ])(
+    'refuses a PRAGMA that sets something for every SQLite file in the server: %s',
+    async (sql) => {
+      // hard_heap_limit = 1 leaves no SQLite handle in the process able to read a row, the host's
+      // own included, until the server restarts; and a PRAGMA acts when it's prepared, EXPLAINed or
+      // not.
+      for (const options of [READ, WRITE]) {
+        await expect(driver.query(sql, options)).rejects.toMatchObject({
+          code: 'not-allowed',
+          message: expect.stringContaining('for every SQLite database this server has open'),
+        })
+      }
+      expect(await names()).toEqual([['Ada']])
+      expect(host.prepare('SELECT name FROM users').all()).toEqual([{ name: 'Ada' }])
+      const elsewhere = new DatabaseSync(other)
+      expect(elsewhere.prepare('SELECT token FROM secret').all()).toEqual([{ token: 'hunter2' }])
+      elsewhere.close()
+    },
+  )
+
+  it('still runs the PRAGMAs that read, and those that set something for their own statement', async () => {
+    expect((await driver.query('PRAGMA table_info(users)', READ)).rows.map((r) => r[1])).toEqual([
+      'id',
+      'name',
+    ])
+    expect((await driver.query('PRAGMA hard_heap_limit', READ)).rows).toEqual([['0']])
+    expect((await driver.query('PRAGMA soft_heap_limit', READ)).rows).toEqual([['0']])
+    await driver.query('PRAGMA foreign_keys = OFF', WRITE)
+    await driver.query('PRAGMA cache_size = 100', READ)
+    expect((await driver.query('PRAGMA user_version', READ)).rows).toEqual([['0']])
+    // A column, a table or a string named like one of them is none of them.
+    await driver.query('CREATE TABLE hard_heap_limit (pragma TEXT)', WRITE)
+    await driver.query(`INSERT INTO hard_heap_limit VALUES ('PRAGMA hard_heap_limit = 1')`, WRITE)
+    expect((await driver.query('SELECT pragma FROM hard_heap_limit', READ)).rows).toEqual([
+      ['PRAGMA hard_heap_limit = 1'],
+    ])
+  })
+
+  /** A statement SQLite never finishes, and never leaves to let JavaScript stop it. */
+  const ENDLESS =
+    'WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c) SELECT count(*) FROM c'
+
+  it('really stops a statement at its time limit: the file it was writing is let go of', async () => {
+    host.exec('PRAGMA busy_timeout = 0')
+    await expect(
+      driver.query(`UPDATE users SET name = (${ENDLESS})`, { ...WRITE, timeoutMs: 300 }),
+    ).rejects.toThrow('ran past its 300 ms limit')
+    // Stopped in name only, it would hold the write lock for as long as the server runs.
+    await new Promise((resolve) => setTimeout(resolve, 300))
+    host.exec(`INSERT INTO users VALUES (2, 'Grace')`)
+    await driver.apply(
+      { schema: 'main', table: 'users' },
+      [{ type: 'insert', values: { id: '3', name: 'Edsger' } }],
+      { timeoutMs: 5_000 },
+    )
+    expect(await names()).toEqual([['Ada'], ['Grace'], ['Edsger']])
+  })
+
+  it('stops a canceled statement the same way, and runs the next one', async () => {
+    const controller = new AbortController()
+    const running = driver.query(`UPDATE users SET name = (${ENDLESS})`, {
+      ...WRITE,
+      signal: controller.signal,
+    })
+    setTimeout(() => controller.abort(), 200)
+    await expect(running).rejects.toMatchObject({ code: 'canceled' })
+    await new Promise((resolve) => setTimeout(resolve, 300))
+    expect((await driver.query(`UPDATE users SET name = 'Lovelace'`, WRITE)).affectedRows).toBe(1)
+  })
+
+  it('runs someone’s SQL on a thread, as it used to, where the server can’t start a process', async () => {
+    const node = process.execPath
+    Object.defineProperty(process, 'execPath', {
+      value: join(dir, 'no-such-node'),
+      configurable: true,
+    })
+    const threaded = sqliteDriver(`sqlite:${file}`)
+    try {
+      expect((await threaded.query('SELECT name FROM users', READ)).rows).toEqual([['Ada']])
+      expect((await threaded.query(`UPDATE users SET name = 'Lovelace'`, WRITE)).affectedRows).toBe(
+        1,
+      )
+      await expect(threaded.query('PRAGMA hard_heap_limit = 1', READ)).rejects.toMatchObject({
+        code: 'not-allowed',
+      })
+      // And its time limit still answers, as before.
+      await expect(
+        threaded.query(
+          'WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 300000000) SELECT count(*) FROM c',
+          { ...READ, timeoutMs: 200 },
+        ),
+      ).rejects.toThrow('ran past its 200 ms limit')
+    } finally {
+      Object.defineProperty(process, 'execPath', { value: node, configurable: true })
+      await threaded.close()
+    }
+  })
+
   it('goes on exporting when someone else’s statement is stopped at its time limit', async () => {
     host.exec(`CREATE TABLE big (id INTEGER PRIMARY KEY);
       WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 2500)

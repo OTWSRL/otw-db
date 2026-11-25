@@ -235,3 +235,79 @@ describe('a backup beside what it can’t hold', () => {
     ).toEqual({ n: 1 })
   })
 })
+
+describe('a restore beside tables it leaves where they are', () => {
+  /*
+   * A table that inherits one outside the schemas, a partition of one outside them and a foreign
+   * table aren't in a backup, and a restore says it leaves them alone: with their privileges,
+   * which the backup doesn't hold and so couldn't put back, and with the sequences they own.
+   */
+  const DATABASE = 'otw_db_kept_grants'
+  const ROLE = 'otw_db_kept_reader'
+  let admin: Driver
+  let database: Driver
+
+  beforeAll(async () => {
+    admin = postgresDriver(url)
+    await run('postgres', [
+      `DROP DATABASE IF EXISTS ${DATABASE} WITH (FORCE)`,
+      `DROP ROLE IF EXISTS ${ROLE}`,
+      `CREATE ROLE ${ROLE}`,
+      `CREATE DATABASE ${DATABASE}`,
+    ])
+    await run(
+      DATABASE,
+      `CREATE SCHEMA other;
+       CREATE TABLE other.base (id integer PRIMARY KEY, v text);
+       CREATE TABLE public.kid () INHERITS (other.base);
+       CREATE TABLE other.events (id integer, at date) PARTITION BY RANGE (at);
+       CREATE TABLE public.events_2026 PARTITION OF other.events
+         FOR VALUES FROM ('2026-01-01') TO ('2027-01-01');
+       CREATE SEQUENCE public.events_2026_n OWNED BY public.events_2026.id;
+       ALTER TABLE public.events_2026 ALTER COLUMN id SET DEFAULT nextval('public.events_2026_n');
+       CREATE EXTENSION file_fdw SCHEMA other;
+       CREATE SERVER kept_files FOREIGN DATA WRAPPER file_fdw;
+       CREATE FOREIGN TABLE public.ext_rows (a integer) SERVER kept_files OPTIONS (filename '/dev/null');
+       CREATE TABLE public.plain (id integer PRIMARY KEY);
+       GRANT SELECT ON public.kid, public.events_2026, public.ext_rows, public.plain TO ${ROLE};
+       GRANT USAGE ON SEQUENCE public.events_2026_n TO ${ROLE};
+       INSERT INTO public.events_2026 (at) VALUES ('2026-06-01');`,
+    )
+    database = admin.withDatabase!(DATABASE)
+  }, 60_000)
+
+  afterAll(async () => {
+    await database?.close()
+    await run('postgres', [
+      `DROP DATABASE IF EXISTS ${DATABASE} WITH (FORCE)`,
+      `DROP ROLE IF EXISTS ${ROLE}`,
+    ]).catch(() => {})
+    await admin?.close()
+  })
+
+  it('keeps their privileges, and the sequence a partition of a table outside owns', async () => {
+    await restore(database, await backup(database))
+    expect(
+      await one(
+        DATABASE,
+        `SELECT has_table_privilege('${ROLE}', 'public.kid', 'SELECT') AS inherits,
+                has_table_privilege('${ROLE}', 'public.events_2026', 'SELECT') AS partition,
+                has_table_privilege('${ROLE}', 'public.ext_rows', 'SELECT') AS foreign_table,
+                has_table_privilege('${ROLE}', 'public.plain', 'SELECT') AS restored,
+                to_regclass('public.events_2026_n') IS NOT NULL AS sequence,
+                (SELECT pg_get_expr(d.adbin, d.adrelid) FROM pg_attrdef d
+                  WHERE d.adrelid = to_regclass('public.events_2026')) AS id_default,
+                CASE WHEN to_regclass('public.events_2026_n') IS NULL THEN false
+                     ELSE has_sequence_privilege('${ROLE}', 'public.events_2026_n', 'USAGE') END AS sequence_use`,
+      ),
+    ).toEqual({
+      inherits: true,
+      partition: true,
+      foreign_table: true,
+      restored: true,
+      sequence: true,
+      id_default: `nextval('events_2026_n'::regclass)`,
+      sequence_use: true,
+    })
+  })
+})

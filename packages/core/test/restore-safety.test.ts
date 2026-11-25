@@ -107,6 +107,32 @@ describe('a restore whose input goes wrong', () => {
     },
   )
 
+  it.each([
+    ['COMMIT', '--x\rCOMMIT\nWORK'],
+    ['COMMIT', '-- a comment the server ends at its carriage return\r\n--\rcommit'],
+    ['PREPARE', "PREPARE/**/TRANSACTION 'x'"],
+    ['PREPARE', "prepare\n--c\ntransaction 'x'"],
+    ['COMMIT', 'COMMIT/* */AND CHAIN'],
+  ])('refuses %s however comments and line ends hide it: %j', async (word, statement) => {
+    const file = await backupOf(db)
+    const end = file.lastIndexOf('-- otw-db backup complete')
+    const edited = `${file.slice(0, end)}${statement};\nDROP TABLE public.notes;\nSELECT 1/0;\n${file.slice(end)}`
+    await expect(restoreInto(db, pieces(encode(edited)))).rejects.toThrow(
+      new RegExp(`^Statement [\\d,]+ of the backup is ${word}, which a backup never holds`),
+    )
+    expect(await notes()).toEqual([
+      { id: 1, body: 'kept' },
+      { id: 2, body: 'also kept' },
+    ])
+  })
+
+  it('still restores a PREPAREd statement, which is not PREPARE TRANSACTION', async () => {
+    const file = await backupOf(db)
+    const end = file.lastIndexOf('-- otw-db backup complete')
+    const edited = `${file.slice(0, end)}PREPARE /* a plan */ kept_plan AS SELECT 1;\n${file.slice(end)}`
+    await expect(restoreInto(db, pieces(encode(edited)))).resolves.toMatchObject({ tables: 1 })
+  })
+
   it('refuses COPY, which a backup never holds: its rows are INSERTs', async () => {
     const file = await backupOf(db)
     const end = file.lastIndexOf('-- otw-db backup complete')
@@ -361,6 +387,28 @@ describe('the restore API, when someone else is in the database', () => {
     expect(rows.rows.map((r) => r.id)).toEqual([1, 9])
   })
 
+  it('says once that it restored, when the browser leaves just as it finishes', async () => {
+    const text = encode(await backupOf(db))
+    const { upload } = (await (await start(text.length)).json()) as { upload: string }
+    await piece(upload, 0, text)
+    // The audit of a restore comes after its commit and before the browser is told: there.
+    let body: ReadableStream<Uint8Array> | undefined
+    audit.mockImplementation((event: AuditEvent) => {
+      if (event.action === 'restore') void body?.cancel()
+    })
+    try {
+      const ran = await run(upload, 'postgres')
+      body = ran.body!
+      const restores = () => audit.mock.calls.map(([e]) => e).filter((e) => e.action === 'restore')
+      await vi.waitFor(() => expect(restores().length).toBeGreaterThan(0), { timeout: 5_000 })
+      await new Promise((resolve) => setTimeout(resolve, 200))
+      // It was restored, and the log says that and nothing else.
+      expect(restores().map((e) => e.error)).toEqual([undefined])
+    } finally {
+      audit.mockReset()
+    }
+  })
+
   it('audits a restore with how many statements it ran and the file’s SHA-256', async () => {
     const text = encode(await backupOf(db))
     const { upload } = (await (await start(text.length)).json()) as { upload: string }
@@ -384,6 +432,202 @@ describe('a PostgreSQL session', () => {
       await expect(session.query('SELECT 1; COMMIT')).rejects.toThrow(
         'cannot insert multiple commands into a prepared statement',
       )
+    } finally {
+      await session.end(false)
+      await driver.close()
+    }
+  })
+})
+
+describe('a backup of names that hold line ends', () => {
+  // A name goes into the file's comments, for whoever reads it. Written as it is, what follows a
+  // line end in the name is a line of SQL, which the restore runs as the person restoring.
+  it.each(['\n', '\r', '\r\n'])(
+    'keeps a name with %j in it inside its comment',
+    async (lineEnd) => {
+      const db = new PGlite()
+      const target = new PGlite()
+      try {
+        const table = `x${lineEnd}CREATE TABLE public.pwned (a int); --`
+        const schema = `s${lineEnd}CREATE SCHEMA pwned; --`
+        await db.exec(`CREATE TABLE public."${table}" (id integer PRIMARY KEY);
+        INSERT INTO public."${table}" VALUES (1);
+        CREATE SCHEMA "${schema}";
+        CREATE TABLE "${schema}".t (id integer PRIMARY KEY);
+        CREATE TABLE "${schema}".kid () INHERITS (public."${table}");`)
+        const file = await backupOf(db, ['public', schema])
+        // The name is whole in the file's comment, on the comment's one line.
+        expect(file).toContain('-- Data: public.x CREATE TABLE public.pwned (a int); --\n')
+        await restoreInto(target, pieces(encode(file)))
+        const made = await target.query<{ name: string }>(
+          `SELECT n.nspname || '.' || c.relname AS name FROM pg_class c
+           JOIN pg_namespace n ON n.oid = c.relnamespace
+          WHERE c.relkind = 'r' AND n.nspname NOT LIKE 'pg\\_%' AND n.nspname <> 'information_schema'
+          ORDER BY 1`,
+        )
+        expect(made.rows.map((row) => row.name)).toEqual([`public.${table}`, `${schema}.t`].sort())
+        expect(
+          (await target.query(`SELECT 1 FROM pg_namespace WHERE nspname = 'pwned'`)).rows,
+        ).toEqual([])
+      } finally {
+        await db.close()
+        await target.close()
+      }
+    },
+  )
+})
+
+describe('a statement that ends the restore’s transaction, past every check of its text', () => {
+  /*
+   * The checks of a statement's first words are the first defence; this is the one behind them,
+   * for a way of writing COMMIT nobody has thought of. The session is asked after each statement
+   * whether its transaction is still open, and a mark set inside the transaction must still be
+   * there at the end. A statement of the file stands in for the unknown: the session below runs
+   * what it names instead.
+   */
+  const NOTES = `CREATE TABLE public.notes (id integer PRIMARY KEY, body text);
+    INSERT INTO public.notes VALUES (1, 'kept'), (2, 'also kept');`
+
+  async function escaping(
+    session: Awaited<ReturnType<NonNullable<ReturnType<typeof pgliteDriver>['session']>>>,
+    file: string,
+    instead: string,
+  ) {
+    const end = file.lastIndexOf('-- otw-db backup complete')
+    const edited = `${file.slice(0, end)}SELECT 'escape here';\nDROP TABLE public.notes;\n${file.slice(end)}`
+    const ran: string[] = []
+    const through: typeof session = {
+      ...session,
+      inTransaction: () => session.inTransaction!(),
+      query(sql, values) {
+        ran.push(sql)
+        return session.query(sql.includes("'escape here'") ? instead : sql, values)
+      },
+    }
+    try {
+      await restoreSql(through, pieces(encode(edited)), { check: async () => {} })
+      await session.end(true)
+      return { ran, error: null }
+    } catch (error) {
+      await session.end(false)
+      return { ran, error: error as Error }
+    }
+  }
+
+  describe.each(['PGlite', 'PostgreSQL'] as const)('on %s', (kind) => {
+    let db: PGlite | undefined
+    let admin: pg.Client | undefined
+    let driver: ReturnType<typeof pgliteDriver>
+    let file: string
+    const exec = (sql: string) => (db ? db.exec(sql) : admin!.query(sql))
+    const count = async () => {
+      const sql = `SELECT count(*)::int AS n FROM public.notes`
+      const rows = db ? (await db.query<{ n: number }>(sql)).rows : (await admin!.query(sql)).rows
+      return (rows[0] as { n: number }).n
+    }
+
+    beforeAll(async () => {
+      if (kind === 'PGlite') {
+        db = new PGlite()
+        driver = pgliteDriver(db)
+      } else {
+        // A database of its own: the restore replaces the whole of `public`.
+        const url = new URL(inject('postgresUrl'))
+        const setup = new pg.Client({ connectionString: url.href })
+        await setup.connect()
+        await setup.query('DROP DATABASE IF EXISTS escapes')
+        await setup.query('CREATE DATABASE escapes')
+        await setup.end()
+        url.pathname = '/escapes'
+        admin = new pg.Client({ connectionString: url.href })
+        await admin.connect()
+        driver = postgresDriver(url.href)
+      }
+      await exec(NOTES)
+      const session = await driver.session!('snapshot')
+      try {
+        const server = await prepare(session)
+        file = ''
+        for await (const piece of backupSql(session, server, ['public'], WHEN)) file += piece
+      } finally {
+        await session.end(false)
+      }
+    })
+    afterAll(async () => {
+      await driver.close()
+      await db?.close()
+      await admin?.end()
+    })
+
+    it('says whether its transaction is still open', async () => {
+      const session = await driver.session!('write')
+      try {
+        expect(session.inTransaction!()).toBe(true)
+        await session.query('SELECT 1')
+        expect(session.inTransaction!()).toBe(true)
+        await session.query('COMMIT')
+        expect(session.inTransaction!()).toBe(false)
+      } finally {
+        await session.end(false)
+      }
+    })
+
+    it.each(['COMMIT', 'ROLLBACK'])(
+      'stops at a statement that runs %s, before the next one',
+      async (word) => {
+        const { ran, error } = await escaping(await driver.session!('write'), file, word)
+        expect(error?.message).toMatch(
+          /^Statement [\d,]+ of the backup ended the restore’s transaction, which a backup never does/,
+        )
+        // The statement after it, which would have run outside any transaction, never ran.
+        expect(ran.at(-1)).toContain("'escape here'")
+        expect(ran.some((sql) => sql.includes('DROP TABLE public.notes'))).toBe(false)
+        expect(await count()).toBe(2)
+      },
+    )
+
+    it('refuses to finish when the transaction at the end isn’t the one it began', async () => {
+      const { error } = await escaping(await driver.session!('write'), file, 'COMMIT AND CHAIN')
+      expect(error?.message).toMatch(
+        /^The backup left the restore’s transaction for another, which a backup never does/,
+      )
+      // What came after the new transaction began was undone with it.
+      expect(await count()).toBe(2)
+    })
+  })
+})
+
+describe('a PostgreSQL session on a pg older than 8.12', () => {
+  // pg 8.11 has no queryMode: text without values goes over the simple protocol, which runs
+  // every statement in it, a COMMIT after a harmless one included.
+  const old = (): ReturnType<typeof postgresDriver> =>
+    postgresDriver(inject('postgresUrl'), {
+      // @ts-expect-error pg 8.11 under another name, for this test: it has no types of its own.
+      modules: () => Promise.all([import('pg-8-11'), import('pg-cursor')]),
+    })
+
+  it('opens no session to restore in, and says to update pg', async () => {
+    const driver = old()
+    try {
+      await expect(driver.session!('write')).rejects.toThrow(
+        'This server’s PostgreSQL driver (pg) runs several statements sent as one, so a restore can’t be held to one transaction. Update pg to 8.12 or later.',
+      )
+      // The connection it tried on went back whole: the driver still answers.
+      const session = await driver.session!('snapshot')
+      expect((await session.query('SELECT 1::text')).rows).toEqual([['1']])
+      await session.end(false)
+    } finally {
+      await driver.close()
+    }
+  })
+
+  it('still reads, so a backup is made as before', async () => {
+    const driver = old()
+    const session = await driver.session!('snapshot')
+    try {
+      const { rows } = await session.query('SELECT n::text FROM generate_series(1, 30000) n')
+      expect(rows).toHaveLength(30_000)
+      expect(rows.at(-1)).toEqual(['30000'])
     } finally {
       await session.end(false)
       await driver.close()

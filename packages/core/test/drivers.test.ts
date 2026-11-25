@@ -284,6 +284,75 @@ describe('PGlite shared with its host', () => {
     await client.close()
   })
 
+  it.each(['read', 'write', 'a statement that fails', 'a session rolled back'] as const)(
+    'leaves alone what the host itself sets up while it waits for someone’s statement: %s',
+    async (kind) => {
+      // The host's queries wait for the statement's transaction and run the moment it ends. Put
+      // back after that, the session would lose what they had just set: taken for the statement's.
+      const client = await host()
+      const driver = pgliteDriver(client)
+      const waits = () =>
+        client.exec(`SET search_path = app; SET application_name = 'busy';
+          CREATE TEMP TABLE host_late_tmp (x integer); LISTEN host_late;
+          PREPARE host_late AS SELECT 1; SELECT pg_advisory_lock(20);`)
+      let hosts: Promise<unknown>
+      if (kind === 'a session rolled back') {
+        const session = await driver.session!('write')
+        await session.query('SELECT pg_advisory_lock(21)')
+        await session.query('PREPARE tool_late AS SELECT 2')
+        hosts = waits()
+        await session.end(false)
+      } else {
+        const sql =
+          kind === 'a statement that fails'
+            ? 'SELECT pg_advisory_lock(21), pg_sleep(0.05), 1 / 0'
+            : 'SELECT pg_advisory_lock(21), pg_sleep(0.05)'
+        const tools = driver.query(sql, kind === 'read' ? read : write).catch(() => {})
+        hosts = waits()
+        await tools
+      }
+      await hosts
+      // Whatever a driver does after its transaction has had the time to do it.
+      await new Promise((resolve) => setTimeout(resolve, 50))
+      await client.query('SELECT 1')
+      expect(await hostState(client)).toEqual({
+        ...HOST,
+        search_path: 'app',
+        application_name: 'busy',
+        temp: ['host_late_tmp', 'host_tmp'],
+        prepared: ['host_late', 'host_statement'],
+        channels: ['host_channel', 'host_late'],
+        locks: [7, 20],
+      })
+      await client.close()
+    },
+  )
+
+  it('puts back a setting of the host’s own that someone’s statement set, a plugin’s or an app’s', async () => {
+    // Settings like app.tenant are in no catalog: the session's own list doesn't have them.
+    const client = await host()
+    const driver = pgliteDriver(client)
+    const tenant = async () =>
+      (await client.query<{ t: string | null }>(`SELECT current_setting('app.tenant', true) AS t`))
+        .rows[0]!.t
+    await driver.query(`SET app.tenant = '2'`, write)
+    expect(await tenant()).not.toBe('2')
+    await client.exec(`SET app.tenant = '1'`)
+    for (const sql of [
+      `SET app.tenant = '2'`,
+      `SELECT set_config('app.tenant', '3', false)`,
+      `SET "app"."tenant" TO '4'`,
+      'RESET app.tenant',
+      // Names with dots that aren't settings do no harm.
+      'SELECT c.relname FROM pg_catalog.pg_class c LIMIT 1',
+    ]) {
+      await driver.query(sql, write)
+      expect(await tenant(), sql).toBe('1')
+    }
+    expect(await hostState(client)).toEqual(HOST)
+    await client.close()
+  })
+
   it('leaves the host’s connection as it was after a session that set its own, as a restore does', async () => {
     const client = await host()
     const driver = pgliteDriver(client)

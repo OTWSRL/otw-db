@@ -2,6 +2,7 @@ import type CursorClass from 'pg-cursor'
 import { connect } from 'node:net'
 import type { FieldDef, Pool, PoolClient, PoolConfig, QueryArrayConfig } from 'pg'
 import { ConnectionError, DbAdminError, QueryError } from '../errors.ts'
+import { refuseBeyondReadingPostgres } from './read-only.ts'
 import {
   DATABASES_SQL,
   detail,
@@ -319,7 +320,10 @@ class PostgresDriver implements Driver {
     return { product: 'PostgreSQL', ...row!, version: versionOf(row!.version) }
   }
 
-  query(sql: string, options: QueryOptions): Promise<QueryResult> {
+  async query(sql: string, options: QueryOptions): Promise<QueryResult> {
+    // Someone's own statement, not one the driver wrote for the grid, whose table may well be
+    // named like something refused here. Before a connection is taken: nothing to give back.
+    if (options.access === 'read') refuseBeyondReadingPostgres(sql)
     return this.#run(sql, undefined, options)
   }
 
@@ -532,6 +536,7 @@ class PostgresDriver implements Driver {
   async session(mode: 'snapshot' | 'write'): Promise<Session> {
     const { client } = await this.#connect()
     try {
+      if (mode === 'write') await oneStatementOnly(client)
       await client.query(
         mode === 'snapshot' ? 'BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY' : 'BEGIN',
       )
@@ -540,15 +545,21 @@ class PostgresDriver implements Driver {
       throw toError(error)
     }
     let ended = false
+    // What the server says after every query: I outside a transaction, T inside one, E inside
+    // one that failed. It costs nothing to hear, where asking would be a round trip a statement.
+    let status: string | undefined = 'T'
+    const connection = (client as unknown as { connection?: Heard }).connection
+    const heard = (message: { status?: string }) => {
+      status = message.status
+    }
+    connection?.on('readyForQuery', heard)
     return {
       exclusive: false,
+      inTransaction: () => status !== 'I',
       async query(text, values) {
         try {
-          // The extended protocol: one statement a query, whatever the text holds, as the server
-          // refuses a second. A restore's statements come from a file, and none may end its
-          // transaction. (pg 8.12 and later take queryMode; its types don't list it yet.)
-          const config: QueryArrayConfig<unknown[]> & { queryMode: 'extended' } = {
-            text,
+          const result = await client.query({
+            ...extended(text),
             ...(values
               ? {
                   values: values.map((v) =>
@@ -556,11 +567,7 @@ class PostgresDriver implements Driver {
                   ),
                 }
               : {}),
-            rowMode: 'array',
-            types: AS_TEXT,
-            queryMode: 'extended',
-          }
-          const result = await client.query(config)
+          })
           return { rows: result.rows as (string | null)[][] }
         } catch (error) {
           throw toError(error)
@@ -574,6 +581,7 @@ class PostgresDriver implements Driver {
         } catch (error) {
           throw toError(error)
         } finally {
+          connection?.off('readyForQuery', heard)
           client.release(true)
         }
       },
@@ -588,6 +596,44 @@ class PostgresDriver implements Driver {
     const pool = await opened?.catch(() => undefined)
     await pool?.pool.end()
   }
+}
+
+/**
+ * A session's query, over the extended protocol: one statement a query, whatever the text holds,
+ * as the server refuses a second. A restore's statements come from a file, and none may carry
+ * another that ends its transaction. (pg's types don't list queryMode yet.)
+ */
+function extended(text: string): QueryArrayConfig<unknown[]> & { queryMode: 'extended' } {
+  return { text, rowMode: 'array', types: AS_TEXT, queryMode: 'extended' }
+}
+
+/**
+ * Makes sure of it, on the connection a write session is about to use, before its transaction
+ * begins: two statements in one query must be refused. pg takes queryMode from 8.12 on; an
+ * older one ignores it and sends text without values over the simple protocol, which runs every
+ * statement in it, and nothing asked of it afterwards could undo the second. So a restore never
+ * starts on a connection that would have run both: it says to update pg instead. Reading, and
+ * so a backup, is the same on any pg.
+ */
+async function oneStatementOnly(client: PoolClient): Promise<void> {
+  try {
+    await client.query(extended('SELECT 1; SELECT 2'))
+  } catch (error) {
+    // 42601: "cannot insert multiple commands into a prepared statement".
+    if ((error as { code?: string }).code === '42601') return
+    throw error
+  }
+  throw new DbAdminError(
+    'This server’s PostgreSQL driver (pg) runs several statements sent as one, so a restore can’t be held to one transaction. Update pg to 8.12 or later.',
+    500,
+    'driver-unsafe',
+  )
+}
+
+/** pg's connection, as far as a session listens to it: the server's ReadyForQuery after a query. */
+interface Heard {
+  on(event: 'readyForQuery', listener: (message: { status?: string }) => void): void
+  off(event: 'readyForQuery', listener: (message: { status?: string }) => void): void
 }
 
 /** What pg keeps from the server's BackendKeyData, which a cancel request quotes. */

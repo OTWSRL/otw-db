@@ -9,6 +9,7 @@ A database manager in your app: browse, query and edit PostgreSQL, MySQL, MariaD
 | Package              | For                                                          |
 | -------------------- | ------------------------------------------------------------ |
 | `@otwdesign/db-core` | The engine and its API, as one standard Fetch handler        |
+| `@otwdesign/db-next` | Next.js: `npx @otwdesign/db-next init`, with its own sign-in |
 | `@otwdesign/db-node` | node:http, Express and Connect                               |
 | `@otwdesign/db`      | The `otw-db` command, with every driver: `npx @otwdesign/db` |
 
@@ -153,17 +154,51 @@ export const dbAdmin = createDbAdmin({
 })
 ```
 
-**Next.js** (`app/db/[[...path]]/route.ts`): a route handler takes the Fetch handler as it is.
-[examples/next](examples/next) is a whole app, with its tests.
+**Next.js**, on Vercel or anywhere: in the app's directory,
+
+```sh
+npx @otwdesign/db-next init
+```
+
+It writes one route file, adds a password to `.env.local`, and installs `@otwdesign/db-next`.
+[examples/next](examples/next) is the app it leaves, with its tests.
 
 ```ts
-import { dbAdmin } from '@/db-admin'
+// app/db/[[...path]]/route.ts
+import { createDbRoute } from '@otwdesign/db-next'
 
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
-export const GET = (request: Request) => dbAdmin.fetch(request)
-export const POST = (request: Request) => dbAdmin.fetch(request)
+export const { GET, POST } = createDbRoute()
 ```
+
+```dotenv
+DB_ADMIN_PASSWORD=…                              # whoever has it gets in; 16 characters at least
+DB_ADMIN_USERS=you@example.com,ana@example.com   # the app's signed-in users who need no password
+DB_ADMIN_MAIN_URL=postgres://…                   # or the app's own DATABASE_URL, read-only
+```
+
+- **Who gets in.** `/db` has a sign-in page of its own, for the password. The app's own users
+  listed in `DB_ADMIN_USERS` get in without it once they're signed in to the app, and the audit
+  log has their email. With the list set and no password, only they get in. An app on Supabase
+  Auth has its session read, with no code; any other sign-in says who is signed in:
+  `createDbRoute({ user: async () => (await auth())?.user?.email })`. Or decide it all yourself
+  with `createDbRoute({ authorize })`.
+- **Which databases.** `DB_ADMIN_<NAME>_URL`, as everywhere. With none, the app's own, read-only
+  (`DB_ADMIN_APP_ACCESS=write` to edit): `DATABASE_URL_UNPOOLED`, `POSTGRES_URL_NON_POOLING`,
+  `DATABASE_URL` or `POSTGRES_URL`, in that order, since the tool keeps a session and a
+  transaction pooler doesn't.
+- **Supabase.** Linked through Vercel's integration, the database's address is in the env
+  already. An app that only uses Supabase's API has none: copy the Session pooler connection
+  string from Supabase's Connect dialog into `DB_ADMIN_MAIN_URL`. List in `DB_ADMIN_USERS` only
+  people who have an account, and keep Confirm email on: an address nobody has registered could
+  otherwise be signed up by anyone.
+- **Middleware** that signs people in on every route must leave `/db` out of its matcher: the
+  tool's API can't be answered with a login page.
+- **On Vercel** the package brings `pg` and `pg-cursor` itself, where Next's file tracing finds
+  them. Mounting `createDbAdmin` by hand, hand them over the same way (see [Drivers](#drivers)),
+  or the deployed function has no driver. MySQL and MariaDB work where the whole of
+  `node_modules` is deployed (`next start` on a server), not yet in a Vercel function.
 
 **Hono, Bun, Deno:** `app.all('/db/*', (c) => dbAdmin.fetch(c.req.raw))`, or
 `Bun.serve({ fetch: dbAdmin.fetch })`.

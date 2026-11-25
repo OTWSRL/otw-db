@@ -7,8 +7,11 @@ on its own from the command line. Apache-2.0.
 ## Decisions (Tahir, 2026-11-06)
 
 - Package names: `@otwdesign/db-core`, `@otwdesign/db-ui`, `@otwdesign/db-node`,
-  `@otwdesign/plugin-db`. `db-next` was dropped: a Next.js route handler takes the core's Fetch
-  handler as it is, so it would have held nothing.
+  `@otwdesign/plugin-db`. `db-next` was dropped at first: a Next.js route handler takes the core's
+  Fetch handler as it is, so it would have held nothing. It came back (Tahir, 2026-11-25) with
+  something to hold: a sign-in of its own, the drivers Vercel's file tracing needs to see, and
+  `npx @otwdesign/db-next init`. It's built on `db-core`'s public options alone, so core didn't
+  change for it.
 - Connections come from environment variables (or the host's code). None are saved from the UI in v1.
 - v1 databases: PostgreSQL, MySQL/MariaDB, SQLite.
 - Apache-2.0, like the CMS.
@@ -25,6 +28,7 @@ One engine, one HTTP surface, thin hosts.
 | `@otwdesign/db-node`   | `toNodeHandler()` for node:http-style servers                                       | `db-core`          |
 | `@otwdesign/db`        | The `otw-db` command with every driver, for `npx @otwdesign/db` (Tahir, 2026-11-07) | `db-node`, drivers |
 | `@otwdesign/plugin-db` | The OTW CMS plugin                                                                  | `db-core`, SDK     |
+| `@otwdesign/db-next`   | `createDbRoute()` for Next.js, its sign-in, and `otw-db-next init`                  | `db-core`, pg      |
 
 - **The Fetch handler is the contract.** `createDbAdmin(options)` returns `fetch(request)`, a
   standard `Request → Response` function, and `routes`, the same endpoints as a flat list.

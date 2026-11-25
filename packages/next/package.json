@@ -1,0 +1,67 @@
+{
+  "name": "@otwdesign/db-next",
+  "version": "1.3.2",
+  "description": "OTW DB in a Next.js app: one route file, a password sign-in or your app's own users, and the drivers Vercel needs. npx @otwdesign/db-next init sets it up.",
+  "license": "Apache-2.0",
+  "author": "OTW SRL",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/OTWSRL/otw-db.git",
+    "directory": "packages/next"
+  },
+  "homepage": "https://github.com/OTWSRL/otw-db/tree/main/packages/next#readme",
+  "bugs": {
+    "url": "https://github.com/OTWSRL/otw-db/issues"
+  },
+  "keywords": [
+    "database",
+    "admin",
+    "nextjs",
+    "vercel",
+    "supabase",
+    "postgresql"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "type": "module",
+  "engines": {
+    "node": ">=22.18"
+  },
+  "exports": {
+    ".": {
+      "@otwdesign/source": "./src/index.ts",
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./cli": {
+      "@otwdesign/source": "./src/cli.ts",
+      "types": "./dist/cli.d.ts",
+      "default": "./dist/cli.js"
+    }
+  },
+  "bin": {
+    "otw-db-next": "./bin/otw-db-next.js"
+  },
+  "files": [
+    "dist",
+    "src",
+    "bin",
+    "NOTICE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@otwdesign/db-core": "workspace:*",
+    "pg": "^8.23.1",
+    "pg-cursor": "^2.22.1"
+  },
+  "devDependencies": {
+    "@supabase/ssr": "^0.12.7",
+    "@supabase/supabase-js": "^2.119.0",
+    "@types/pg": "^8.23.1",
+    "@types/pg-cursor": "^2.7.2"
+  }
+}

@@ -1,18 +1,29 @@
-// OTW DB as people install it: the five packages packed as npm would publish them, installed with
+// OTW DB as people install it: the six packages packed as npm would publish them, installed with
 // npm from those tarballs (everything else from the registry) into apps that aren't part of this
 // repo, then type-checked, built and run against PostgreSQL:
 //
 //   1. a TypeScript Express app (type-checked without skipLibCheck, so our .d.ts files are too);
 //   2. the otw-db command, from @otwdesign/db alone;
 //   3. an OTW CMS site made by create-otw-cms from npm, with the Database plugin;
-//   4. the same site installed with pnpm, querying PostgreSQL through the plugin.
+//   4. the same site installed with pnpm, querying PostgreSQL through the plugin;
+//   5. a Next.js app set up by `otw-db-next init`, built as Vercel builds it (only the files
+//      Next's tracing finds), run away from its node_modules, signed in to and queried; with
+//      npm, then with pnpm.
 //
 // It catches what the workspace hides, where every package's devDependencies are installed: a
 // file, a type or a dependency the published packages forgot.
 //
 //   node scripts/packed-check.mjs [--keep]
 import { execFileSync, spawn } from 'node:child_process'
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs'
 import { createServer } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
@@ -22,10 +33,11 @@ import { chromium } from '@playwright/test'
 import { startPostgres } from '../e2e/postgres.mjs'
 
 const ROOT = resolve(import.meta.dirname, '..')
-const PACKAGES = ['core', 'ui', 'node', 'db', 'plugin']
+const PACKAGES = ['core', 'ui', 'node', 'db', 'plugin', 'next']
 const CMS = '1.1.0'
 const keep = process.argv.includes('--keep')
-const work = mkdtempSync(join(tmpdir(), 'otw-db-packed-'))
+// Its real path: a temp directory behind a symlink (macOS's /var) isn't where a bundler finds it.
+const work = realpathSync(mkdtempSync(join(tmpdir(), 'otw-db-packed-')))
 const servers = []
 
 const run = (command, args, cwd, env = {}) =>
@@ -326,6 +338,116 @@ if (rows[0]?.[0] !== 'from the packed packages') throw new Error('The pg driver 
     )
   } finally {
     await browser.close()
+  }
+
+  // 5. A Next.js app, as `otw-db-next init` sets it up and as Vercel runs it. A Vercel function
+  // holds only the files Next's tracing found, which is what `output: 'standalone'` writes out:
+  // run from there, away from the app's node_modules, a driver the tracing missed isn't found.
+  for (const manager of ['npm', 'pnpm']) {
+    console.log(`\n— A Next.js app set up by otw-db-next init (${manager}), run as Vercel runs it`)
+    const app = join(work, `next-${manager}`)
+    mkdirSync(join(app, 'app'), { recursive: true })
+    write(join(app, 'package.json'), {
+      name: `packed-next-${manager}`,
+      private: true,
+      dependencies: {
+        '@otwdesign/db-next': local('@otwdesign/db-next'),
+        next: '^16.4.5',
+        react: '^19.3.1',
+        'react-dom': '^19.3.1',
+      },
+      devDependencies: {
+        '@types/node': '^24.0.0',
+        '@types/react': '^19.3.0',
+        typescript: '~6.0.3',
+      },
+      ...(manager === 'pnpm' ? { pnpm: { overrides } } : { overrides }),
+    })
+    write(join(app, 'tsconfig.json'), {
+      compilerOptions: {
+        target: 'ES2023',
+        lib: ['dom', 'dom.iterable', 'es2023'],
+        strict: true,
+        noEmit: true,
+        module: 'esnext',
+        moduleResolution: 'bundler',
+        isolatedModules: true,
+        jsx: 'react-jsx',
+        skipLibCheck: true,
+        plugins: [{ name: 'next' }],
+      },
+      include: ['next-env.d.ts', '**/*.ts', '**/*.tsx', '.next/types/**/*.ts'],
+      exclude: ['node_modules'],
+    })
+    write(join(app, '.gitignore'), 'node_modules\n.next\n.env*\n')
+    write(
+      join(app, 'next.config.ts'),
+      `export default { output: 'standalone', outputFileTracingRoot: ${JSON.stringify(app)} }\n`,
+    )
+    write(
+      join(app, 'app/layout.tsx'),
+      `export default function Layout({ children }: { children: React.ReactNode }) {
+  return (
+    <html lang="en">
+      <body>{children}</body>
+    </html>
+  )
+}
+`,
+    )
+    write(join(app, 'app/page.tsx'), 'export default () => <h1>A packed Next.js app</h1>\n')
+    if (manager === 'pnpm') {
+      run('pnpm', ['install', '--no-frozen-lockfile', '--config.confirmModulesPurge=false'], app)
+    } else run('npm', ['install', '--no-audit', '--no-fund'], app)
+    // The package is there from the tarball; init writes the route and the password.
+    run(join(app, 'node_modules/.bin/otw-db-next'), ['init', '--no-install'], app)
+    const password = /^DB_ADMIN_PASSWORD=(.+)$/m.exec(
+      readFileSync(join(app, '.env.local'), 'utf8'),
+    )?.[1]
+    expect('init wrote a password of its own', password?.length, 32)
+    expect(
+      'and one route file',
+      readFileSync(join(app, 'app/db/[[...path]]/route.ts'), 'utf8').includes('createDbRoute()'),
+      true,
+    )
+    // Type-checks the route as it builds.
+    run(
+      manager === 'pnpm' ? 'pnpm' : 'npx',
+      [...(manager === 'pnpm' ? ['exec'] : []), 'next', 'build'],
+      app,
+    )
+    const deployed = join(work, `next-${manager}-deployed`)
+    renameSync(join(app, '.next/standalone'), deployed)
+    const port = await freePort()
+    serve('node', ['server.js'], deployed, {
+      ...connection,
+      DB_ADMIN_PASSWORD: password,
+      PORT: String(port),
+      HOSTNAME: '127.0.0.1',
+    })
+    const base = `http://127.0.0.1:${port}`
+    await until('the Next.js app', async () => (await fetch(`${base}/db`)).ok, 120)
+    expect('turns away who isn’t signed in', (await api(base, '/db/api/connections')).status, 401)
+    const signedIn = await fetch(`${base}/db/sign-in`, {
+      method: 'POST',
+      redirect: 'manual',
+      headers: { 'content-type': 'application/x-www-form-urlencoded', origin: base },
+      body: new URLSearchParams({ password }).toString(),
+    })
+    expect('signs in with the password init made', signedIn.status, 303)
+    const cookie = signedIn.headers.get('set-cookie')?.split(';')[0]
+    const queried = await (
+      await api(base, '/db/api/query', {
+        method: 'POST',
+        headers: { cookie },
+        body: JSON.stringify({ connection: 'main', sql: 'SELECT name FROM packed_items' }),
+      })
+    ).json()
+    expect(
+      'queries PostgreSQL with the drivers that were traced into the build',
+      queried.rows?.[0]?.[0] ?? queried.error?.message,
+      'from the packed packages',
+    )
   }
 
   console.log(`\nThe packed packages install, type-check, build and run${keep ? `: ${work}` : '.'}`)

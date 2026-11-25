@@ -9,10 +9,8 @@
     "test:e2e": "next build && playwright test"
   },
   "dependencies": {
-    "@otwdesign/db-core": "workspace:*",
+    "@otwdesign/db-next": "workspace:*",
     "next": "^16.4.5",
-    "pg": "^8.23.1",
-    "pg-cursor": "^2.22.1",
     "react": "^19.3.1",
     "react-dom": "^19.3.1"
   },

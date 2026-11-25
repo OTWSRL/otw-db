@@ -10,7 +10,8 @@
       "@otwdesign/db-ui",
       "@otwdesign/db-node",
       "@otwdesign/db",
-      "@otwdesign/plugin-db"
+      "@otwdesign/plugin-db",
+      "@otwdesign/db-next"
     ]
   ],
   "linked": [],

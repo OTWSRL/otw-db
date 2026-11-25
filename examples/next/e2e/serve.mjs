@@ -14,7 +14,7 @@ const next = spawn('npx', ['next', 'start', '-p', '3470'], {
     ...process.env,
     DB_ADMIN_MAIN_URL: url,
     DB_ADMIN_MAIN_LABEL: 'Guests DB',
-    DEMO_SECRET: 'e2e',
+    DB_ADMIN_PASSWORD: 'the example’s own password',
   },
 })
 const stop = () => next.kill()
